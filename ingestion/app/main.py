@@ -17,6 +17,7 @@ it is unset, at import time — before uvicorn ever binds a socket.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import sys
 import time
@@ -81,7 +82,7 @@ def _check_auth(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")
     token = authorization[len("Bearer "):]
-    if token != SYNC_TOKEN:
+    if not hmac.compare_digest(token, SYNC_TOKEN):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 

@@ -10,6 +10,7 @@ User-Agent. `exclude_prefixes` always wins over `include_prefixes`.
 
 from __future__ import annotations
 
+import ipaddress
 import time
 import urllib.robotparser
 from urllib.parse import urljoin, urlparse
@@ -22,6 +23,10 @@ from .config import SourceConfig
 from .logging_config import get_logger
 
 USER_AGENT = "self-docs-crawler/0.1"
+
+# Redirect chains are bounded: an unbounded chain could be abused to exhaust
+# resources or bounce the crawler indefinitely (security review L1).
+MAX_REDIRECTS = 5
 
 logger = get_logger(component="crawler")
 
@@ -56,6 +61,38 @@ def _allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[str]
         return False
     if include_prefixes:
         return any(path.startswith(p) for p in include_prefixes)
+    return True
+
+
+def _is_private_ip_host(host: str) -> bool:
+    """True if `host` is an IP literal within a private/link-local/loopback
+    range. Returns False for plain hostnames — no DNS resolution is performed
+    here (out of scope for this check; see security review L1)."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_link_local or ip.is_loopback
+
+
+def _validate_final_url(
+    final_url: str,
+    base_url: str,
+    include_prefixes: list[str],
+    exclude_prefixes: list[str],
+    base_host_is_public: bool,
+) -> bool:
+    """Re-validate a response's FINAL url (after any redirects) is still
+    same-host, allowed by include/exclude, and — when the source's configured
+    host is public — not an IP literal in a private/link-local range.
+    Guards against a redirect bouncing the crawler off-host (security review
+    L1)."""
+    if not _same_host(final_url, base_url):
+        return False
+    if not _allowed(urlparse(final_url).path, include_prefixes, exclude_prefixes):
+        return False
+    if base_host_is_public and _is_private_ip_host(urlparse(final_url).hostname or ""):
+        return False
     return True
 
 
@@ -119,11 +156,12 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> list[dict
     """
     own_client = client is None
     if own_client:
-        client = httpx.Client(follow_redirects=True)
+        client = httpx.Client(follow_redirects=True, max_redirects=MAX_REDIRECTS)
 
     log = logger.bind(source=source.name)
     try:
         base_url = str(source.base_url)
+        base_host_is_public = not _is_private_ip_host(urlparse(base_url).hostname or "")
         rp = load_robots(client, base_url)
         limiter = RateLimiter(source.rate_limit_rps)
 
@@ -157,6 +195,16 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> list[dict
             duration_ms = round((time.monotonic() - start) * 1000, 1)
             if resp.status_code != 200:
                 log.info("page_fetch_non_200", url=url, status=resp.status_code, duration_ms=duration_ms)
+                return None
+            final_url = str(resp.url)
+            if not _validate_final_url(
+                final_url,
+                base_url,
+                source.include_prefixes,
+                source.exclude_prefixes,
+                base_host_is_public,
+            ):
+                log.info("redirect_rejected", url=url, final_url=final_url)
                 return None
             log.info("page_fetched", url=url, duration_ms=duration_ms)
             return resp

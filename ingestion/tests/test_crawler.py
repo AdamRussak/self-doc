@@ -1,7 +1,7 @@
 import httpx
 
 from app.config import SourceConfig
-from app.crawler import crawl
+from app.crawler import _is_private_ip_host, _validate_final_url, crawl
 
 ROBOTS_ALLOW_ALL = "User-agent: *\nAllow: /\n"
 ROBOTS_DISALLOW_PRIVATE = "User-agent: *\nDisallow: /private/\n"
@@ -109,6 +109,91 @@ def test_bfs_fallback_when_no_sitemap():
     assert "https://example.com/" in urls
     assert "https://example.com/docs/a" in urls
     assert not any("other.com" in u for u in urls)
+
+
+def test_cross_host_redirect_is_rejected():
+    """A response whose FINAL url (after following redirects) lands on a
+    different host than base_url must be rejected, not indexed (security
+    review L1)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            return httpx.Response(302, headers={"Location": "https://evil.com/"})
+        if url == "https://evil.com/":
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, follow_redirects=True, max_redirects=5)
+    pages = crawl(source, client=client)
+    assert pages == []
+
+
+def test_private_ip_redirect_rejected_when_base_host_public():
+    """A redirect to an IP literal in a private/link-local range must be
+    rejected when the source's configured host is public (security review
+    L1)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://8.8.8.8/":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254/"})
+        if url == "http://169.254.169.254/":
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://8.8.8.8/",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, follow_redirects=True, max_redirects=5)
+    pages = crawl(source, client=client)
+    assert pages == []
+
+
+def test_is_private_ip_host_detects_rfc1918_and_link_local():
+    assert _is_private_ip_host("10.0.0.1") is True
+    assert _is_private_ip_host("192.168.1.1") is True
+    assert _is_private_ip_host("169.254.169.254") is True  # link-local / cloud metadata
+    assert _is_private_ip_host("127.0.0.1") is True  # loopback
+    assert _is_private_ip_host("8.8.8.8") is False
+    assert _is_private_ip_host("example.com") is False  # hostname, not an IP literal
+
+
+def test_validate_final_url_rejects_private_ip_literal_when_base_host_public():
+    # Same "host" string on both sides so the same-host check alone would
+    # pass — the private-IP check is the thing rejecting this.
+    assert _validate_final_url(
+        final_url="http://169.254.169.254/",
+        base_url="http://169.254.169.254/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+        base_host_is_public=True,
+    ) is False
+
+
+def test_validate_final_url_allows_private_ip_when_base_host_is_itself_private():
+    assert _validate_final_url(
+        final_url="http://169.254.169.254/",
+        base_url="http://169.254.169.254/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+        base_host_is_public=False,
+    ) is True
 
 
 def test_robots_disallow_blocks_page():

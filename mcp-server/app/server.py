@@ -31,7 +31,8 @@ def search_docs(query: str, source: str | None = None, limit: int = 5) -> str:
     knowledge: API syntax, config options, examples). Use this INSTEAD of guessing
     framework syntax from memory. NOT for project state or decisions — use Mem0
     for those. `source` optionally filters to one doc set (see list_doc_sources)."""
-    return retrieval.search(query=query, source=source, limit=limit)
+    clamped_limit = min(max(limit, 1), 20)
+    return retrieval.search(query=query, source=source, limit=clamped_limit)
 
 
 @mcp.tool

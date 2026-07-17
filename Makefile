@@ -25,12 +25,16 @@ sync:
 #
 # DB-dependent tests (ingestion/tests/test_store.py, mcp-server/tests/
 # test_retrieval_integration.py, tests/test_e2e.py) need the compose `db` up
-# and reachable on 127.0.0.1:5433 (published by docker-compose.yml) with
-# POSTGRES_USER=self_docs POSTGRES_PASSWORD=testpass123 POSTGRES_DB=self_docs
-# (or override via env) — bring it up first with:
-#     docker compose up -d db
+# and reachable on 127.0.0.1:5433 with POSTGRES_USER=self_docs
+# POSTGRES_PASSWORD=testpass123 POSTGRES_DB=self_docs (or override via env).
+#
+# The base docker-compose.yml deliberately publishes NO db port (security
+# review finding M1: db must be reachable only inside the compose network in
+# production). The host-loopback mapping is an explicit opt-in test overlay —
+# bring db up (with the port) first via:
+#     docker compose -f docker-compose.yml -f docker-compose.test.yml up -d db
 # They skip cleanly (not fail) when no db is reachable, so `make test` stays
-# green without Docker too, but full coverage requires the db up.
+# green without Docker too, but full coverage requires the db up as above.
 test:
 	@echo "=== ensuring ingestion/.venv ==="
 	@test -d ingestion/.venv || python3 -m venv ingestion/.venv

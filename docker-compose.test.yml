@@ -1,0 +1,10 @@
+# Test-only overlay: publishes the db port on loopback so host-run test
+# suites (`make test`) can reach Postgres directly at 127.0.0.1:5433. NEVER
+# applied to a production `docker compose up` — only combined explicitly via
+# `-f docker-compose.yml -f docker-compose.test.yml` (see Makefile `test`
+# target). Security review finding M1: db must not be reachable from outside
+# the compose network in production.
+services:
+  db:
+    ports:
+      - "127.0.0.1:5433:5432"
