@@ -1,0 +1,93 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.2-pg16 # pinned — CVE-2026-3172 fix (parallel HNSW buffer overflow), do NOT float to :pg16
+    container_name: self-docs-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    # No published ports — reachable only inside the compose network.
+
+  ingestion:
+    build:
+      context: ./ingestion
+    container_name: self-docs-ingestion
+    restart: unless-stopped
+    profiles:
+      - full
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SYNC_TOKEN: ${SYNC_TOKEN}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      OMP_NUM_THREADS: 1
+      ORT_NUM_THREADS: 2
+    expose:
+      - "8080"
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+    # No Traefik exposure — n8n reaches http://ingestion:8080 by container DNS.
+
+  mcp-server:
+    build:
+      context: ./mcp-server
+    container_name: self-docs-mcp-server
+    restart: unless-stopped
+    profiles:
+      - full
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      OMP_NUM_THREADS: 1
+      ORT_NUM_THREADS: 2
+    expose:
+      - "8000"
+    networks:
+      - default
+      - traefik
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    # Traefik labels/routing land in T5 once mcp-server/Dockerfile exists.
+
+networks:
+  default:
+    name: self-docs-internal
+  traefik:
+    name: ${TRAEFIK_NETWORK:-traefik_proxy}
+    external: true
+
+volumes:
+  pgdata:
