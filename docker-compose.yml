@@ -22,7 +22,13 @@ services:
       resources:
         limits:
           memory: 512M
-    # No published ports — reachable only inside the compose network.
+    ports:
+      # Published on the host ONLY so `make test` (run from the host, per T8) can
+      # reach the compose db directly for the store.py/retrieval/e2e integration
+      # tests (POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5433). Not otherwise required
+      # in production — mcp-server/ingestion reach `db:5432` over the compose
+      # network by container DNS regardless of this mapping.
+      - "127.0.0.1:5433:5432"
 
   ingestion:
     build:

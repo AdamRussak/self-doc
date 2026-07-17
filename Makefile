@@ -15,8 +15,40 @@ sync:
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
 		-H "Content-Type: application/json"
 
+# Runs the full suite for BOTH packages (ingestion, mcp-server) plus the
+# cross-package e2e test, as the single `make test` entrypoint from repo root.
+#
+# Each package ships its own `app` top-level package name, so they cannot
+# share one venv/import namespace; each gets its own venv (created here if
+# missing) and is tested with its own interpreter. The e2e test spans both by
+# shelling out to each venv's interpreter in turn (see tests/test_e2e.py).
+#
+# DB-dependent tests (ingestion/tests/test_store.py, mcp-server/tests/
+# test_retrieval_integration.py, tests/test_e2e.py) need the compose `db` up
+# and reachable on 127.0.0.1:5433 (published by docker-compose.yml) with
+# POSTGRES_USER=self_docs POSTGRES_PASSWORD=testpass123 POSTGRES_DB=self_docs
+# (or override via env) — bring it up first with:
+#     docker compose up -d db
+# They skip cleanly (not fail) when no db is reachable, so `make test` stays
+# green without Docker too, but full coverage requires the db up.
 test:
-	pytest
+	@echo "=== ensuring ingestion/.venv ==="
+	@test -d ingestion/.venv || python3 -m venv ingestion/.venv
+	@ingestion/.venv/bin/pip install -q -U pip
+	@ingestion/.venv/bin/pip install -q -e ingestion
+	@ingestion/.venv/bin/pip install -q pytest
+	@echo "=== ensuring mcp-server/.venv ==="
+	@test -d mcp-server/.venv || python3 -m venv mcp-server/.venv
+	@mcp-server/.venv/bin/pip install -q -U pip
+	@mcp-server/.venv/bin/pip install -q -e mcp-server
+	@mcp-server/.venv/bin/pip install -q pytest
+	@echo "=== ingestion test suite ==="
+	cd ingestion && ../ingestion/.venv/bin/pytest -q
+	@echo "=== mcp-server test suite ==="
+	cd mcp-server && ../mcp-server/.venv/bin/pytest -q
+	@echo "=== e2e (cross-package) test suite ==="
+	cd tests && ../ingestion/.venv/bin/python -m pytest -q
+	@echo "make test: all suites green (DB-dependent tests skip cleanly if 'docker compose up -d db' wasn't run first)."
 
 # Dump the docs database to a timestamped custom-format archive under ./backups.
 backup:
