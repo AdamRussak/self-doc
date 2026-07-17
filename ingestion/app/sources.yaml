@@ -1,0 +1,27 @@
+# Validated at service startup with pydantic; the service fails fast on duplicate
+# names, missing/invalid base_url, or unknown keys.
+# See IMPLEMENTATION_PLAN.md §2 "sources.yaml schema".
+sources:
+  - name: fastapi
+    base_url: https://fastapi.tiangolo.com/
+    sitemap: https://fastapi.tiangolo.com/sitemap.xml
+    include_prefixes: ["/tutorial/", "/reference/", "/advanced/", "/deployment/"]
+    exclude_prefixes: ["/release-notes/", "/newsletter/"]
+    max_pages: 500
+    language: english
+    rate_limit_rps: 1.0
+
+  - name: nextjs
+    base_url: https://nextjs.org/docs
+    include_prefixes: ["/docs/"]
+    exclude_prefixes: ["/docs/messages/", "/docs/architecture/"]
+    max_pages: 500
+    language: english
+    rate_limit_rps: 1.0
+
+  - name: pgvector-readme
+    base_url: https://github.com/pgvector/pgvector
+    include_prefixes: ["/pgvector/pgvector"]
+    max_pages: 3
+    language: english
+    rate_limit_rps: 1.0
