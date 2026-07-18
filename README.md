@@ -30,7 +30,8 @@ make up                     # starts db, ingestion (port 8080), and mcp-server (
 make sync                   # trigger initial documentation sync
 ```
 
-Local clients connect to `http://127.0.0.1:8081/sse` (`/mcp` when using streamable HTTP).
+Local clients connect to `http://127.0.0.1:8081/mcp` (streamable HTTP; requires an
+`Authorization: Bearer <MCP_TOKEN>` header — see `docs/client-setup.md`).
 
 ## Quickstart (Production / Home-Lab with Traefik)
 
@@ -38,9 +39,17 @@ To deploy with Traefik ingress routing on a home-lab server:
 
 ```bash
 cp .env.example .env        # fill in credentials and DOCS_MCP_HOSTNAME
+                             # also set MCP_TOKEN=$(openssl rand -hex 32) — required, see below
 make up-prod                # applies docker-compose.prod.yml overlay for Traefik ingress
 make sync                   # trigger initial documentation sync
 ```
+
+**`MCP_TOKEN` is required.** If it's missing from `.env`, `mcp-server` fails
+fast on startup and restart-loops. If you're upgrading an existing deployment,
+update all client configs with the `Authorization` header *before or
+alongside* restarting `mcp-server` — see [Deploy / Upgrade — MCP_TOKEN
+requirement](docs/runbook.md#deploy--upgrade--mcp_token-requirement-read-before-restarting-mcp-server)
+in the runbook for the full checklist.
 
 ## MCP Tools
 

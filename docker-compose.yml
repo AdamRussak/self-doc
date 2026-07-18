@@ -48,8 +48,16 @@ services:
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
+      SOURCES_YAML: /config/sources.yaml
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      # Mount the *directory*, not the file: a single-file bind mount pins an
+      # inode, and editors that save via atomic rename (vim, VS Code) would
+      # leave the container reading stale content after an edit — which is
+      # the exact bug this SOURCES_YAML override exists to fix. Do not
+      # "simplify" this to a single-file mount.
+      - ./ingestion/config:/config:ro
     networks:
       - default
     deploy:
@@ -69,6 +77,7 @@ services:
       db:
         condition: service_healthy
     environment:
+      MCP_TOKEN: ${MCP_TOKEN}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}

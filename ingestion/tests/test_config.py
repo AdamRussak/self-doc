@@ -12,9 +12,13 @@ def write_yaml(tmp_path: Path, text: str) -> Path:
 
 
 def test_seed_sources_yaml_loads(tmp_path):
-    seed = Path(__file__).parent.parent / "app" / "sources.yaml"
+    seed = Path(__file__).parent.parent / "config" / "sources.yaml"
     sources = load_sources(seed)
     names = {s.name for s in sources}
+    # Exact set equality is intentional: this file is bind-mounted and
+    # runtime-mutable, so an accidental deletion or typo in a source name
+    # must fail this test loudly. Adding a source is a deliberate two-file
+    # change (this assertion + sources.yaml), not friction to avoid.
     assert names == {
         "fastapi",
         "nextjs",
@@ -24,7 +28,10 @@ def test_seed_sources_yaml_loads(tmp_path):
         "docker-compose",
         "structlog",
         "pydantic",
+        "mcp",
     }
+    # The per-source invariants below check config correctness (each source
+    # is well-formed), not the presence/absence of any particular source.
     for s in sources:
         assert s.max_pages > 0
         assert s.rate_limit_rps > 0

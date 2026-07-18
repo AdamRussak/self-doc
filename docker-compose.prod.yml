@@ -33,6 +33,23 @@ services:
       - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.average=20"
       - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.burst=50"
       - "traefik.http.routers.self-docs-mcp.middlewares=self-docs-mcp-ratelimit"
+      # NOTE: Traefik v3 has no per-router "request timeout" middleware type
+      # (the dynamic-config middleware kinds are buffering, chain,
+      # circuitbreaker, compress, forwardauth, headers, ipallowlist,
+      # inflightreq, ratelimit, redirect*, replacepath*, retry, stripprefix* —
+      # no timeout middleware exists). A slow embedding+pgvector query is a
+      # *backend response* delay, which Traefik controls via a serversTransport
+      # (forwardingTimeouts), not via a router middleware — so it is NOT
+      # chained into the routers.middlewares list above alongside the rate
+      # limiter. If this LAN's Traefik also needs a client-facing responding
+      # timeout (how long Traefik itself takes to answer the client), that is
+      # `entryPoints.<name>.transport.respondingTimeouts.*`, which lives in
+      # Traefik's *static* config (traefik.yml / CLI flags), not in these
+      # container labels — add it there if needed.
+      - "traefik.http.serversTransports.self-docs-mcp-transport.forwardingTimeouts.dialTimeout=10s"
+      - "traefik.http.serversTransports.self-docs-mcp-transport.forwardingTimeouts.responseHeaderTimeout=60s"
+      - "traefik.http.serversTransports.self-docs-mcp-transport.forwardingTimeouts.idleConnTimeout=90s"
+      - "traefik.http.services.self-docs-mcp.loadbalancer.serverstransport=self-docs-mcp-transport"
 
 networks:
   traefik:

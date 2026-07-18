@@ -75,8 +75,11 @@ self-docs/
 │   │   ├── extract.py          # trafilatura → markdown
 │   │   ├── chunker.py          # heading-aware splitting
 │   │   ├── embedder.py         # FastEmbed passage_embed wrapper
-│   │   ├── store.py            # hash-diff upsert into Postgres
-│   │   └── sources.yaml        # declarative list of doc sites to index
+│   │   └── store.py            # hash-diff upsert into Postgres
+│   └── config/
+│       └── sources.yaml        # declarative list of doc sites to index
+│                               # (bind-mounted read-only; re-read on every
+│                               # /sync, not baked into the image)
 ├── mcp-server/
 │   ├── Dockerfile
 │   ├── pyproject.toml
@@ -144,18 +147,25 @@ so the documented upgrade path is **nuke and rebuild**: `docker compose down -v 
 with the new init scripts, trigger a full sync. If the DB ever accumulates non-rebuildable
 state, adopt Alembic then (recorded as an ADR).
 
-### `sources.yaml` schema
+### `ingestion/config/sources.yaml` schema
+
+Lives at `ingestion/config/sources.yaml`, bind-mounted read-only into the
+`ingestion` container (`SOURCES_YAML=/config/sources.yaml`) and re-read from
+disk on every `/sync` request — no rebuild/restart needed to pick up an edit.
+Validated at process startup with pydantic (fail-fast: an invalid file at
+boot aborts the container); a bad edit discovered at runtime instead fails
+soft — `/sync` returns HTTP 400 and the service keeps serving its
+last-known-good config. See `docs/runbook.md` "Add a new doc source" for the
+full procedure and validation command.
 
 ```yaml
-# Validated at service startup with pydantic; the service fails fast on duplicate
-# names, missing/invalid base_url, or unknown keys.
 sources:
   - name: fastapi              # unique, [a-z0-9-], maps to doc_sources.name
     base_url: https://fastapi.tiangolo.com/
     sitemap: https://fastapi.tiangolo.com/sitemap.xml   # optional; BFS fallback if absent
     include_prefixes: ["/tutorial/", "/reference/"]      # optional allowlist
     exclude_prefixes: ["/blog/", "/release-notes/"]      # optional denylist (wins over include)
-    max_pages: 500              # hard cap, required
+    max_pages: 500              # REQUIRED, no default — omitting it fails validation
     language: english           # optional, default english → to_tsvector config
     rate_limit_rps: 1.0         # optional, default 1.0 req/sec
 ```

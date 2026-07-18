@@ -76,6 +76,22 @@ def test_sync_requires_bearer_auth(app_module):
     assert "running" in resp.json()
 
 
+def test_default_sources_yaml_resolves_to_existing_file(app_module):
+    """No other test in this module exercises the *default* SOURCES_YAML
+    path: every other test either sets the env var or monkeypatches
+    `app_module.SOURCES_YAML`. The `app_module` fixture above never sets
+    SOURCES_YAML, so the constant it holds here is whatever `app.main`
+    computed at import time from `Path(__file__).parent.parent / "config" /
+    "sources.yaml"` — a real relative-path resolution, not a test fixture
+    value. Asserting against `app_module.SOURCES_YAML` (rather than
+    recomputing the same expression here) is what makes this catch a future
+    relative-path regression instead of tautologically agreeing with
+    itself."""
+    assert "SOURCES_YAML" not in os.environ
+    assert app_module.SOURCES_YAML.exists()
+    assert app_module.SOURCES_YAML.name == "sources.yaml"
+
+
 def test_health_ok(app_module):
     client = TestClient(app_module.app)
     resp = client.get("/health")
@@ -128,8 +144,9 @@ def test_sync_source_crash_marks_status_failed_on_fresh_connection(app_module, m
     monkeypatch.setattr(store, "sync_source", crashing_sync_source)
     monkeypatch.setattr(store, "mark_source_failed", lambda name: calls.append(name))
 
-    name = next(iter(app_module.SOURCES_BY_NAME))
-    app_module._run_sync_blocking([name])
+    sources_by_name = app_module.get_sources_by_name()
+    name = next(iter(sources_by_name))
+    app_module._run_sync_blocking([name], sources_by_name)
 
     assert calls == [name]
     assert app_module._state["results"][name]["last_status"] == "failed"
@@ -140,7 +157,7 @@ def test_sync_second_call_returns_409_while_running(app_module, monkeypatch):
     import time
 
     # Make the sync worker slow so we can observe the "running" state.
-    def slow_sync(names):
+    def slow_sync(names, sources_by_name):
         time.sleep(0.5)
 
     monkeypatch.setattr(app_module, "_run_sync_blocking", slow_sync)
@@ -168,7 +185,7 @@ def test_sync_second_call_returns_409_while_running(app_module, monkeypatch):
 def test_status_reports_in_flight_sync_progress(app_module, monkeypatch):
     import time
 
-    def slow_sync_blocking(names):
+    def slow_sync_blocking(names, sources_by_name):
         app_module._state["current"] = {
             "source": names[0],
             "pages_processed": 10,
@@ -240,8 +257,9 @@ def test_run_sync_blocking_updates_pages_processed(app_module, monkeypatch):
 
     monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
 
-    name = next(iter(app_module.SOURCES_BY_NAME))
-    app_module._run_sync_blocking([name])
+    sources_by_name = app_module.get_sources_by_name()
+    name = next(iter(sources_by_name))
+    app_module._run_sync_blocking([name], sources_by_name)
 
 
 def test_configure_logging_suppresses_third_party_loggers():
@@ -271,12 +289,127 @@ def test_run_sync_blocking_records_pages_soft_failed(app_module, monkeypatch):
         ),
     )
 
-    name = next(iter(app_module.SOURCES_BY_NAME))
+    sources_by_name = app_module.get_sources_by_name()
+    name = next(iter(sources_by_name))
     before_count = app_module.PAGES_SOFT_FAILED.labels(source=name)._value.get()
-    app_module._run_sync_blocking([name])
+    app_module._run_sync_blocking([name], sources_by_name)
     after_count = app_module.PAGES_SOFT_FAILED.labels(source=name)._value.get()
 
     assert app_module._state["results"][name]["pages_soft_failed"] == 3
     assert after_count - before_count == 3
+
+
+def test_invalid_sources_yaml_refuses_to_start(tmp_path):
+    """Startup fail-fast is UNCHANGED: an invalid sources.yaml at import time
+    still exits non-zero with a FATAL message on stderr, before uvicorn ever
+    binds a socket."""
+    bad_yaml = tmp_path / "sources.yaml"
+    bad_yaml.write_text(
+        "sources:\n"
+        "  - name: Bad Name!!\n"  # violates NAME_PATTERN -> ConfigError
+        "    base_url: https://example.com/\n"
+        "    max_pages: 10\n"
+    )
+    env = os.environ.copy()
+    env["SYNC_TOKEN"] = "test-token-123"
+    env["SOURCES_YAML"] = str(bad_yaml)
+    env["POSTGRES_HOST"] = "127.0.0.1"
+    env["POSTGRES_PORT"] = "5433"
+    env["POSTGRES_USER"] = "self_docs"
+    env["POSTGRES_PASSWORD"] = "testpass123"
+    env["POSTGRES_DB"] = "self_docs"
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        cwd=str(_ingestion_root()),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "FATAL" in proc.stderr
+    assert "sources.yaml" in proc.stderr
+
+
+def test_sources_yaml_reread_picks_up_file_changes(app_module, monkeypatch, tmp_path):
+    """A running service must pick up sources.yaml edits without a restart:
+    get_sources()/get_sources_by_name() re-read SOURCES_YAML on every call
+    rather than caching it once at import time."""
+    yaml_path = tmp_path / "sources.yaml"
+    yaml_path.write_text(
+        "sources:\n"
+        "  - name: reread-a\n"
+        "    base_url: https://reread-a.example.com/\n"
+        "    max_pages: 10\n"
+    )
+    monkeypatch.setattr(app_module, "SOURCES_YAML", yaml_path)
+
+    first = app_module.get_sources_by_name()
+    assert set(first.keys()) == {"reread-a"}
+
+    yaml_path.write_text(
+        "sources:\n"
+        "  - name: reread-b\n"
+        "    base_url: https://reread-b.example.com/\n"
+        "    max_pages: 10\n"
+    )
+
+    second = app_module.get_sources_by_name()
+    assert set(second.keys()) == {"reread-b"}
+
+
+def test_sync_invalid_midflight_edit_fails_soft_and_keeps_serving(app_module, monkeypatch, tmp_path):
+    """The highest-value safety test: a typo introduced in sources.yaml while
+    the service is running must return HTTP 400 on the next /sync call — it
+    must NOT crash the service or wipe out the previously-good config. The
+    very next request, once the file is fixed again, must succeed."""
+    import time as time_mod
+
+    yaml_path = tmp_path / "sources.yaml"
+    valid_yaml = (
+        "sources:\n"
+        "  - name: soft-a\n"
+        "    base_url: https://soft-a.example.com/\n"
+        "    max_pages: 10\n"
+    )
+    yaml_path.write_text(valid_yaml)
+    monkeypatch.setattr(app_module, "SOURCES_YAML", yaml_path)
+    # Avoid any real crawl/DB work — this test is only about config reload
+    # semantics around the /sync endpoint.
+    monkeypatch.setattr(app_module, "_run_sync_blocking", lambda names, sources_by_name: None)
+
+    def _wait_for_lock_release():
+        for _ in range(50):
+            if not app_module._sync_lock.locked():
+                return
+            time_mod.sleep(0.02)
+
+    with TestClient(app_module.app) as client:
+        resp1 = client.post("/sync", headers={"Authorization": "Bearer test-token-123"})
+        assert resp1.status_code == 200
+        assert resp1.json()["sources"] == ["soft-a"]
+        _wait_for_lock_release()
+
+        # A typo lands mid-flight: an unknown key makes the file invalid.
+        yaml_path.write_text(
+            "sources:\n"
+            "  - name: soft-a\n"
+            "    base_url: https://soft-a.example.com/\n"
+            "    max_pages: 10\n"
+            "    bogus_key: true\n"
+        )
+
+        resp2 = client.post("/sync", headers={"Authorization": "Bearer test-token-123"})
+        assert resp2.status_code == 400
+        # The last-known-good config must be untouched by the failed re-read.
+        assert set(app_module._get_last_good_sources_by_name().keys()) == {"soft-a"}
+        _wait_for_lock_release()
+
+        # The typo is fixed — the service must still be serving normally.
+        yaml_path.write_text(valid_yaml)
+
+        resp3 = client.post("/sync", headers={"Authorization": "Bearer test-token-123"})
+        assert resp3.status_code == 200
+        assert resp3.json()["sources"] == ["soft-a"]
 
 

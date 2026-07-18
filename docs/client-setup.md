@@ -2,10 +2,10 @@
 
 # Client setup — connecting an agent IDE to self-docs
 
-When running **locally in development** (`make up`), the server exposes a loopback streamable HTTP/SSE endpoint at:
+When running **locally in development** (`make up`), the server exposes a loopback streamable HTTP endpoint at:
 
 ```
-http://127.0.0.1:8081/sse
+http://127.0.0.1:8081/mcp
 ```
 *(or port `8000` if `${DOCS_MCP_HOST_PORT}` is set to 8000).*
 
@@ -17,7 +17,47 @@ https://<DOCS_MCP_HOSTNAME>/mcp
 
 Replace `<DOCS_MCP_HOSTNAME>` with the value of `DOCS_MCP_HOSTNAME` from `.env`. When behind Traefik, the endpoint is rate-limited to ~20 req/s (burst 50).
 
+Every request — local or remote — must include an `Authorization: Bearer <MCP_TOKEN>`
+header, where `<MCP_TOKEN>` is the value of the `MCP_TOKEN` environment variable from
+`.env`. Requests without a valid token receive `401 Unauthorized`.
+
 Two tools are exposed: `search_docs(query, source?, limit?)` and `list_doc_sources()`. See `AGENTS.md` for the routing rules every client should follow.
+
+---
+
+## Copy-paste `mcp.json` samples
+
+**Local dev:**
+
+```json
+{
+  "mcpServers": {
+    "self-docs": {
+      "type": "http",
+      "url": "http://127.0.0.1:8081/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
+    }
+  }
+}
+```
+
+**Remote (production / home-lab via Traefik):**
+
+```json
+{
+  "mcpServers": {
+    "self-docs": {
+      "type": "http",
+      "url": "https://<DOCS_MCP_HOSTNAME>/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
+    }
+  }
+}
+```
 
 ---
 
@@ -32,7 +72,10 @@ Edit `~/.cursor/mcp.json`:
   "mcpServers": {
     "self-docs": {
       "type": "http",
-      "url": "https://<DOCS_MCP_HOSTNAME>/mcp"
+      "url": "https://<DOCS_MCP_HOSTNAME>/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
     }
   }
 }
@@ -48,7 +91,10 @@ only):
   "mcpServers": {
     "self-docs": {
       "type": "http",
-      "url": "https://<DOCS_MCP_HOSTNAME>/mcp"
+      "url": "https://<DOCS_MCP_HOSTNAME>/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
     }
   }
 }
@@ -69,7 +115,8 @@ times.
 Add the server once, globally:
 
 ```bash
-claude mcp add --transport http self-docs https://<DOCS_MCP_HOSTNAME>/mcp
+claude mcp add --transport http self-docs https://<DOCS_MCP_HOSTNAME>/mcp \
+  --header "Authorization: Bearer <MCP_TOKEN>"
 ```
 
 ### Project scope
@@ -79,7 +126,8 @@ To scope the server to one project instead of globally, add it with
 Cursor reads, same schema — the two clients can share it):
 
 ```bash
-claude mcp add --transport http self-docs https://<DOCS_MCP_HOSTNAME>/mcp --scope project
+claude mcp add --transport http self-docs https://<DOCS_MCP_HOSTNAME>/mcp \
+  --header "Authorization: Bearer <MCP_TOKEN>" --scope project
 ```
 
 **Verify:**
@@ -97,27 +145,28 @@ markdown hits with `heading_path` and a source URL.
 
 ## Antigravity
 
-> Antigravity's MCP config schema moves between releases — verify the exact
-> field names against your installed version's docs before relying on this.
-> As of writing, Antigravity uses a `serverUrl`-style remote-HTTP entry,
-> conceptually equivalent to Cursor's `mcp.json`:
+> Antigravity supports both `type: "http"` + `url` (Cursor-style schema) and
+> `serverUrl`-style remote entries depending on version/release. Both work with
+> `self-docs` streamable HTTP endpoint over `/mcp`.
 
-Edit Antigravity's `mcp_config.json`:
+Edit Antigravity's `mcp_config.json` (`~/.gemini/config/mcp_config.json`):
 
 ```json
 {
   "mcpServers": {
     "self-docs": {
-      "serverUrl": "https://<DOCS_MCP_HOSTNAME>/mcp"
+      "type": "http",
+      "url": "https://<DOCS_MCP_HOSTNAME>/mcp",
+      "headers": {
+        "Authorization": "Bearer <MCP_TOKEN>"
+      }
     }
   }
 }
 ```
+*(For local development against `make up`, use `"url": "http://127.0.0.1:8081/mcp"` and replace `<MCP_TOKEN>` with your literal `MCP_TOKEN` secret value from `.env`.)*
 
-If your Antigravity version instead expects `type: "http"` + `url` (the
-Cursor-style schema) or a `transport` block, use that form instead — the
-important part is a remote HTTP/streamable-HTTP entry pointing at the
-`/mcp` path above, with no local command/process.
+If your Antigravity release expects `serverUrl` instead (`"serverUrl": "https://<DOCS_MCP_HOSTNAME>/mcp"`), use that field name — the important part is pointing at the `/mcp` path with the `Authorization: Bearer <MCP_TOKEN>` header set and no local command/process.
 
 **Verify:** open Antigravity's MCP/tools panel, confirm `self-docs` shows as
 connected with `search_docs` and `list_doc_sources` available, then run a

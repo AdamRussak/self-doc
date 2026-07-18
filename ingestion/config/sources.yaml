@@ -133,3 +133,23 @@ sources:
     max_pages: 100                                          # Hard safety cap; /docs/validation/latest/ has ~89 URLs in the sitemap
     language: english
     rate_limit_rps: 1.0
+  - name: mcp
+    base_url: https://modelcontextprotocol.io/
+    # WARNING: base_url's path is "/", which is NOT covered by
+    # include_prefixes below. This only passes config validation because a
+    # sitemap is declared (the BFS-seed-filter check short-circuits when a
+    # sitemap is present). If this sitemap URL ever 404s (as happened with
+    # the traefik source above), the crawler falls back to BFS seeded on
+    # "/", which include_prefixes would then filter out entirely — silently
+    # indexing 0 pages. If that ever happens, fix by adding "/" is not
+    # viable (too broad); instead point base_url at an in-scope path (e.g.
+    # https://modelcontextprotocol.io/docs) or verify/update the sitemap URL.
+    sitemap: https://modelcontextprotocol.io/sitemap.xml          # Optional (falls back to recursive BFS crawl if omitted)
+    include_prefixes: ["/docs","/extensions","/specification"]           # Only crawl URLs starting with this prefix
+    # Verified against https://modelcontextprotocol.io/sitemap.xml
+    # (2026-07-19): 135 URLs fall under /docs (16) + /extensions (8) +
+    # /specification (111) combined. Capped well above that with headroom
+    # for future doc growth.
+    max_pages: 200
+    language: english
+    rate_limit_rps: 1.0

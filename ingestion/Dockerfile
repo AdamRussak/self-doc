@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml uv.lock ./
 COPY app ./app
+COPY config ./config
 
 # Install uv for lockfile-based reproducible builds, export requirements from lockfile, then install deps.
 RUN pip install --no-cache-dir uv \

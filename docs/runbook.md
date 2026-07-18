@@ -5,9 +5,83 @@ in the repo root with a populated `.env` (see `.env.example`).
 
 ---
 
+## Deploy / Upgrade — MCP_TOKEN requirement (read before restarting mcp-server)
+
+This applies to any deploy/upgrade that brings the `mcp-server` image up to a
+version that enforces `MCP_TOKEN` auth on `/mcp` (see the `401` troubleshooting
+entry below for the auth behavior itself — this section is the pre-deploy
+checklist that prevents the failure mode in the first place).
+
+1. **Add `MCP_TOKEN` to `.env` before deploying.** `.env.example` documents the
+   variable, but an existing `.env` created before this change will not have
+   it. Generate one:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+   Add it to `.env` as `MCP_TOKEN=<generated-value>` alongside `SYNC_TOKEN`.
+
+   **Failure mode if skipped:** `docker-compose.yml` interpolates
+   `MCP_TOKEN: ${MCP_TOKEN}` into the `mcp-server` service environment. If
+   `MCP_TOKEN` is unset in `.env`, this interpolates to an empty string. The
+   server's startup fail-fast check treats an empty `MCP_TOKEN` the same as a
+   missing one and refuses to start, so the container exits `1` immediately
+   and Docker's restart policy brings it back up into the same failure —
+   a **restart loop**. If you see `mcp-server` repeatedly restarting/exiting
+   right after this upgrade, or `docker compose logs mcp-server` showing an
+   immediate exit with no requests ever served, this is almost certainly the
+   cause — check `.env` for `MCP_TOKEN` first. Confirm by running
+   `docker compose logs mcp-server` and grepping for the literal line the
+   server prints to stderr before exiting:
+
+   ```
+   FATAL: MCP_TOKEN environment variable is required but not set. Refusing to start.
+   ```
+
+2. **This is a breaking change for every existing MCP client.** Once
+   `mcp-server` enforces `MCP_TOKEN`, any client (Cursor, Claude Code,
+   Antigravity, etc.) still configured without an `Authorization: Bearer
+   <MCP_TOKEN>` header will start getting `401` on every tool call the moment
+   the new `mcp-server` container is up — see `docs/client-setup.md` for the
+   exact header shape each client needs.
+
+   **Safe ordering:**
+   1. Add `MCP_TOKEN` to `.env` (step 1 above).
+   2. Update every registered client's config to send the `Authorization`
+      header (`docs/client-setup.md`).
+   3. Rebuild/restart the `mcp-server` container:
+      ```bash
+      docker compose up -d --build mcp-server
+      ```
+
+   Doing the client updates *before or alongside* the container restart avoids
+   a window where clients are silently broken with `401`s.
+
+3. **Post-deploy: verify the Traefik `serversTransport` binding (production
+   only).** `docker-compose.prod.yml` declares a Traefik `serversTransport`
+   label intended to raise the backend timeout for slow embedding+pgvector
+   queries. **This is unverified in-repo** — `ingestion/config/sources.yaml` does
+   not index a Traefik documentation source, so this repo cannot cite
+   `search_docs` evidence that the Traefik v3 Docker provider actually builds
+   `http.serversTransports.*` from container labels the way the compose file
+   assumes. Confirm it manually after deploying:
+
+   ```bash
+   curl <traefik-api>/api/http/serversTransports
+   ```
+
+   Confirm `self-docs-mcp-transport@docker` exists in the output **and** is
+   bound to the `mcp-server` service. If it does not appear, the intended 60s
+   backend timeout is **not** in effect, and the underlying 504 risk on slow
+   embedding+pgvector queries remains open — treat that as a follow-up, not a
+   silent no-op.
+
+---
+
 ## Add a new doc source
 
-1. Edit `ingestion/app/sources.yaml` and add an entry per the schema (see
+1. Edit `ingestion/config/sources.yaml` and add an entry per the schema (see
    `IMPLEMENTATION_PLAN.md` §2 "sources.yaml schema"):
 
    ```yaml
@@ -16,34 +90,54 @@ in the repo root with a populated `.env` (see `.env.example`).
      sitemap: https://example.com/sitemap.xml   # optional; BFS fallback if absent
      include_prefixes: ["/docs/"]                # optional allowlist
      exclude_prefixes: ["/blog/"]                 # optional denylist (wins over include)
-     max_pages: 300                               # required hard cap
+     max_pages: 300                               # REQUIRED — no default (see below)
      language: english                            # optional, default english
      rate_limit_rps: 1.0                          # optional, default 1.0
    ```
 
-   Validation is fail-fast at ingestion startup (pydantic): duplicate names,
-   missing/invalid `base_url`, or unknown keys abort the service. Test your
-   YAML by restarting the ingestion container and checking it comes up:
+   `max_pages` is **required with no default** — omitting it fails config
+   validation. This is not a hypothetical: it's the exact mistake that once
+   made an edit to this file silently have no effect at all (the file
+   failed validation, so the last-known-good config kept serving instead).
+   Before syncing, validate the file directly with the same loader the
+   service uses:
 
    ```bash
-   docker compose restart ingestion
-   docker compose logs ingestion --tail=50
+   cd ingestion && ./.venv/bin/python -c "from app.config import load_sources; load_sources('config/sources.yaml')"
    ```
 
-2. Get the change live — the ingestion service only reads `sources.yaml` at
-   startup, so either:
-   - **Rebuild + restart** (needed if you changed the file inside the image
-     build context and want it baked in for reproducibility):
-     ```bash
-     docker compose build ingestion
-     docker compose up -d ingestion
-     ```
-   - **Restart only** (fastest path for local iteration — `sources.yaml` is
-     read from disk at process start, a plain restart re-reads it as long as
-     the file is present in the built image/mount):
-     ```bash
-     docker compose restart ingestion
-     ```
+   A clean exit (no output) means the file is valid; a `ConfigError`
+   traceback tells you exactly what's wrong (duplicate name, bad
+   `base_url`, unknown key, missing `max_pages`, or a sitemap-less source
+   whose `base_url` isn't covered by its own `include_prefixes`) before you
+   ever hit `/sync`.
+
+2. Get the change live. `ingestion/config/sources.yaml` is bind-mounted
+   read-only into the container (`./ingestion/config:/config:ro`,
+   `SOURCES_YAML=/config/sources.yaml`) and is **re-read from disk on every
+   `/sync` request** — no rebuild, no restart, just save the file and call
+   `/sync`. There are two distinct failure modes to understand, because they
+   behave very differently:
+
+   - **Container startup (fail-fast).** `sources.yaml` is also loaded once
+     at process start, before uvicorn binds. If it's invalid at that point,
+     the container prints `FATAL: invalid sources.yaml (...)` to stderr and
+     exits non-zero — it will **not** boot. This only bites you after a
+     restart/recreate of the `ingestion` container (e.g. `docker compose up
+     -d ingestion`, or a host reboot), not from editing the file while the
+     service is already running.
+   - **Runtime re-read on `/sync` (fail-soft).** If you edit the file while
+     `ingestion` is already running and introduce an error, the *next*
+     `/sync` call re-reads it, gets a `ConfigError`, and returns **HTTP
+     400** with the validation message in the response body — the service
+     itself keeps running unaffected, still serving the previous
+     last-known-good config for any other request. Nothing crashes; you
+     just don't get your new/changed source until the file is fixed.
+
+   In short: a bad edit that's only ever read at runtime degrades gracefully
+   (400, old config keeps working); a bad edit that's present when the
+   container itself starts up prevents it from coming up at all. Use the
+   pre-sync validation command above to avoid hitting either path.
 
 3. Trigger a sync of just the new source:
 
@@ -163,7 +257,7 @@ recover the point-in-time index.
 
 ## Expected sync durations
 
-Driven by `max_pages` and `rate_limit_rps` in `ingestion/app/sources.yaml`
+Driven by `max_pages` and `rate_limit_rps` in `ingestion/config/sources.yaml`
 (crawler etiquette: ~1 req/sec per source, sequential fetch):
 
 | Source            | `max_pages` | Rough duration            |
@@ -295,6 +389,21 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   unset, so a `401` means the service is up but the caller sent the wrong
   token, not that auth is misconfigured server-side.
 
+- **`401` on `POST /mcp` (or any tool call).** Missing or wrong
+  `Authorization: Bearer $MCP_TOKEN` header. Confirm the client's configured
+  token matches `.env`'s `MCP_TOKEN` on the `mcp-server` container — see
+  `docs/client-setup.md` for the exact header shape each client needs. As
+  with `SYNC_TOKEN`, a `401` here means the service is up and reachable but
+  the caller sent a missing/incorrect token, not that auth is misconfigured
+  server-side. Note that `GET /metrics` is intentionally left unauthenticated
+  on both `mcp-server` and `ingestion` so the Docker healthcheck and
+  Prometheus can scrape it without a token.
+
+  See also [Deploy / Upgrade — MCP_TOKEN
+  requirement](#deploy--upgrade--mcp_token-requirement-read-before-restarting-mcp-server)
+  above if you are hitting `401`s (or a restart loop) right after upgrading
+  `mcp-server` — that section is the pre-deploy checklist for exactly this.
+
 - **Empty `heading_path` on GitHub-README-derived sources** (e.g.
   `pgvector-readme`). Known, cosmetic quirk — READMEs don't always parse
   into a clean heading breadcrumb the way a docs site's nested pages do. The
@@ -302,4 +411,20 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   indicate a broken sync.
 
 - **A source keeps coming back `partial` or `failed`.**
-  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` in `sources.yaml` and re-sync; other sources are unaffected by one source's failure.
+  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` in `ingestion/config/sources.yaml` and re-sync; other sources are unaffected by one source's failure.
+
+  **A source reports `ok` but `pages_seen == 0` (silently indexed nothing)**,
+  or a previously-healthy source suddenly goes empty after a sitemap moves.
+  Watch for this specific trap: a source whose `base_url` path is *not*
+  covered by its own `include_prefixes` only passes config validation
+  because it also declares a `sitemap` — the validator's
+  BFS-seed-filter check (`config.py`'s `_base_url_passes_own_prefix_filters`)
+  short-circuits and skips the check entirely whenever `sitemap` is set. If
+  that sitemap URL ever 404s (moves, gets renamed upstream, etc.), the
+  crawler falls back to BFS seeded on `base_url` — which `include_prefixes`
+  then filters out immediately, before the first fetch — and the source
+  syncs "successfully" with zero pages indexed. This is exactly what
+  happened with the `traefik` source (its original sitemap URL 404d) and is
+  why the `mcp` source in `ingestion/config/sources.yaml` carries an inline
+  `WARNING:` comment about this same shape. If a source goes quiet, check
+  whether its declared `sitemap` still 200s before looking anywhere else.

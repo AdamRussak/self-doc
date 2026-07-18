@@ -20,6 +20,7 @@ import asyncio
 import hmac
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,14 +44,68 @@ if not SYNC_TOKEN:
     raise SystemExit(1)
 
 # --- Load + validate sources.yaml at startup --------------------------------------------
-SOURCES_YAML = Path(os.environ.get("SOURCES_YAML", str(Path(__file__).parent / "sources.yaml")))
+# Defaults to ingestion/config/sources.yaml; override with the SOURCES_YAML
+# env var (e.g. for tests pointing at a fixture file).
+SOURCES_YAML = Path(
+    os.environ.get("SOURCES_YAML", str(Path(__file__).parent.parent / "config" / "sources.yaml"))
+)
 try:
-    ALL_SOURCES: list[SourceConfig] = load_sources(SOURCES_YAML)
+    _INITIAL_SOURCES: list[SourceConfig] = load_sources(SOURCES_YAML)
 except ConfigError as e:
     print(f"FATAL: invalid sources.yaml ({SOURCES_YAML}): {e}", file=sys.stderr)
     raise SystemExit(1)
 
-SOURCES_BY_NAME: dict[str, SourceConfig] = {s.name: s for s in ALL_SOURCES}
+# --- Dynamic re-read with a last-known-good cache for test observability ----------------
+# Startup (above) is fail-fast: invalid config at boot aborts the process
+# before uvicorn binds. Runtime re-reads (below) must fail *soft*: a typo
+# introduced in sources.yaml while the service is running must never crash
+# it or empty out its source list mid-flight — callers get a ConfigError,
+# which request handlers turn into an HTTP 400, and the process keeps
+# running. `_last_good_sources` records the last successfully-loaded config
+# for tests to assert against; it is not read on any production request path.
+_sources_cache_lock = threading.Lock()
+_last_good_sources: list[SourceConfig] = _INITIAL_SOURCES
+
+
+def get_sources() -> list[SourceConfig]:
+    """Re-read and validate SOURCES_YAML from disk on every call.
+
+    On success, updates `_last_good_sources` and returns the fresh list.
+    On `ConfigError`, logs a structured event and re-raises WITHOUT
+    touching the cache — the previous last-known-good list is left
+    untouched. `_last_good_sources` is a test-observable record only: no
+    production call path reads it back as a fallback. The fail-soft
+    behavior actually observed (service stays up, caller gets a 400)
+    comes from the try/except around this call in the `/sync` handler,
+    not from this cache.
+    """
+    global _last_good_sources
+    try:
+        sources = load_sources(SOURCES_YAML)
+    except ConfigError as e:
+        logger.error("sources_yaml_reload_failed", path=str(SOURCES_YAML), error=str(e))
+        raise
+    with _sources_cache_lock:
+        _last_good_sources = sources
+    return sources
+
+
+def get_sources_by_name() -> dict[str, SourceConfig]:
+    """Same contract as `get_sources()`, keyed by source name."""
+    return {s.name: s for s in get_sources()}
+
+
+def _get_last_good_sources_by_name() -> dict[str, SourceConfig]:
+    """The last successfully-loaded config, without attempting a re-read.
+
+    Not called from any request path — this is a test seam used to assert
+    that the fail-soft cache survives a failed reload without triggering
+    another `load_sources()` call (which would just re-raise the same
+    `ConfigError`). Kept private (`_`-prefixed) since it has no production
+    call site."""
+    with _sources_cache_lock:
+        return {s.name: s for s in _last_good_sources}
+
 
 app = FastAPI(title="self-docs ingestion")
 
@@ -90,9 +145,13 @@ def _check_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def _run_sync_blocking(names: list[str]) -> None:
+def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceConfig]) -> None:
     """Synchronous sync worker — runs in a worker thread via `asyncio.to_thread`
-    so the event loop stays responsive for /status, /health, /metrics."""
+    so the event loop stays responsive for /status, /health, /metrics.
+
+    `sources_by_name` is resolved ONCE by the caller (the /sync endpoint) and
+    passed down here so a sources.yaml edit landing mid-sync cannot change
+    the set of sources (or their config) being iterated partway through."""
     orig_crawl = store.crawler.crawl
 
     def tracking_crawl(src, *args, **kwargs):
@@ -104,7 +163,7 @@ def _run_sync_blocking(names: list[str]) -> None:
     store.crawler.crawl = tracking_crawl
     try:
         for i, name in enumerate(names):
-            source = SOURCES_BY_NAME[name]
+            source = sources_by_name[name]
             log = logger.bind(source=name)
             start = time.monotonic()
             _state["current"] = {
@@ -157,9 +216,9 @@ def _run_sync_blocking(names: list[str]) -> None:
         store.crawler.crawl = orig_crawl
 
 
-async def _sync_task(names: list[str]) -> None:
+async def _sync_task(names: list[str], sources_by_name: dict[str, SourceConfig]) -> None:
     try:
-        await asyncio.to_thread(_run_sync_blocking, names)
+        await asyncio.to_thread(_run_sync_blocking, names, sources_by_name)
     finally:
         _state["running"] = False
         _state["current"] = None
@@ -174,8 +233,16 @@ async def sync(req: SyncRequest | None = None, authorization: str | None = Heade
     if _sync_lock.locked():
         raise HTTPException(status_code=409, detail="sync already running")
 
-    names = req.sources if (req and req.sources) else list(SOURCES_BY_NAME.keys())
-    unknown = [n for n in names if n not in SOURCES_BY_NAME]
+    # Resolve sources.yaml ONCE for this request: a re-read here fails soft
+    # (this try/except turns a ConfigError into a 400 and the service keeps
+    # running) rather than crashing — unlike the fail-fast startup load above.
+    try:
+        sources_by_name = get_sources_by_name()
+    except ConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    names = req.sources if (req and req.sources) else list(sources_by_name.keys())
+    unknown = [n for n in names if n not in sources_by_name]
     if unknown:
         raise HTTPException(status_code=400, detail=f"unknown source(s): {unknown}")
 
@@ -188,7 +255,7 @@ async def sync(req: SyncRequest | None = None, authorization: str | None = Heade
         "position": f"1 of {len(names)}" if names else "0 of 0",
     }
     logger.info("sync_started", sources=names)
-    asyncio.create_task(_sync_task(names))
+    asyncio.create_task(_sync_task(names, sources_by_name))
     return {"status": "started", "sources": names}
 
 
