@@ -17,21 +17,35 @@ Validation fails fast (raises `ConfigError`) on:
   - missing/invalid `base_url` (must be a valid http(s) URL)
   - unknown keys on a source entry
   - `name` not matching `^[a-z0-9-]+$`
+  - a sitemap-less source whose `base_url` path is excluded by its own
+    `include_prefixes`/`exclude_prefixes` (the BFS crawl seed would never
+    pass its own filters, so the source would index 0 pages)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
 NAME_PATTERN = r"^[a-z0-9-]+$"
 
 
 class ConfigError(ValueError):
     """Raised when sources.yaml fails validation. Message is human-readable."""
+
+
+def _path_allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[str]) -> bool:
+    """Mirrors crawler._allowed: exclude_prefixes always wins over
+    include_prefixes; an empty include_prefixes allowlists everything."""
+    if any(path.startswith(p) for p in exclude_prefixes):
+        return False
+    if include_prefixes:
+        return any(path.startswith(p) for p in include_prefixes)
+    return True
 
 
 class SourceConfig(BaseModel):
@@ -52,6 +66,27 @@ class SourceConfig(BaseModel):
     @classmethod
     def _none_to_empty(cls, v: Any) -> Any:
         return v if v is not None else []
+
+    @model_validator(mode="after")
+    def _base_url_passes_own_prefix_filters(self) -> "SourceConfig":
+        # Without a sitemap, the crawler seeds its BFS queue with base_url
+        # itself; if base_url's path is excluded (or not included) by this
+        # source's own include/exclude_prefixes, the seed is filtered out
+        # before the first fetch and the source silently indexes nothing
+        # (see security/lesson: nextjs base_url `/docs` vs include_prefixes
+        # `["/docs/"]`). Fail fast at config-load time instead.
+        if self.sitemap is not None:
+            return self
+        path = urlparse(str(self.base_url)).path or "/"
+        if not _path_allowed(path, self.include_prefixes, self.exclude_prefixes):
+            raise ValueError(
+                f"source '{self.name}': base_url path {path!r} is excluded by its own "
+                f"include_prefixes={self.include_prefixes!r} / exclude_prefixes="
+                f"{self.exclude_prefixes!r} — the BFS crawl seed would be filtered out "
+                "before the first fetch, so this source would index 0 pages. Fix the "
+                "prefixes so base_url's path itself is allowed."
+            )
+        return self
 
 
 class SourcesFile(BaseModel):

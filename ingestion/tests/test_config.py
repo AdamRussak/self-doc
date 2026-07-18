@@ -113,3 +113,69 @@ def test_missing_max_pages_raises(tmp_path):
     )
     with pytest.raises(ConfigError):
         load_sources(p)
+
+
+def test_base_url_excluded_by_own_include_prefixes_raises(tmp_path):
+    # Regression test for the nextjs lesson: base_url path `/docs` combined
+    # with include_prefixes `["/docs/"]` filters out the only BFS seed URL,
+    # so the source would silently index 0 pages. Must fail fast at load.
+    p = write_yaml(
+        tmp_path,
+        """
+        sources:
+          - name: bad-seed
+            base_url: https://example.com/docs
+            include_prefixes: ["/docs/"]
+            max_pages: 10
+        """,
+    )
+    with pytest.raises(ConfigError, match="bad-seed"):
+        load_sources(p)
+
+
+def test_base_url_excluded_by_own_exclude_prefixes_raises(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        """
+        sources:
+          - name: bad-seed-excluded
+            base_url: https://example.com/blog
+            exclude_prefixes: ["/blog"]
+            max_pages: 10
+        """,
+    )
+    with pytest.raises(ConfigError, match="bad-seed-excluded"):
+        load_sources(p)
+
+
+def test_base_url_allowed_by_own_prefixes_loads_fine(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        """
+        sources:
+          - name: good-seed
+            base_url: https://example.com/docs
+            include_prefixes: ["/docs"]
+            max_pages: 10
+        """,
+    )
+    sources = load_sources(p)
+    assert sources[0].name == "good-seed"
+
+
+def test_sitemap_source_skips_base_url_prefix_check(tmp_path):
+    # A sitemap-based source discovers URLs from the sitemap, not by BFS from
+    # base_url, so base_url need not itself pass include_prefixes.
+    p = write_yaml(
+        tmp_path,
+        """
+        sources:
+          - name: sitemap-src
+            base_url: https://example.com/
+            sitemap: https://example.com/sitemap.xml
+            include_prefixes: ["/tutorial/"]
+            max_pages: 10
+        """,
+    )
+    sources = load_sources(p)
+    assert sources[0].name == "sitemap-src"

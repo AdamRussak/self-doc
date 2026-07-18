@@ -224,8 +224,13 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
 
     outcome.pages_removed = _delete_missing_pages(conn, source_id, seen_urls)
 
+    pages_seen = outcome.pages_fetched + outcome.pages_skipped + outcome.pages_failed
     succeeded_any = outcome.pages_fetched > 0 or outcome.pages_skipped > 0
-    if outcome.pages_failed == 0:
+    if pages_seen == 0:
+        # A crawl that fetched/skipped/failed nothing indexed nothing — never
+        # report "ok" for an empty crawl (defeats partial/failed alerting).
+        outcome.status = "failed"
+    elif outcome.pages_failed == 0:
         outcome.status = "ok"
     elif succeeded_any:
         outcome.status = "partial"

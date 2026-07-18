@@ -13,7 +13,7 @@ sources:
 
   - name: nextjs
     base_url: https://nextjs.org/docs
-    include_prefixes: ["/docs/"]
+    include_prefixes: ["/docs"]
     exclude_prefixes: ["/docs/messages/", "/docs/architecture/"]
     max_pages: 500
     language: english

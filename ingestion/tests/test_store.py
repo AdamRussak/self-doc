@@ -219,3 +219,27 @@ def test_source_status_partial_on_some_page_failures(conn, monkeypatch):
     assert outcome.status == "partial"
     assert outcome.pages_fetched == 1
     assert outcome.pages_failed == 1
+
+
+def test_source_status_failed_on_empty_crawl(conn, monkeypatch):
+    # A crawl that fetches/skips/fails nothing (e.g. every candidate URL was
+    # filtered out before the first fetch) must never report "ok" — that
+    # would silently hide a source indexing 0 pages from partial/failed
+    # alerting.
+    source = make_source()
+
+    def empty_crawl(source, client=None):
+        return []
+
+    monkeypatch.setattr(store.crawler, "crawl", empty_crawl)
+
+    outcome = store.sync_source(source, conn)
+    assert outcome.pages_fetched == 0
+    assert outcome.pages_skipped == 0
+    assert outcome.pages_failed == 0
+    assert outcome.status == "failed"
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_status FROM doc_sources WHERE name = %s", (source.name,))
+        (status,) = cur.fetchone()
+    assert status == "failed"
