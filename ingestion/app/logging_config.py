@@ -31,6 +31,9 @@ def configure_logging(service: str = "ingestion", level: int = logging.INFO) -> 
 
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
 
+    for name in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

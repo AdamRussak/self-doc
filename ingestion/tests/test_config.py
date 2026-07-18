@@ -15,7 +15,16 @@ def test_seed_sources_yaml_loads(tmp_path):
     seed = Path(__file__).parent.parent / "app" / "sources.yaml"
     sources = load_sources(seed)
     names = {s.name for s in sources}
-    assert names == {"fastapi", "nextjs", "pgvector-readme"}
+    assert names == {
+        "fastapi",
+        "nextjs",
+        "pgvector-readme",
+        "appwrite",
+        "traefik",
+        "docker-compose",
+        "structlog",
+        "pydantic",
+    }
     for s in sources:
         assert s.max_pages > 0
         assert s.rate_limit_rps > 0

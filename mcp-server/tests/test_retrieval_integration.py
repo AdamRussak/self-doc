@@ -77,14 +77,32 @@ def model() -> TextEmbedding:
     return TextEmbedding(model_name=retrieval.EMBEDDING_MODEL_NAME)
 
 
+# The `seeded` fixture below only ever creates sources under these two
+# names. Scoping cleanup to them (instead of wiping the whole doc_sources
+# table) keeps this suite from ever touching genuine indexed sources
+# (fastapi, traefik, docker-compose, pgvector-readme, ...) when run against
+# the live DB.
+_TEST_SOURCE_NAMES = ("source-a", "source-b")
+
+
+def _purge_test_sources(c) -> None:
+    # doc_pages/doc_chunks cascade from doc_sources via ON DELETE CASCADE, so
+    # deleting the source row is sufficient to remove everything it owns.
+    c.rollback()  # clear any aborted transaction left by a failing test
+    with c.cursor() as cur:
+        cur.execute("DELETE FROM doc_sources WHERE name = ANY(%s)", (list(_TEST_SOURCE_NAMES),))
+    c.commit()
+
+
 @pytest.fixture()
 def conn():
     c = _connect(row_factory=dict_row)
-    with c.cursor() as cur:
-        cur.execute("DELETE FROM doc_sources")
-    c.commit()
-    yield c
-    c.close()
+    try:
+        _purge_test_sources(c)  # safety net in case a prior run crashed mid-test
+        yield c
+    finally:
+        _purge_test_sources(c)
+        c.close()
 
 
 class _NoCloseCtx:
@@ -159,15 +177,22 @@ def seeded(conn, model, monkeypatch):
 
 
 def test_exact_token_query_ranks_its_chunk_top_via_fts_arm(seeded):
-    result = retrieval.search("zzqfrobnicate", limit=5)
+    # Scoped to source-a: the live DB also holds the real indexed corpus
+    # (thousands of unrelated chunks) alongside the seeded fixture data, so
+    # an unscoped search could in principle surface an unrelated real chunk
+    # instead of the one this test seeded and cares about.
+    result = retrieval.search("zzqfrobnicate", source="source-a", limit=5)
     top_hit = result.split("\n\n---\n\n")[0]
     assert "a-cache" in top_hit
 
 
 def test_paraphrase_query_hits_its_chunk_via_vector_arm(seeded):
     # No lexical overlap with CHUNK_B's wording ("dark mode", "appearance",
-    # "settings", "toggle") — only the vector arm can surface this.
-    result = retrieval.search("how do I switch the interface to a night theme", limit=5)
+    # "settings", "toggle") — only the vector arm can surface this. Scoped to
+    # source-a for the same isolation reason as above: the vector arm has no
+    # relevance floor, so an unscoped query can be outranked by a real corpus
+    # chunk that is coincidentally closer in embedding space.
+    result = retrieval.search("how do I switch the interface to a night theme", source="source-a", limit=5)
     top_hit = result.split("\n\n---\n\n")[0]
     assert "a-theme" in top_hit
 

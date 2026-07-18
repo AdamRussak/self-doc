@@ -1,0 +1,133 @@
+# Retrieval quality eval cases.
+#
+# Each case tests that a specific query returns relevant results from the
+# expected source. The eval harness (test_retrieval_quality.py) asserts that
+# `expected_snippet` appears as a substring in at least `min_hits` of the
+# returned chunks.
+#
+# Run with: make eval
+# Requires: a synced database (all seed sources indexed).
+
+cases:
+  # --- FastAPI (exact-token + semantic) ---
+  - query: "FastAPI dependency injection"
+    expected_source: fastapi
+    expected_snippet: "Depends"
+    min_hits: 1
+
+  - query: "how to validate request body"
+    expected_source: fastapi
+    expected_snippet: "BaseModel"
+    min_hits: 1
+
+  - query: "FastAPI path parameters"
+    expected_source: fastapi
+    expected_snippet: "path"
+    min_hits: 1
+
+  - query: "background tasks in FastAPI"
+    expected_source: fastapi
+    expected_snippet: "BackgroundTask"
+    min_hits: 1
+
+  - query: "FastAPI middleware"
+    expected_source: fastapi
+    expected_snippet: "middleware"
+    min_hits: 1
+
+  # --- Next.js (exact-token + semantic) ---
+  - query: "revalidatePath"
+    expected_source: nextjs
+    expected_snippet: "revalidatePath"
+    min_hits: 1
+
+  - query: "how to do server side rendering"
+    expected_source: nextjs
+    expected_snippet: "server"
+    min_hits: 1
+
+  - query: "Next.js dynamic routes"
+    expected_source: nextjs
+    expected_snippet: "dynamic"
+    min_hits: 1
+
+  - query: "Next.js middleware"
+    expected_source: nextjs
+    expected_snippet: "middleware"
+    min_hits: 1
+
+  - query: "Next.js image optimization"
+    expected_source: nextjs
+    expected_snippet: "Image"
+    min_hits: 1
+
+  # --- pgvector (exact-token + semantic) ---
+  - query: "HNSW index parameters"
+    expected_source: pgvector-readme
+    expected_snippet: "hnsw"
+    min_hits: 1
+
+  - query: "cosine distance operator"
+    expected_source: pgvector-readme
+    expected_snippet: "<=>"
+    min_hits: 1
+
+  - query: "pgvector vector type"
+    expected_source: pgvector-readme
+    expected_snippet: "vector"
+    min_hits: 1
+
+  # --- Edge cases ---
+  - query: "uvicorn"
+    expected_source: fastapi
+    expected_snippet: "uvicorn"
+    min_hits: 1
+
+  - query: "how to bust the cache for one route"
+    expected_source: nextjs
+    expected_snippet: "revalidat"
+    min_hits: 1
+
+  # --- Appwrite ---
+  - query: "Appwrite database collections"
+    expected_source: appwrite
+    expected_snippet: "collection"
+    min_hits: 1
+
+  - query: "Appwrite authentication"
+    expected_source: appwrite
+    expected_snippet: "auth"
+    min_hits: 1
+
+  # --- Traefik ---
+  - query: "Traefik Docker labels"
+    expected_source: traefik
+    expected_snippet: "label"
+    min_hits: 1
+
+  - query: "Traefik middleware rate limiting"
+    expected_source: traefik
+    expected_snippet: "rateLimit"
+    min_hits: 1
+
+  # --- Docker Compose ---
+  - query: "Docker Compose volumes"
+    expected_source: docker-compose
+    expected_snippet: "volume"
+    min_hits: 1
+
+  - query: "Docker Compose healthcheck"
+    expected_source: docker-compose
+    expected_snippet: "healthcheck"
+    min_hits: 1
+
+  # --- structlog ---
+  - query: "structlog processors"
+    expected_source: structlog
+    expected_snippet: "processor"
+    min_hits: 1
+
+  - query: "structlog JSON rendering"
+    expected_source: structlog
+    expected_snippet: "JSON"
+    min_hits: 1

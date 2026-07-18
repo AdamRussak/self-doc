@@ -6,6 +6,10 @@ if the sitemap fetch/parse fails), else same-host breadth-first crawl from
 `urllib.robotparser`, applies a per-source token-bucket-ish rate limit
 (`rate_limit_rps`, default 1.0 req/sec), and identifies itself with a custom
 User-Agent. `exclude_prefixes` always wins over `include_prefixes`.
+
+Yields explicit `fetch_ok=True` / `fetch_ok=False` items for attempted
+fetches so downstream (`store.sync_source`) can protect never-started or
+transiently failing pages from being purged.
 """
 
 from __future__ import annotations
@@ -13,14 +17,20 @@ from __future__ import annotations
 import ipaddress
 import time
 import urllib.robotparser
+import warnings
+from collections.abc import Iterator
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 from .config import SourceConfig
 from .logging_config import get_logger
+from .urlscope import parse_sitemap
+from .urlscope import path_allowed as _path_allowed
 
 USER_AGENT = "self-docs-crawler/0.1"
 
@@ -56,12 +66,13 @@ def _same_host(url: str, base_url: str) -> bool:
 
 
 def _allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[str]) -> bool:
-    """exclude_prefixes always wins over include_prefixes."""
-    if any(path.startswith(p) for p in exclude_prefixes):
-        return False
-    if include_prefixes:
-        return any(path.startswith(p) for p in include_prefixes)
-    return True
+    """exclude_prefixes always wins over include_prefixes.
+
+    Delegates to `urlscope.path_allowed` for path-SEGMENT-BOUNDARY matching
+    (a plain `str.startswith` here would let `include_prefixes=["/traefik"]`
+    also match `/traefik-hub/...`, `/traefik-enterprise/...`,
+    `/traefik-mesh/...` — see urlscope module docstring)."""
+    return _path_allowed(path, include_prefixes, exclude_prefixes)
 
 
 def _is_private_ip_host(host: str) -> bool:
@@ -121,23 +132,175 @@ def can_fetch(rp: urllib.robotparser.RobotFileParser, url: str) -> bool:
         return True
 
 
-def discover_sitemap_urls(client: httpx.Client, sitemap_url: str) -> list[str]:
-    """Parse a sitemap.xml (with or without the sitemap XML namespace) and
-    return the list of <loc> URLs. Raises on network/parse failure so callers
-    can fall back to BFS."""
+# A sitemap index of sitemap indexes should log and stop, not recurse
+# unbounded (appwrite-style discovery must be bounded and safe against a
+# self-referencing sitemap index).
+MAX_SITEMAP_RECURSION_DEPTH = 1
+
+
+def discover_sitemap_urls(
+    client: httpx.Client,
+    sitemap_url: str,
+    max_pages: int,
+    limiter: RateLimiter,
+    log,
+    base_url: str,
+    include_prefixes: list[str],
+    exclude_prefixes: list[str],
+) -> list[str]:
+    """Discover page URLs from a sitemap.xml, recursing into child sitemaps
+    when the root is a `<sitemapindex>` (e.g. appwrite.io/sitemap.xml, whose
+    children are pages.xml, docs.xml, etc.).
+
+    Candidate `<loc>` entries are filtered by same-host + `include_prefixes`/
+    `exclude_prefixes` (via `urlscope.path_allowed`) BEFORE `max_pages` is
+    applied. This is load-bearing: a shared, whole-host sitemap (e.g.
+    doc.traefik.io/sitemap.xml covering traefik + enterprise + hub + mesh, or
+    docs.docker.com/sitemap.xml covering the entire Docker docs site) may put
+    only a small minority of its entries in scope for this source. Capping on
+    the RAW, unfiltered `<loc>` list would truncate to the first `max_pages`
+    URLs regardless of scope and hand back an incomplete-but-treated-as-
+    complete enumeration; `store.sync_source`'s `_delete_missing_pages` then
+    deletes every real in-scope page absent from that truncated list — i.e.
+    it would destroy a live corpus on a *successful* sync. Filtering here,
+    before the cap, is what keeps discovery a complete in-scope enumeration.
+
+    Raises on the TOP-LEVEL fetch/parse failure so callers can fall back to
+    BFS. A CHILD sitemap that fails to fetch/parse is logged and skipped —
+    it does not abort discovery of the other children. Recursion is capped
+    at `MAX_SITEMAP_RECURSION_DEPTH` and guarded against cycles (a
+    self-referencing sitemap index terminates). Stops early once `max_pages`
+    IN-SCOPE URLs have been collected so a huge sitemap cannot blow the page
+    budget. Uses `limiter` so recursion into child sitemaps still respects
+    the source's configured rate limit.
+
+    When `max_pages` actually truncates discovery (upstream has more in-scope
+    URLs than the budget allows), emits a single `sitemap_truncated_at_cap`
+    log event — once per call, not once per skipped URL — so an operator
+    watching a sync can tell that `max_pages`, not upstream, decided the
+    corpus size (traefik currently sits at 397 pages against `max_pages:
+    400`; this fires for real the moment upstream crosses 400).
+    """
+    truncation = {"truncated": False, "extra_seen_in_scope": 0, "unprocessed_child_sitemaps": 0}
+    collected = _discover_sitemap_urls_recursive(
+        client,
+        sitemap_url,
+        max_pages,
+        limiter,
+        log,
+        base_url,
+        include_prefixes,
+        exclude_prefixes,
+        depth=0,
+        seen_sitemaps=set(),
+        truncation=truncation,
+    )
+    if truncation["truncated"]:
+        log.info(
+            "sitemap_truncated_at_cap",
+            cap=max_pages,
+            collected=len(collected),
+            extra_seen_in_scope=truncation["extra_seen_in_scope"],
+            unprocessed_child_sitemaps=truncation["unprocessed_child_sitemaps"],
+        )
+    return collected
+
+
+def _discover_sitemap_urls_recursive(
+    client: httpx.Client,
+    sitemap_url: str,
+    max_pages: int,
+    limiter: RateLimiter,
+    log,
+    base_url: str,
+    include_prefixes: list[str],
+    exclude_prefixes: list[str],
+    *,
+    depth: int,
+    seen_sitemaps: set[str],
+    truncation: dict,
+) -> list[str]:
+    """Recursive worker for `discover_sitemap_urls`. `truncation` is a shared
+    mutable dict accumulated across the whole recursion tree; the public
+    wrapper logs from it exactly once after recursion completes."""
+    if sitemap_url in seen_sitemaps or max_pages <= 0:
+        return []
+    seen_sitemaps.add(sitemap_url)
+
+    limiter.wait()
     resp = client.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=15)
     resp.raise_for_status()
-    root = ElementTree.fromstring(resp.content)
-    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    urls = [el.text.strip() for el in root.findall(".//sm:loc", ns) if el.text]
-    if not urls:
-        urls = [el.text.strip() for el in root.findall(".//loc") if el.text]
-    return urls
+    urls, child_sitemaps = parse_sitemap(resp.content)
+
+    filtered: list[str] = []
+    for u in urls:
+        if not _same_host(u, base_url):
+            continue
+        if not _allowed(urlparse(u).path, include_prefixes, exclude_prefixes):
+            continue
+        if u not in filtered:
+            filtered.append(u)
+
+    if len(filtered) > max_pages:
+        # Overflow computed cheaply from data already fetched — no extra
+        # network calls — so operators can tell "truncated by 3" from
+        # "truncated by 3000".
+        truncation["truncated"] = True
+        truncation["extra_seen_in_scope"] += len(filtered) - max_pages
+        return filtered[:max_pages]
+
+    collected = filtered
+
+    if child_sitemaps:
+        if depth >= MAX_SITEMAP_RECURSION_DEPTH:
+            log.info(
+                "sitemap_index_depth_capped",
+                sitemap_url=sitemap_url,
+                children=len(child_sitemaps),
+            )
+            return collected
+        if len(collected) >= max_pages:
+            # Budget already exhausted by this level's own in-scope URLs;
+            # the child sitemaps are never fetched/explored.
+            truncation["truncated"] = True
+            truncation["unprocessed_child_sitemaps"] += len(child_sitemaps)
+            return collected
+        for i, child_url in enumerate(child_sitemaps):
+            if len(collected) >= max_pages:
+                truncation["truncated"] = True
+                truncation["unprocessed_child_sitemaps"] += len(child_sitemaps) - i
+                break
+            try:
+                child_urls = _discover_sitemap_urls_recursive(
+                    client,
+                    child_url,
+                    max_pages - len(collected),
+                    limiter,
+                    log,
+                    base_url,
+                    include_prefixes,
+                    exclude_prefixes,
+                    depth=depth + 1,
+                    seen_sitemaps=seen_sitemaps,
+                    truncation=truncation,
+                )
+            except (httpx.HTTPError, ValueError, ElementTree.ParseError) as e:
+                log.info("child_sitemap_failed", sitemap_url=child_url, error=str(e))
+                continue
+            for u in child_urls:
+                if u not in collected:
+                    collected.append(u)
+                if len(collected) >= max_pages:
+                    break
+
+    return collected
 
 
 def extract_links(html: str, page_url: str) -> list[str]:
     """Extract absolute, fragment-stripped same-document links from an HTML page."""
-    soup = BeautifulSoup(html, "html.parser")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+        soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -147,12 +310,21 @@ def extract_links(html: str, page_url: str) -> list[str]:
     return links
 
 
-def crawl(source: SourceConfig, client: httpx.Client | None = None) -> list[dict]:
+def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[dict]:
     """Discover and fetch up to `source.max_pages` pages for `source`.
 
-    Returns a list of `{"url": str, "html": str}` dicts. Pure w.r.t. side
-    effects on `client` — pass a mock/fake httpx.Client in tests to avoid
-    real network calls.
+    YIELDS `{"url": str, "html": str | None, "fetch_ok": bool}` dicts one at a
+    time as pages are visited, rather than materializing the whole crawl in
+    memory first. `fetch_ok=True` (with `html` populated) is yielded on
+    successful fetch. `fetch_ok=False` (with `html=None`) is yielded when an
+    attempted fetch fails (e.g., `robots_disallowed`, `page_fetch_failed`,
+    `page_fetch_non_200`, `redirect_rejected`), enabling downstream callers
+    (`store.sync_source`) to add the URL to `seen_urls` and prevent accidental
+    purging of existing rows during transient network outages. Scope and
+    private-IP rejections are dropped without being yielded.
+
+    Pure w.r.t. side effects on `client` — pass a mock/fake httpx.Client in
+    tests to avoid real network calls.
     """
     own_client = client is None
     if own_client:
@@ -165,37 +337,46 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> list[dict
         rp = load_robots(client, base_url)
         limiter = RateLimiter(source.rate_limit_rps)
 
-        pages: list[dict] = []
+        pages_fetched = 0
         visited: set[str] = set()
 
         candidate_urls: list[str] | None = None
         if source.sitemap:
             try:
-                candidate_urls = discover_sitemap_urls(client, str(source.sitemap))
+                candidate_urls = discover_sitemap_urls(
+                    client,
+                    str(source.sitemap),
+                    source.max_pages,
+                    limiter,
+                    log,
+                    base_url,
+                    source.include_prefixes,
+                    source.exclude_prefixes,
+                )
                 log.info("sitemap_discovered", count=len(candidate_urls))
-            except (httpx.HTTPError, ElementTree.ParseError) as e:
+            except (httpx.HTTPError, ElementTree.ParseError, ValueError) as e:
                 log.info("sitemap_failed_fallback_bfs", error=str(e))
                 candidate_urls = None
 
-        def _visit(url: str) -> httpx.Response | None:
+        def _visit(url: str) -> dict | None:
             if not _same_host(url, base_url):
                 return None
             if not _allowed(urlparse(url).path, source.include_prefixes, source.exclude_prefixes):
                 return None
             if not can_fetch(rp, url):
                 log.info("robots_disallowed", url=url)
-                return None
+                return {"url": url, "html": None, "fetch_ok": False}
             limiter.wait()
             start = time.monotonic()
             try:
                 resp = client.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
             except httpx.HTTPError as e:
                 log.info("page_fetch_failed", url=url, error=str(e))
-                return None
+                return {"url": url, "html": None, "fetch_ok": False}
             duration_ms = round((time.monotonic() - start) * 1000, 1)
             if resp.status_code != 200:
                 log.info("page_fetch_non_200", url=url, status=resp.status_code, duration_ms=duration_ms)
-                return None
+                return {"url": url, "html": None, "fetch_ok": False}
             final_url = str(resp.url)
             if not _validate_final_url(
                 final_url,
@@ -205,38 +386,42 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> list[dict
                 base_host_is_public,
             ):
                 log.info("redirect_rejected", url=url, final_url=final_url)
-                return None
+                return {"url": url, "html": None, "fetch_ok": False}
             log.info("page_fetched", url=url, duration_ms=duration_ms)
-            return resp
+            return {"url": url, "html": resp.text, "fetch_ok": True}
 
         if candidate_urls is not None:
             for url in candidate_urls:
-                if len(pages) >= source.max_pages:
+                if pages_fetched >= source.max_pages:
                     break
                 url = _strip_fragment(url)
                 if url in visited:
                     continue
                 visited.add(url)
-                resp = _visit(url)
-                if resp is not None:
-                    pages.append({"url": url, "html": resp.text})
+                item = _visit(url)
+                if item is not None:
+                    if item.get("fetch_ok", True):
+                        pages_fetched += 1
+                    yield item
         else:
             queue = [base_url]
-            while queue and len(pages) < source.max_pages:
+            while queue and pages_fetched < source.max_pages:
                 url = _strip_fragment(queue.pop(0))
                 if url in visited:
                     continue
                 visited.add(url)
-                resp = _visit(url)
-                if resp is None:
+                item = _visit(url)
+                if item is None:
                     continue
-                pages.append({"url": url, "html": resp.text})
-                for link in extract_links(resp.text, url):
-                    if link not in visited and _same_host(link, base_url):
-                        queue.append(link)
+                if item.get("fetch_ok", True):
+                    pages_fetched += 1
+                yield item
+                if item.get("fetch_ok", True) and item.get("html"):
+                    for link in extract_links(item["html"], url):
+                        if link not in visited and _same_host(link, base_url):
+                            queue.append(link)
 
-        log.info("crawl_complete", pages_fetched=len(pages))
-        return pages
+        log.info("crawl_complete", pages_fetched=pages_fetched)
     finally:
         if own_client:
             client.close()

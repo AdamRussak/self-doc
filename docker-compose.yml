@@ -48,8 +48,8 @@ services:
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
-    expose:
-      - "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
     networks:
       - default
     deploy:
@@ -76,11 +76,10 @@ services:
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
-    expose:
-      - "8000"
+    ports:
+      - "127.0.0.1:${DOCS_MCP_HOST_PORT:-8081}:8000"
     networks:
       - default
-      - traefik
     deploy:
       resources:
         limits:
@@ -91,33 +90,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-    labels:
-      - "traefik.enable=true"
-      # Container is attached to both `default` and `traefik` networks; tell
-      # Traefik explicitly which one to route through.
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}"
-      - "traefik.http.routers.self-docs-mcp.rule=Host(`${DOCS_MCP_HOSTNAME}`)"
-      # Home-lab convention is TLS-terminated `websecure`; override via
-      # TRAEFIK_ENTRYPOINT (e.g. to plain `web`) if this LAN's Traefik uses a
-      # different entrypoint name or has no TLS resolver configured.
-      - "traefik.http.routers.self-docs-mcp.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
-      - "traefik.http.routers.self-docs-mcp.tls=true"
-      - "traefik.http.services.self-docs-mcp.loadbalancer.server.port=8000"
-      # Disable response buffering so the streamable-HTTP/SSE transport isn't
-      # delayed/chunked by Traefik's reverse proxy.
-      - "traefik.http.services.self-docs-mcp.loadbalancer.responseforwarding.flushinterval=-1"
-      # Rate limit: a looping/misbehaving agent must not be able to hammer
-      # Postgres via repeated search_docs calls.
-      - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.average=20"
-      - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.burst=50"
-      - "traefik.http.routers.self-docs-mcp.middlewares=self-docs-mcp-ratelimit"
 
 networks:
   default:
     name: self-docs-internal
-  traefik:
-    name: ${TRAEFIK_NETWORK:-traefik_proxy}
-    external: true
 
 volumes:
   pgdata:

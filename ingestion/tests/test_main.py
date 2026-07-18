@@ -107,6 +107,34 @@ def test_sync_rejects_unknown_source(app_module):
     assert resp.status_code == 400
 
 
+def test_sync_source_crash_marks_status_failed_on_fresh_connection(app_module, monkeypatch):
+    """If `store.sync_source` itself crashes (e.g. its connection died mid
+    sync — the "connection is lost" incident this task fixes), the crash
+    handler must still persist last_status='failed' via a *new* connection,
+    since the one `sync_source` was using may be the reason it crashed."""
+    import app.store as store
+
+    calls = []
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+
+    def crashing_sync_source(source, conn):
+        raise RuntimeError("the connection is lost")
+
+    monkeypatch.setattr(store, "sync_source", crashing_sync_source)
+    monkeypatch.setattr(store, "mark_source_failed", lambda name: calls.append(name))
+
+    name = next(iter(app_module.SOURCES_BY_NAME))
+    app_module._run_sync_blocking([name])
+
+    assert calls == [name]
+    assert app_module._state["results"][name]["last_status"] == "failed"
+
+
 def test_sync_second_call_returns_409_while_running(app_module, monkeypatch):
     import asyncio
     import time
@@ -135,3 +163,120 @@ def test_sync_second_call_returns_409_while_running(app_module, monkeypatch):
             json={"sources": ["fastapi"]},
         )
         assert resp2.status_code == 409
+
+
+def test_status_reports_in_flight_sync_progress(app_module, monkeypatch):
+    import time
+
+    def slow_sync_blocking(names):
+        app_module._state["current"] = {
+            "source": names[0],
+            "pages_processed": 10,
+            "start_time": time.monotonic() - 5.0,
+            "position": f"1 of {len(names)}",
+        }
+        time.sleep(0.3)
+        app_module._state["current"]["pages_processed"] = 25
+        time.sleep(0.3)
+
+    monkeypatch.setattr(app_module, "_run_sync_blocking", slow_sync_blocking)
+
+    with TestClient(app_module.app) as client:
+        resp_post = client.post(
+            "/sync",
+            headers={"Authorization": "Bearer test-token-123"},
+            json={"sources": ["fastapi", "traefik"]},
+        )
+        assert resp_post.status_code == 200
+
+        time.sleep(0.1)
+        resp_status1 = client.get("/status")
+        assert resp_status1.status_code == 200
+        data1 = resp_status1.json()
+        assert data1["running"] is True
+        assert "current" in data1
+        assert data1["current"]["source"] == "fastapi"
+        assert data1["current"]["pages_processed"] == 10
+        assert data1["current"]["position"] == "1 of 2"
+        assert isinstance(data1["current"]["elapsed_s"], int)
+        assert data1["current"]["elapsed_s"] >= 5
+
+        time.sleep(0.3)
+        resp_status2 = client.get("/status")
+        assert resp_status2.status_code == 200
+        data2 = resp_status2.json()
+        assert data2["running"] is True
+        assert data2["current"]["pages_processed"] == 25
+
+        time.sleep(0.5)
+        resp_status3 = client.get("/status")
+        assert resp_status3.status_code == 200
+        data3 = resp_status3.json()
+        assert data3["running"] is False
+        assert "current" not in data3 or data3.get("current") is None
+
+
+def test_run_sync_blocking_updates_pages_processed(app_module, monkeypatch):
+    """Verify that _run_sync_blocking wraps store.crawler.crawl and increments
+    pages_processed dynamically as pages are yielded."""
+    import app.store as store
+
+    def fake_crawl(source, client=None):
+        yield {"url": "https://example.com/p1", "html": "# page 1"}
+        assert app_module._state["current"]["pages_processed"] == 1
+        yield {"url": "https://example.com/p2", "html": "# page 2"}
+        assert app_module._state["current"]["pages_processed"] == 2
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(
+        store,
+        "sync_source",
+        lambda source, conn: store.SourceOutcome(name=source.name, pages_fetched=2, status="ok"),
+    )
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+
+    name = next(iter(app_module.SOURCES_BY_NAME))
+    app_module._run_sync_blocking([name])
+
+
+def test_configure_logging_suppresses_third_party_loggers():
+    import logging
+    from app.logging_config import configure_logging
+
+    configure_logging()
+    for name in ("httpx", "httpcore", "uvicorn.access"):
+        assert logging.getLogger(name).level == logging.WARNING
+
+
+def test_run_sync_blocking_records_pages_soft_failed(app_module, monkeypatch):
+    from app import store
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(
+        store,
+        "sync_source",
+        lambda source, conn: store.SourceOutcome(
+            name=source.name,
+            pages_soft_failed=3,
+            status="ok",
+        ),
+    )
+
+    name = next(iter(app_module.SOURCES_BY_NAME))
+    before_count = app_module.PAGES_SOFT_FAILED.labels(source=name)._value.get()
+    app_module._run_sync_blocking([name])
+    after_count = app_module.PAGES_SOFT_FAILED.labels(source=name)._value.get()
+
+    assert app_module._state["results"][name]["pages_soft_failed"] == 3
+    assert after_count - before_count == 3
+
+

@@ -11,11 +11,13 @@ ENV OMP_NUM_THREADS=1 \
 
 WORKDIR /app
 
-# Install the package first so dependency layers cache independently of app code.
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 COPY app ./app
 
-RUN pip install --no-cache-dir .
+# Install uv for lockfile-based reproducible builds, export requirements from lockfile, then install deps.
+RUN pip install --no-cache-dir uv \
+    && uv export --no-dev --no-editable --format requirements-txt -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt
 
 # Non-root user; the FastEmbed cache lives under its home so the model can be
 # pre-downloaded (as this user) at build time and re-used at runtime.

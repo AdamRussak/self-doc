@@ -212,6 +212,7 @@ print(json.dumps({{
     "status": outcome.status,
     "pages_fetched": outcome.pages_fetched,
     "pages_failed": outcome.pages_failed,
+    "pages_soft_failed": outcome.pages_soft_failed,
     "chunks_indexed": outcome.chunks_indexed,
     "error": outcome.error,
 }}))

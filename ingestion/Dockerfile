@@ -14,10 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 COPY app ./app
 
-RUN pip install --no-cache-dir .
+# Install uv for lockfile-based reproducible builds, export requirements from lockfile, then install deps.
+RUN pip install --no-cache-dir uv \
+    && uv export --no-dev --no-editable --format requirements-txt -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt
 
 # Pre-download the FastEmbed embedding model (BAAI/bge-small-en-v1.5) and the
 # BGE tokenizer at build time so the first real sync doesn't pay a cold-start

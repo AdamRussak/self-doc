@@ -1,0 +1,57 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest  # or: self-hosted
+
+    services:
+      db:
+        image: pgvector/pgvector:0.8.2-pg16
+        env:
+          POSTGRES_USER: self_docs
+          POSTGRES_PASSWORD: testpass123
+          POSTGRES_DB: self_docs
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U self_docs -d self_docs"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 20s
+
+    env:
+      POSTGRES_USER: self_docs
+      POSTGRES_PASSWORD: testpass123
+      POSTGRES_DB: self_docs
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5433"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5433 -U self_docs && break
+            sleep 1
+          done
+
+      - name: Init database schema
+        run: |
+          PGPASSWORD=testpass123 psql -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
+            -f db/init/01_schema.sql
+
+      - name: Run tests
+        run: make test

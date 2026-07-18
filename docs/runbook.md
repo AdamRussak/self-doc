@@ -67,6 +67,8 @@ in the repo root with a populated `.env` (see `.env.example`).
    curl -sS http://localhost:8080/status | jq '."my-new-source"'
    ```
 
+   *(Note: A source reporting `last_status: "ok"` with `pages_soft_failed > 0` is completely healthy and normal — it indicates expected real-world site quirks like 404/503 links or stub pages. Only `pages_failed > 0` triggers `"partial"` or `"failed"`. See [Page Classification & Source Status Semantics](#page-classification--source-status-semantics) below.)*
+
 ---
 
 ## Re-index from scratch (nuke-and-rebuild)
@@ -93,6 +95,8 @@ with `\dx` (pgvector extension) and `\dt` (three tables) via
 
 ## Backup
 
+### Manual
+
 ```bash
 make backup
 ```
@@ -100,8 +104,35 @@ make backup
 Runs `pg_dump -Fc` inside the `db` container and writes a timestamped
 custom-format archive to `./backups/docs_<timestamp>.dump` on the host. Safe
 to run at any time (MVCC — a sync in progress does not block or corrupt the
-backup). No automated scheduling in the MVP; run this manually or wire it
-into cron/n8n yourself.
+backup).
+
+To prune old backups (keeping the 4 most recent by default):
+
+```bash
+make backup-prune          # keep 4
+make backup-prune KEEP=7   # keep 7
+```
+
+Or run both in one step:
+
+```bash
+make backup-auto           # backup + prune (keeps 4)
+```
+
+### Automated (cron)
+
+Use `scripts/backup.sh` with cron or a systemd timer. The script validates
+that the `db` container is running before attempting a backup.
+
+```bash
+# Weekly backup, Mondays at 04:00 (day after the n8n sync)
+# Add to crontab: crontab -e
+0 4 * * 1 /path/to/self-docs/scripts/backup.sh >> /var/log/self-docs-backup.log 2>&1
+```
+
+Environment variables:
+- `SELF_DOCS_DIR` — path to the repo root (default: auto-detected from script location)
+- `KEEP` — number of backups to retain (default: 4)
 
 ## Restore
 
@@ -152,6 +183,78 @@ larger sources.
 
 ---
 
+## Page Classification & Source Status Semantics
+
+The ingestion pipeline separates transient, expected site quirks (`pages_soft_failed`) from actionable internal defects (`pages_failed`) so operational alarms and status checks remain high-signal.
+
+### Three-Tier Page Classification
+
+1. **`pages_soft_failed` (Expected Site Quirks & Transient Skips)**
+   Pages that encountered expected real-world site friction during crawling or content extraction:
+   - **Stale/Broken Links (`fetch_ok=False`)**: Upstream sitemaps or HTML navigation links pointing to dead `404`/`503` URLs, or pages blocked by `robots.txt`. These URLs are added to `seen_urls` (so `_delete_missing_pages()` does not prematurely purge legitimate existing rows when a page is temporarily unreachable) and logged as `page_fetch_skipped`.
+   - **Stub / Placeholder Pages (`extraction.status != "ok"`)**: Pages with very little or malformed content (e.g., `<200` characters of Markdown or empty shells after boilerplate stripping) that are skipped during extraction and logged as `page_content_skipped`.
+   - *Behavior:* Soft failures do **not** degrade a source's overall status. They are recorded for observability but do not trigger operational alerts or `"partial"` statuses.
+
+2. **`pages_skipped` (Unchanged Hash Matches)**
+   Pages whose content SHA-256 hash exactly matches existing database rows from a previous sync. These are skipped instantly without re-chunking or re-embedding (`page_unchanged_skip`).
+
+3. **`pages_failed` (Actionable Pipeline Defects)**
+   Pages that encountered real, actionable internal errors during processing (e.g., database connection drops, transaction errors inside `replace_page()`, or `chunker.chunk_markdown()` crashes). These represent genuine infrastructure or pipeline failures that require operator intervention.
+
+### Source Status Determination (`last_status`)
+
+At the conclusion of `sync_source()`, the source's overall `last_status` is assigned:
+- **`"ok"`**: Zero hard errors occurred (`pages_failed == 0`) AND at least one page was processed (`pages_fetched + pages_skipped + pages_soft_failed > 0`). A source with `pages_soft_failed > 0` and `pages_failed == 0` correctly reports `"ok"`.
+- **`"partial"`**: At least one hard error occurred (`pages_failed > 0`), but one or more pages in the source succeeded or skipped (`succeeded_any` is true).
+- **`"failed"`**: Every attempted page encountered a hard pipeline error (`pages_failed > 0` and `succeeded_any` is false), OR the crawl yielded zero pages (`pages_seen == 0`, e.g., dead sitemap URL or over-restrictive `include_prefixes`).
+
+### Observability & Signals
+
+You can monitor page outcomes across three operational interfaces:
+
+#### 1. Querying `GET /status`
+The JSON status payload exposes exact counts for each classification per source:
+```bash
+curl -sS http://localhost:8080/status | jq '."traefik"'
+```
+Example output for a healthy source with transient broken links/stubs (`pages_soft_failed > 0`):
+```json
+{
+  "pages_fetched": 158,
+  "pages_skipped": 0,
+  "pages_failed": 0,
+  "pages_soft_failed": 5,
+  "pages_removed": 0,
+  "chunks_indexed": 1504,
+  "last_status": "ok",
+  "last_synced": 1752872160.123,
+  "error": null
+}
+```
+
+#### 2. Checking Prometheus Metrics
+The `/metrics` endpoint exposes counters for each outcome tier:
+```bash
+curl -sS http://localhost:8080/metrics | grep -E "^pages_(fetched|skipped|soft_failed|failed)_total"
+```
+Relevant series:
+- `pages_fetched_total{source="..."}`
+- `pages_skipped_total{source="..."}`
+- `pages_soft_failed_total{source="..."}`
+- `pages_failed_total{source="..."}`
+
+#### 3. Filtering Structured JSON Logs (`structlog`)
+Every page classification logs a distinct, structured JSON event:
+```bash
+# Watch for soft failures (broken upstream links or stub content skips)
+docker compose logs ingestion | grep -E '"event": "page_(content|fetch)_skipped"'
+
+# Watch for real actionable pipeline exceptions or source crashes
+docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_source_crashed)"'
+```
+
+---
+
 ## Troubleshooting
 
 - **Is the embedding model available offline?** Yes — `BAAI/bge-small-en-v1.5`
@@ -198,9 +301,5 @@ larger sources.
   chunk content and source URL are still correct and citable; this does not
   indicate a broken sync.
 
-- **A source keeps coming back `partial` or `failed`.** Check
-  `docker compose logs ingestion` for that source's `sync_source_crashed` or
-  extraction-length-sanity-check warnings — usually an upstream DOM change
-  or a dead sitemap. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` in
-  `sources.yaml` and re-sync; other sources are unaffected by one source's
-  failure.
+- **A source keeps coming back `partial` or `failed`.**
+  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` in `sources.yaml` and re-sync; other sources are unaffected by one source's failure.

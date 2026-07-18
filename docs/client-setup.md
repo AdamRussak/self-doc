@@ -1,21 +1,23 @@
 # Client setup — connecting an agent IDE to self-docs
 
-The `self-docs` MCP server is a single, shared, remote **streamable HTTP**
-endpoint behind Traefik at:
+# Client setup — connecting an agent IDE to self-docs
+
+When running **locally in development** (`make up`), the server exposes a loopback streamable HTTP/SSE endpoint at:
+
+```
+http://127.0.0.1:8081/sse
+```
+*(or port `8000` if `${DOCS_MCP_HOST_PORT}` is set to 8000).*
+
+When deployed **in production / home-lab behind Traefik** (`make up-prod`), the server is exposed at:
 
 ```
 https://<DOCS_MCP_HOSTNAME>/mcp
 ```
 
-Replace `<DOCS_MCP_HOSTNAME>` with the value of `DOCS_MCP_HOSTNAME` from this
-repo's `.env` (e.g. `docs-mcp.lan.example.com`). There is no local process to
-run per IDE — every client on the LAN points at the same server. The
-endpoint is rate-limited to ~20 req/s (burst 50) by Traefik; a single agent
-doing normal `search_docs` calls will never hit that.
+Replace `<DOCS_MCP_HOSTNAME>` with the value of `DOCS_MCP_HOSTNAME` from `.env`. When behind Traefik, the endpoint is rate-limited to ~20 req/s (burst 50).
 
-Two tools are exposed: `search_docs(query, source?, limit?)` and
-`list_doc_sources()`. See `AGENTS.md` for the routing rules every client
-should follow.
+Two tools are exposed: `search_docs(query, source?, limit?)` and `list_doc_sources()`. See `AGENTS.md` for the routing rules every client should follow.
 
 ---
 

@@ -1,15 +1,24 @@
-.PHONY: up down sync test backup restore
+-include .env
+export
 
-# Bring up the full stack (db + ingestion + mcp-server). Until T2/T3 land their
-# Dockerfiles, use `docker compose up -d db` directly to bring up just Postgres.
+.PHONY: up down up-prod down-prod sync test eval backup backup-prune backup-auto restore
+
+# Bring up the full stack locally (db + ingestion + mcp-server) using loopback ports.
 up:
 	docker compose --profile full up -d
 
 down:
 	docker compose down
 
+# Bring up the full stack in production/home-lab with Traefik ingress routing.
+up-prod:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile full up -d
+
+down-prod:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml down
+
 # Trigger a documentation sync via the ingestion service's /sync endpoint.
-# Requires SYNC_TOKEN to be set in the environment (see .env).
+# Reads SYNC_TOKEN from .env automatically via -include above.
 sync:
 	curl -sS -X POST http://localhost:8080/sync \
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
@@ -54,12 +63,33 @@ test:
 	cd tests && ../ingestion/.venv/bin/python -m pytest -q
 	@echo "make test: all suites green (DB-dependent tests skip cleanly if 'docker compose up -d db' wasn't run first)."
 
+# Run retrieval quality evaluation against a synced database.
+# Requires: compose db up with synced seed sources.
+# Skips cleanly if no db is reachable.
+eval:
+	@echo "=== ensuring mcp-server/.venv (eval needs retrieval module) ==="
+	@test -d mcp-server/.venv || python3 -m venv mcp-server/.venv
+	@mcp-server/.venv/bin/pip install -q -U pip
+	@mcp-server/.venv/bin/pip install -q -e mcp-server
+	@mcp-server/.venv/bin/pip install -q pytest pyyaml psycopg[binary]
+	@echo "=== retrieval quality eval ==="
+	cd tests/eval && ../../mcp-server/.venv/bin/python -m pytest -q -m eval
+
 # Dump the docs database to a timestamped custom-format archive under ./backups.
 backup:
 	mkdir -p backups
 	docker compose exec -T db pg_dump -U $${POSTGRES_USER} -d $${POSTGRES_DB} -Fc \
 		> backups/docs_$$(date +%Y%m%d_%H%M%S).dump
 	@echo "Backup written to backups/docs_<timestamp>.dump"
+
+# Prune old backups, keeping the most recent KEEP (default 4) dumps.
+KEEP ?= 4
+backup-prune:
+	@echo "Keeping the $(KEEP) most recent backups, removing older ones..."
+	@cd backups 2>/dev/null && ls -1t docs_*.dump 2>/dev/null | tail -n +$$(($(KEEP)+1)) | xargs -r rm -v || true
+
+# Combined target for cron/timer: backup then prune.
+backup-auto: backup backup-prune
 
 # Restore from a backup produced by `make backup`.
 # Usage: make restore FILE=backups/docs_20260101_030000.dump

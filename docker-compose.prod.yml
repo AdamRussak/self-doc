@@ -1,0 +1,40 @@
+# Production / Home-Lab Overlay for Traefik Ingress Routing
+#
+# Use this overlay alongside docker-compose.yml when deploying on a host running
+# Traefik. Attaches the mcp-server container to the external Traefik bridge network
+# and applies TLS termination, host routing, and rate-limiting middlewares.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile full up -d
+# or:
+#   make up-prod
+
+services:
+  mcp-server:
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      # Container is attached to both `default` and `traefik` networks; tell
+      # Traefik explicitly which one to route through.
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}"
+      - "traefik.http.routers.self-docs-mcp.rule=Host(`${DOCS_MCP_HOSTNAME}`)"
+      # Home-lab convention is TLS-terminated `websecure`; override via
+      # TRAEFIK_ENTRYPOINT (e.g. to plain `web`) if this LAN's Traefik uses a
+      # different entrypoint name or has no TLS resolver configured.
+      - "traefik.http.routers.self-docs-mcp.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.self-docs-mcp.tls=true"
+      - "traefik.http.services.self-docs-mcp.loadbalancer.server.port=8000"
+      # Disable response buffering so the streamable-HTTP/SSE transport isn't
+      # delayed/chunked by Traefik's reverse proxy.
+      - "traefik.http.services.self-docs-mcp.loadbalancer.responseforwarding.flushinterval=-1"
+      # Rate limit: a looping/misbehaving agent must not be able to hammer
+      # Postgres via repeated search_docs calls.
+      - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.self-docs-mcp-ratelimit.ratelimit.burst=50"
+      - "traefik.http.routers.self-docs-mcp.middlewares=self-docs-mcp-ratelimit"
+
+networks:
+  traefik:
+    name: ${TRAEFIK_NETWORK:-traefik_proxy}
+    external: true
