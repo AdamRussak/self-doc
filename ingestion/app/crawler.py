@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+from . import llms_txt
 from .config import SourceConfig
 from .logging_config import get_logger
 from .urlscope import parse_sitemap
@@ -325,7 +326,78 @@ def extract_links(html: str, page_url: str) -> list[str]:
     return links
 
 
-def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[dict]:
+def _looks_like_llms_txt(text: str) -> bool:
+    """Cheap sanity gate on a body `llms_txt.discover()` claims came from
+    `/llms-full.txt` or `/llms.txt`: `discover()` itself only checks status
+    200 / non-empty / size (by design — it is a generic best-effort HTTP
+    fetch, not a content-type validator), so a site that 200s an arbitrary
+    HTML fallback page for any unknown path (a common pattern) would
+    otherwise be treated as a valid llms.txt export.
+
+    The llmstxt.org convention requires the file to open with an H1 markdown
+    heading (`# Title`); this checks exactly that on the first non-blank
+    line, which is enough to reject an HTML (or otherwise non-llms.txt)
+    response without depending on anything `llms_txt.py` doesn't already
+    expose."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        return stripped.startswith("# ") or stripped == "#"
+    return False
+
+
+def _llms_index_conditional_check(
+    client: httpx.Client,
+    origin: str,
+    conditional: dict[str, tuple[str | None, str | None]],
+    log,
+) -> tuple[str, str] | tuple[str, str, str] | None:
+    """Check the llms-index candidate URLs (`{origin}/llms-full.txt` then
+    `{origin}/llms.txt`, same order/preference as `llms_txt.discover`)
+    against `conditional` validators, issuing a single conditional GET for
+    the first candidate that has a non-None etag/last-modified recorded.
+
+    Returns `("not_modified", url)` on a 304, `("fetched", url, text)` on a
+    200 (so the caller can reuse the body instead of double-fetching), or
+    `None` if no candidate has a conditional entry, or on any error (falls
+    back to a normal, unconditional `llms_txt.discover` call).
+    """
+    candidates = [f"{origin}/llms-full.txt", f"{origin}/llms.txt"]
+    for url in candidates:
+        if url not in conditional:
+            continue
+        etag, last_modified = conditional[url]
+        if etag is None and last_modified is None:
+            continue
+        headers = {"User-Agent": USER_AGENT}
+        if etag is not None:
+            headers["If-None-Match"] = etag
+        if last_modified is not None:
+            headers["If-Modified-Since"] = last_modified
+        try:
+            resp = client.get(url, headers=headers, timeout=15)
+        except Exception as e:  # noqa: BLE001 - fall back to normal discover() on any error
+            log.info("llms_index_conditional_check_failed", url=url, error=str(e))
+            return None
+        if resp.status_code == 304:
+            return ("not_modified", url)
+        if resp.status_code == 200:
+            try:
+                text = resp.text
+            except Exception:  # noqa: BLE001
+                return None
+            if text.strip():
+                return ("fetched", url, text)
+        return None
+    return None
+
+
+def crawl(
+    source: SourceConfig,
+    client: httpx.Client | None = None,
+    conditional: dict[str, tuple[str | None, str | None]] | None = None,
+) -> Iterator[dict]:
     """Discover and fetch up to `source.max_pages` pages for `source`.
 
     YIELDS `{"url": str, "html": str | None, "fetch_ok": bool}` dicts one at a
@@ -336,7 +408,25 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
     `page_fetch_non_200`, `redirect_rejected`), enabling downstream callers
     (`store.sync_source`) to add the URL to `seen_urls` and prevent accidental
     purging of existing rows during transient network outages. Scope and
-    private-IP rejections are dropped without being yielded.
+    private-IP rejections are dropped without being yielded. A successful
+    200 additionally carries `etag`/`last_modified` keys (only when present
+    in the response headers).
+
+    `conditional` maps `url -> (etag, last_modified)` validators from a prior
+    sync. When the *first* request for a URL (not a redirect hop) honors a
+    304, the item `{"url": url, "not_modified": True, "fetch_ok": True}` is
+    yielded instead of re-fetching/re-extracting.
+
+    When `source.llms_txt` is `"auto"` or `"only"`, `crawl` first tries the
+    llmstxt.org convention (`llms-full.txt`/`llms.txt`) via `llms_txt`. If a
+    file is discovered, its sections are yielded as
+    `{"url", "markdown", "heading_path", "fetch_ok": True}` items (capped at
+    `source.max_pages`) and the generator returns — the sitemap/BFS HTML
+    crawl is skipped entirely. If no file is found: `"auto"` falls through to
+    the normal HTML crawl; `"only"` yields nothing. If `conditional` carries a
+    validator for the llms-index URL and it 304s, a single sentinel
+    `{"kind": "llms_index_unchanged", "url", "not_modified": True,
+    "fetch_ok": True}` is yielded and the generator returns.
 
     Pure w.r.t. side effects on `client` — pass a mock/fake httpx.Client in
     tests to avoid real network calls.
@@ -364,6 +454,62 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
 
         pages_fetched = 0
         visited: set[str] = set()
+
+        if source.llms_txt in ("auto", "only"):
+            parsed_base = urlparse(base_url)
+            origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+            index_check = None
+            if conditional:
+                try:
+                    index_check = _llms_index_conditional_check(client, origin, conditional, log)
+                except Exception as e:  # noqa: BLE001 - fall back to discover() on any error
+                    log.info("llms_index_conditional_check_error", error=str(e))
+                    index_check = None
+
+            if index_check is not None and index_check[0] == "not_modified":
+                _, unchanged_url = index_check
+                log.info("llms_index_not_modified", url=unchanged_url)
+                yield {
+                    "kind": "llms_index_unchanged",
+                    "url": unchanged_url,
+                    "not_modified": True,
+                    "fetch_ok": True,
+                }
+                return
+
+            if index_check is not None and index_check[0] == "fetched":
+                _, fetched_url, fetched_text = index_check
+                discovered = (fetched_url, fetched_text)
+            else:
+                discovered = llms_txt.discover(client, base_url)
+
+            if discovered is not None and not _looks_like_llms_txt(discovered[1]):
+                log.info("llms_txt_content_sanity_check_failed", url=discovered[0])
+                discovered = None
+
+            if discovered is not None:
+                index_url, llms_text = discovered
+                limiter.wait()
+                sections = llms_txt.split_llms_full(llms_text, index_url)
+                llms_count = 0
+                for section in sections:
+                    if llms_count >= source.max_pages:
+                        break
+                    yield {
+                        "url": section["url"],
+                        "markdown": section["markdown"],
+                        "heading_path": section["heading_path"],
+                        "fetch_ok": True,
+                    }
+                    llms_count += 1
+                log.info("crawl_complete", pages_fetched=llms_count, mode="llms_txt")
+                return
+            if source.llms_txt == "only":
+                log.info("crawl_complete", pages_fetched=0, mode="llms_txt")
+                return
+            # source.llms_txt == "auto" and nothing discovered: fall through
+            # to the normal sitemap/BFS HTML crawl below.
 
         candidate_urls: list[str] | None = None
         if source.sitemap and not _same_host(str(source.sitemap), base_url):
@@ -407,16 +553,29 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
             resp = None
             for _hop in range(MAX_REDIRECTS + 1):
                 limiter.wait()
+                # Conditional (If-None-Match / If-Modified-Since) headers are
+                # only ever sent on the FIRST request for `url` — never on a
+                # redirect hop's target, which is a different resource.
+                req_headers = {"User-Agent": USER_AGENT}
+                if _hop == 0 and conditional and url in conditional:
+                    cond_etag, cond_last_modified = conditional[url]
+                    if cond_etag is not None:
+                        req_headers["If-None-Match"] = cond_etag
+                    if cond_last_modified is not None:
+                        req_headers["If-Modified-Since"] = cond_last_modified
                 try:
                     resp = client.get(
                         current_url,
-                        headers={"User-Agent": USER_AGENT},
+                        headers=req_headers,
                         timeout=15,
                         follow_redirects=False,
                     )
                 except httpx.HTTPError as e:
                     log.info("page_fetch_failed", url=url, error=str(e))
                     return {"url": url, "html": None, "fetch_ok": False}
+                if _hop == 0 and resp.status_code == 304:
+                    log.info("page_not_modified", url=url)
+                    return {"url": url, "not_modified": True, "fetch_ok": True}
                 if not resp.is_redirect:
                     break
                 location = resp.headers.get("location", "").strip()
@@ -452,7 +611,14 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
                 log.info("redirect_rejected", url=url, final_url=final_url)
                 return {"url": url, "html": None, "fetch_ok": False}
             log.info("page_fetched", url=url, duration_ms=duration_ms)
-            return {"url": url, "html": resp.text, "fetch_ok": True}
+            item = {"url": url, "html": resp.text, "fetch_ok": True}
+            resp_etag = resp.headers.get("etag")
+            resp_last_modified = resp.headers.get("last-modified")
+            if resp_etag is not None:
+                item["etag"] = resp_etag
+            if resp_last_modified is not None:
+                item["last_modified"] = resp_last_modified
+            return item
 
         if candidate_urls is not None:
             for url in candidate_urls:

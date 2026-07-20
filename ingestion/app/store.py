@@ -31,6 +31,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import psycopg
 
@@ -129,6 +130,7 @@ class SourceOutcome:
     name: str
     pages_fetched: int = 0  # new/changed pages successfully (re)indexed
     pages_skipped: int = 0  # unchanged pages skipped
+    pages_not_modified: int = 0  # pages/llms-index short-circuited by a 304 conditional GET
     pages_failed: int = 0  # pages that errored during extract/chunk/embed/store
     pages_soft_failed: int = 0  # pages skipped due to expected site quirks (e.g. 404/503 fetch, stub/placeholder content)
     pages_removed: int = 0  # pages deleted because absent from this crawl
@@ -170,23 +172,34 @@ def replace_page(
     url: str,
     content_hash: str,
     chunks: list[dict],
+    *,
+    fts_config: str = "english",
+    etag: str | None = None,
+    last_modified: str | None = None,
 ) -> int:
     """Delete-and-reinsert a page + its chunks in a single transaction.
 
     `ON DELETE CASCADE` on `doc_chunks.page_id` means deleting the
     `doc_pages` row wipes its old chunks; the new page row (fresh id) and
     chunks are then inserted. Returns the number of chunks inserted.
+
+    `fts_config` is the Postgres text-search configuration (`source.language`)
+    stamped onto every inserted chunk's `fts_config` column, which drives the
+    GENERATED `fts` column's `to_tsvector(fts_config, content)`. `etag` /
+    `last_modified` are the page's HTTP validators (when the crawler surfaced
+    them on a 200 response) persisted onto `doc_pages` for a future
+    conditional-GET sync.
     """
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM doc_pages WHERE url = %s", (url,))
             cur.execute(
                 """
-                INSERT INTO doc_pages (source_id, url, content_hash)
-                VALUES (%s, %s, %s)
+                INSERT INTO doc_pages (source_id, url, content_hash, etag, last_modified)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (source_id, url, content_hash),
+                (source_id, url, content_hash, etag, last_modified),
             )
             row = cur.fetchone()
             assert row is not None
@@ -194,8 +207,8 @@ def replace_page(
             for chunk in chunks:
                 cur.execute(
                     """
-                    INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding)
-                    VALUES (%s, %s, %s, %s, %s::vector)
+                    INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding, fts_config)
+                    VALUES (%s, %s, %s, %s, %s::vector, %s::regconfig)
                     """,
                     (
                         page_id,
@@ -203,9 +216,66 @@ def replace_page(
                         chunk["chunk_index"],
                         chunk["content"],
                         _embedding_literal(chunk["embedding"]),
+                        fts_config,
                     ),
                 )
     return len(chunks)
+
+
+def load_page_validators(
+    conn: psycopg.Connection, source_id: int
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return `{url: (etag, last_modified)}` for every `doc_pages` row of
+    `source_id`, for `crawler.crawl`'s `conditional` argument."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url, etag, last_modified FROM doc_pages WHERE source_id = %s",
+            (source_id,),
+        )
+        rows = cur.fetchall()
+    return {url: (etag, last_modified) for url, etag, last_modified in rows}
+
+
+def update_page_validators(
+    conn: psycopg.Connection, url: str, etag: str | None, last_modified: str | None
+) -> None:
+    """Refresh a `doc_pages` row's HTTP validators in place (used on the
+    hash-unchanged path so a future sync can issue a conditional GET even
+    when this run wasn't itself conditional)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE doc_pages SET etag = %s, last_modified = %s WHERE url = %s",
+            (etag, last_modified, url),
+        )
+    if not conn.autocommit:
+        conn.commit()
+
+
+def get_llms_validators(conn: psycopg.Connection, source_id: int) -> tuple[str | None, str | None]:
+    """Return `(llms_etag, llms_last_modified)` for `source_id`'s `doc_sources` row."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT llms_etag, llms_last_modified FROM doc_sources WHERE id = %s",
+            (source_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return (None, None)
+    return (row[0], row[1])
+
+
+def set_llms_validators(
+    conn: psycopg.Connection, source_id: int, etag: str | None, last_modified: str | None
+) -> None:
+    """Persist the llms-index (`llms.txt`/`llms-full.txt`) HTTP validators
+    for a future conditional-GET sync."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE doc_sources SET llms_etag = %s, llms_last_modified = %s WHERE id = %s",
+            (etag, last_modified, source_id),
+        )
+    if not conn.autocommit:
+        conn.commit()
 
 
 def _delete_missing_pages(
@@ -381,8 +451,29 @@ def sync_source(
         cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
         (pre_sync_existing_count,) = cur.fetchone()
 
+    # Build the conditional-GET validator map passed into `crawler.crawl`:
+    # per-page validators from `doc_pages`, plus (when llms.txt discovery is
+    # enabled) the two llms-index candidate URLs mapped to the source's
+    # stored llms validators, so an unchanged llms.txt/llms-full.txt can
+    # short-circuit the whole crawl via a single 304.
+    conditional: dict[str, tuple[str | None, str | None]] = load_page_validators(conn, source_id)
+    if source.llms_txt in ("auto", "only"):
+        parsed_base = urlparse(str(source.base_url))
+        origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+        llms_validators = get_llms_validators(conn, source_id)
+        if llms_validators != (None, None):
+            conditional[f"{origin}/llms-full.txt"] = llms_validators
+            conditional[f"{origin}/llms.txt"] = llms_validators
+
     try:
-        page_iter = iter(crawler.crawl(source))
+        try:
+            page_iter = iter(crawler.crawl(source, conditional=conditional))
+        except TypeError:
+            # Defensive fallback for callers/tests that monkeypatch
+            # `crawler.crawl` with a signature that doesn't accept
+            # `conditional` (mirrors the same tolerance pattern used
+            # elsewhere for `progress_cb`-less test doubles).
+            page_iter = iter(crawler.crawl(source))
     except Exception as e:  # noqa: BLE001 - defensive: crawler.crawl is a generator
         # function in production, so *calling* it can't itself raise — this
         # branch only fires if `crawl` is swapped for a non-generator
@@ -399,6 +490,7 @@ def sync_source(
     seen_urls: set[str] = set()
     fetch_failed_urls: set[str] = set()
     crawl_aborted_early = False
+    llms_unchanged = False
 
     try:
         # `crawl()` is a generator: pages are pulled and committed one at a
@@ -420,6 +512,14 @@ def sync_source(
                 crawl_aborted_early = True
                 break
 
+            if page.get("kind") == "llms_index_unchanged":
+                # The whole llms.txt/llms-full.txt index 304'd: nothing in
+                # the source changed, so the existing `doc_pages` rows are
+                # left completely untouched (no purge, no rewrite).
+                llms_unchanged = True
+                log.info("llms_index_unchanged", url=page.get("url"))
+                break
+
             url = page["url"]
             seen_urls.add(url)
 
@@ -431,29 +531,57 @@ def sync_source(
                     progress_cb(outcome, url)
                 continue
 
-            html = page["html"]
+            if page.get("not_modified"):
+                # Per-page 304: validators matched, body wasn't re-fetched.
+                # The existing row is already correct — don't touch it.
+                outcome.pages_not_modified += 1
+                log.info("page_not_modified", url=url)
+                if progress_cb:
+                    progress_cb(outcome, url)
+                continue
 
             try:
-                extraction = extract.extract(url, html)
-                if extraction.status != "ok":
-                    outcome.pages_soft_failed += 1
-                    log.info("page_content_skipped", url=url, reason=extraction.reason)
-                    if progress_cb:
-                        progress_cb(outcome, url)
-                    continue
+                markdown = page.get("markdown")
+                if markdown is None:
+                    # HTML page: unchanged extract.extract flow.
+                    html = page["html"]
+                    extraction = extract.extract(url, html)
+                    if extraction.status != "ok":
+                        outcome.pages_soft_failed += 1
+                        log.info("page_content_skipped", url=url, reason=extraction.reason)
+                        if progress_cb:
+                            progress_cb(outcome, url)
+                        continue
+                    markdown = extraction.markdown
+                # else: llms.txt section, already-extracted markdown — skip
+                # extract.extract entirely.
 
-                content_hash = hash_markdown(extraction.markdown)
+                content_hash = hash_markdown(markdown)
                 existing_hash = get_existing_page_hash(conn, url)
                 if existing_hash == content_hash:
                     outcome.pages_skipped += 1
                     log.info("page_unchanged_skip", url=url)
+                    if page.get("etag") or page.get("last_modified"):
+                        # Refresh validators even though the content itself
+                        # didn't change, so a future sync can issue a
+                        # conditional GET for this URL.
+                        update_page_validators(conn, url, page.get("etag"), page.get("last_modified"))
                     if progress_cb:
                         progress_cb(outcome, url)
                     continue
 
-                chunks = chunker.chunk_markdown(url, extraction.markdown)
+                chunks = chunker.chunk_markdown(url, markdown)
                 chunks = embedder.embed_chunks(chunks)
-                n = replace_page(conn, source_id, url, content_hash, chunks)
+                n = replace_page(
+                    conn,
+                    source_id,
+                    url,
+                    content_hash,
+                    chunks,
+                    fts_config=source.language,
+                    etag=page.get("etag"),
+                    last_modified=page.get("last_modified"),
+                )
                 outcome.pages_fetched += 1
                 outcome.chunks_indexed += n
                 log.info("page_indexed", url=url, chunks=n, changed=existing_hash is not None)
@@ -475,6 +603,25 @@ def sync_source(
         close = getattr(page_iter, "close", None)
         if close is not None:
             close()
+
+    if llms_unchanged:
+        # The llms-index 304'd as a whole: nothing about the source changed,
+        # so every existing `doc_pages` row for it is still correct.
+        # Deliberately skip `_delete_missing_pages` entirely (zero deletes,
+        # not just a guard-refused delete) rather than routing through the
+        # `not seen_urls` empty-purge-refusal path below, since `seen_urls`
+        # is empty here for a reason unrelated to a broken enumeration.
+        outcome.pages_removed = 0
+        outcome.pages_not_modified = pre_sync_existing_count
+        outcome.status = "ok"
+        _update_source_status(conn, source.name, outcome.status)
+        log.info(
+            "source_sync_complete",
+            status=outcome.status,
+            reason="llms_index_unchanged",
+            pages_not_modified=outcome.pages_not_modified,
+        )
+        return outcome
 
     # `seen_urls` is only a trustworthy, COMPLETE enumeration of the source
     # when the crawl actually reached `StopIteration`. Two distinct unsafe

@@ -82,6 +82,7 @@ def _make_record(**overrides) -> SourceRecord:
         max_pages=100,
         language="english",
         rate_limit_rps=1.0,
+        llms_txt="auto",
         schedule_cron=None,
         enabled=True,
         status="active",

@@ -57,6 +57,7 @@ def _make_record(
         created_at=datetime.now(timezone.utc),
         last_synced=None,
         last_status=None,
+        llms_txt="auto",
     )
 
 

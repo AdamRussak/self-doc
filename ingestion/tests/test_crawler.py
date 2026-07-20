@@ -925,6 +925,207 @@ def test_extract_links_suppresses_xml_warning(recwarn):
 
 
 
+LLMS_FULL_THREE_SECTIONS = "# One\ncontent1\n\n# Two\ncontent2\n\n# Three\ncontent3\n"
+
+
+def test_llms_auto_falls_back_to_bfs_when_discover_finds_nothing():
+    """llms_txt="auto" with no llms-full.txt/llms.txt available (both 404)
+    must fall through to the normal sitemap/BFS HTML crawl."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url in ("https://example.com/llms-full.txt", "https://example.com/llms.txt"):
+            return httpx.Response(404)
+        if url == "https://example.com/":
+            return httpx.Response(200, text='<html><body><a href="/docs/a">A</a></body></html>')
+        if url == "https://example.com/docs/a":
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    urls = {p["url"] for p in pages}
+    assert "https://example.com/" in urls
+    assert "https://example.com/docs/a" in urls
+    # BFS items carry "html", not "markdown".
+    assert all("html" in p for p in pages)
+
+
+def test_llms_only_yields_nothing_when_discover_finds_nothing():
+    """llms_txt="only" with no llms-full.txt/llms.txt available must yield
+    nothing at all — no BFS fallback."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="only",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages == []
+
+
+def test_llms_discovered_body_yields_one_markdown_item_per_section_capped():
+    """A discovered llms-full.txt body (first non-blank line an H1) yields
+    one markdown item per split section, capped at source.max_pages."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/llms-full.txt":
+            return httpx.Response(200, text=LLMS_FULL_THREE_SECTIONS)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=2,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert len(pages) == 2
+    for p in pages:
+        assert p["fetch_ok"] is True
+        assert "markdown" in p
+        assert "heading_path" in p
+
+
+def test_conditional_304_on_html_url_yields_not_modified_with_no_html():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            if request.headers.get("if-none-match") == "abc123":
+                return httpx.Response(304)
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    pages = list(
+        crawl(source, client=client, conditional={"https://example.com/": ("abc123", None)})
+    )
+    assert pages == [{"url": "https://example.com/", "not_modified": True, "fetch_ok": True}]
+
+
+def test_200_html_response_surfaces_etag_and_last_modified_on_item():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            return httpx.Response(
+                200,
+                text=PAGE_HTML,
+                headers={"ETag": "xyz789", "Last-Modified": "Wed, 01 Jan 2020 00:00:00 GMT"},
+            )
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert len(pages) == 1
+    assert pages[0]["etag"] == "xyz789"
+    assert pages[0]["last_modified"] == "Wed, 01 Jan 2020 00:00:00 GMT"
+
+
+def test_conditional_headers_only_sent_on_first_hop_not_redirect_target():
+    requested_headers: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/docs/old":
+            requested_headers["old"] = dict(request.headers)
+            return httpx.Response(301, headers={"Location": "/docs/new"})
+        if url == "https://example.com/docs/new":
+            requested_headers["new"] = dict(request.headers)
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/docs/old",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    conditional = {
+        "https://example.com/docs/old": ("etag-old", None),
+        "https://example.com/docs/new": ("etag-new", None),
+    }
+    pages = list(crawl(source, client=client, conditional=conditional))
+    assert len(pages) == 1
+    assert requested_headers["old"].get("if-none-match") == "etag-old"
+    assert "if-none-match" not in requested_headers["new"]
+
+
+def test_llms_index_unchanged_sentinel_emitted_on_304_with_stored_validator():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/llms-full.txt":
+            if request.headers.get("if-none-match") == "etag-full":
+                return httpx.Response(304)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    conditional = {"https://example.com/llms-full.txt": ("etag-full", None)}
+    pages = list(crawl(source, client=client, conditional=conditional))
+    assert pages == [
+        {
+            "kind": "llms_index_unchanged",
+            "url": "https://example.com/llms-full.txt",
+            "not_modified": True,
+            "fetch_ok": True,
+        }
+    ]
+
+
 def test_crawl_refuses_unresolvable_host_fail_closed(monkeypatch):
     """Crawl time fails CLOSED on an unresolvable host (unlike config
     validation, which deliberately does not — see test_config)."""

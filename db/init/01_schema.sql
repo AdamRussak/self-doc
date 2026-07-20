@@ -1,11 +1,15 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE doc_sources (
-    id            SERIAL PRIMARY KEY,
-    name          TEXT NOT NULL UNIQUE,      -- e.g. "nextjs", matches sources.yaml key
-    base_url      TEXT NOT NULL,
-    last_synced   TIMESTAMPTZ,
-    last_status   TEXT                       -- ok | partial | failed
+    id                 SERIAL PRIMARY KEY,
+    name               TEXT NOT NULL UNIQUE,      -- e.g. "nextjs", matches sources.yaml key
+    base_url           TEXT NOT NULL,
+    last_synced        TIMESTAMPTZ,
+    last_status        TEXT,                      -- ok | partial | failed
+    llms_txt           TEXT NOT NULL DEFAULT 'auto'
+                            CHECK (llms_txt IN ('auto', 'off', 'only')),
+    llms_etag          TEXT,
+    llms_last_modified TEXT
 );
 
 CREATE TABLE doc_pages (
@@ -13,7 +17,9 @@ CREATE TABLE doc_pages (
     source_id     INT NOT NULL REFERENCES doc_sources(id) ON DELETE CASCADE,
     url           TEXT NOT NULL UNIQUE,
     content_hash  CHAR(64) NOT NULL,         -- SHA-256 of extracted markdown
-    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    etag          TEXT,
+    last_modified TEXT
 );
 
 CREATE TABLE doc_chunks (
@@ -23,7 +29,8 @@ CREATE TABLE doc_chunks (
     chunk_index   INT NOT NULL,
     content       TEXT NOT NULL,             -- markdown
     embedding     vector(384) NOT NULL,
-    fts           tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+    fts_config    regconfig NOT NULL DEFAULT 'english',
+    fts           tsvector GENERATED ALWAYS AS (to_tsvector(fts_config, content)) STORED
 );
 
 CREATE INDEX doc_chunks_embedding_idx ON doc_chunks

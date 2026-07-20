@@ -536,10 +536,10 @@ def test_source_status_partial_on_hard_page_failures(conn, monkeypatch):
 
     orig_replace = store.replace_page
 
-    def fake_replace_page(conn_arg, source_id, url, content_hash, chunks):
+    def fake_replace_page(conn_arg, source_id, url, content_hash, chunks, **kwargs):
         if url == "https://example.com/bad":
             raise RuntimeError("hard DB write error")
-        return orig_replace(conn_arg, source_id, url, content_hash, chunks)
+        return orig_replace(conn_arg, source_id, url, content_hash, chunks, **kwargs)
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
     monkeypatch.setattr(store.extract, "extract", fake_extract)
@@ -1050,6 +1050,126 @@ def test_recovery_resume_across_syncs_incremental(conn, second_conn, monkeypatch
     assert outcome2.pages_fetched == 1  # p2 indexed!
     assert outcome2.status == "ok"
     assert _existing_urls(second_conn, source.name) == {"https://example.com/p1", "https://example.com/p2"}
+
+
+def _fake_crawl_items(monkeypatch, items):
+    """Install a crawler.crawl double that yields `items` verbatim (already
+    in the shape `crawl()` would yield: markdown items, not_modified items,
+    or an llms_index_unchanged sentinel). Accepts **kwargs (in particular
+    `conditional=`) since `sync_source` calls `crawler.crawl(source,
+    conditional=...)` first, falling back to `crawl(source)` only on
+    TypeError."""
+
+    def fake_crawl(source, client=None, conditional=None, **kwargs):
+        yield from items
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+
+
+def test_sync_source_markdown_item_indexes_with_source_language_fts_config(conn, monkeypatch):
+    """A crawl yielding a 'markdown' item (llms.txt fast-path) must be
+    indexed without going through extract.extract, and every inserted
+    doc_chunks row's fts_config must equal source.language."""
+    source = SourceConfig.model_validate(
+        {"name": "test-src", "base_url": "https://example.com/", "max_pages": 10, "language": "french"}
+    )
+    _use_fast_chunk_and_embed(monkeypatch)
+    _fake_crawl_items(
+        monkeypatch,
+        [
+            {
+                "url": "https://example.com/fr-page",
+                "markdown": "# Titre\nCeci est un contenu de test en francais pour la config fts.",
+                "heading_path": "Titre",
+                "fetch_ok": True,
+            }
+        ],
+    )
+
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "ok"
+    assert outcome.pages_fetched == 1
+    assert outcome.chunks_indexed > 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.fts_config::text FROM doc_chunks c
+            JOIN doc_pages p ON p.id = c.page_id
+            JOIN doc_sources s ON s.id = p.source_id
+            WHERE s.name = %s
+            """,
+            (source.name,),
+        )
+        rows = cur.fetchall()
+    assert rows
+    assert all(r[0] == "french" for r in rows)
+
+
+def test_sync_source_per_page_not_modified_bumps_outcome_and_leaves_row_untouched(conn, monkeypatch):
+    """A per-page 304 (`not_modified: True`, no markdown/html) must bump
+    outcome.pages_not_modified and leave the existing doc_pages row exactly
+    as-is (no delete, no rewrite)."""
+    source = make_source()
+    _use_fast_chunk_and_embed(monkeypatch)
+    _fake_crawl_items(
+        monkeypatch,
+        [
+            {
+                "url": "https://example.com/nm",
+                "markdown": "# Title\nSome content that is indexed the first time around.",
+                "heading_path": "Title",
+                "fetch_ok": True,
+            }
+        ],
+    )
+    outcome1 = store.sync_source(source, conn)
+    assert outcome1.pages_fetched == 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/nm",))
+        (hash_before,) = cur.fetchone()
+
+    _fake_crawl_items(
+        monkeypatch,
+        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+    )
+    outcome2 = store.sync_source(source, conn)
+    assert outcome2.pages_not_modified == 1
+    assert outcome2.pages_fetched == 0
+    assert outcome2.pages_removed == 0
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/nm",))
+        (hash_after,) = cur.fetchone()
+    assert hash_after == hash_before
+
+
+def test_sync_source_llms_index_unchanged_sentinel_skips_purge_entirely(conn, second_conn, monkeypatch):
+    """A crawl yielding only the `llms_index_unchanged` sentinel must result
+    in zero deletes (pages_removed == 0) even though doc_pages has rows for
+    this source that were never in seen_urls this run."""
+    source = make_source()
+    existing_urls = [f"https://example.com/page-{i}" for i in range(5)]
+    _seed_pages(conn, monkeypatch, source, existing_urls)
+
+    _fake_crawl_items(
+        monkeypatch,
+        [
+            {
+                "kind": "llms_index_unchanged",
+                "url": "https://example.com/llms-full.txt",
+                "not_modified": True,
+                "fetch_ok": True,
+            }
+        ],
+    )
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.pages_removed == 0
+    assert outcome.status == "ok"
+    assert _existing_urls(second_conn, source.name) == set(existing_urls)
 
 
 def test_recovery_crash_resume_incremental(conn, second_conn, monkeypatch):

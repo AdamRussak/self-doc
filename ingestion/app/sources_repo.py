@@ -67,7 +67,7 @@ aborting the whole scheduler pass. Loud in logs, not fatal in behavior.
 `update_source` vs the lifecycle mutators (`set_status`, `set_enabled`,
 `set_schedule`): `update_source` overwrites ONLY the `SourceConfig`-shaped
 columns (base_url/sitemap/include_prefixes/exclude_prefixes/max_pages/
-language/rate_limit_rps) — it is NOT a full-row replace and never touches
+language/rate_limit_rps/llms_txt) — it is NOT a full-row replace and never touches
 `status`, `enabled`, `schedule_cron`, or `proposed_by`. Those four are
 lifecycle/scheduling fields with different authorization implications than a
 config edit, and are changed only via the dedicated `set_status`/
@@ -102,6 +102,7 @@ SOURCE_COLUMNS: tuple[str, ...] = (
     "max_pages",
     "language",
     "rate_limit_rps",
+    "llms_txt",
     "schedule_cron",
     "enabled",
     "status",
@@ -131,6 +132,7 @@ class SourceRecord:
     max_pages: int | None
     language: str
     rate_limit_rps: float
+    llms_txt: str
     schedule_cron: str | None
     enabled: bool
     status: str
@@ -171,6 +173,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         max_pages,
         language,
         rate_limit_rps,
+        llms_txt,
         schedule_cron,
         enabled,
         status,
@@ -189,6 +192,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         max_pages=max_pages if (max_pages is not None and max_pages > 0) else 100,
         language=language or "english",
         rate_limit_rps=rate_limit_rps if (rate_limit_rps is not None and rate_limit_rps > 0) else 1.0,
+        llms_txt=llms_txt if llms_txt else "auto",
         schedule_cron=schedule_cron,
         enabled=bool(enabled),
         status=status,
@@ -202,7 +206,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
 def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
     """`SourceConfig` -> the plain-value tuple shared by every write path:
     `(base_url, sitemap, include_prefixes, exclude_prefixes, max_pages,
-    language, rate_limit_rps)`. Pure — no DB, no I/O.
+    language, rate_limit_rps, llms_txt)`. Pure — no DB, no I/O.
 
     `name` is deliberately excluded: `create_source` writes it once at
     insert time (a source's `name` is its stable identity, see
@@ -217,6 +221,7 @@ def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
         cfg.max_pages,
         cfg.language,
         cfg.rate_limit_rps,
+        str(cfg.llms_txt),
     )
 
 
@@ -232,6 +237,7 @@ def _cfg_matches_record(cfg: SourceConfig, record: SourceRecord) -> bool:
         and cfg.max_pages == record.max_pages
         and cfg.language == record.language
         and abs(cfg.rate_limit_rps - record.rate_limit_rps) < 1e-9
+        and cfg.llms_txt == record.llms_txt
     )
 
 
@@ -426,7 +432,7 @@ def create_source(
     if status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status!r}: must be one of {VALID_STATUSES}")
 
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -434,8 +440,8 @@ def create_source(
             """
             INSERT INTO doc_sources
                 (name, base_url, sitemap, include_prefixes, exclude_prefixes,
-                 max_pages, language, rate_limit_rps, status, proposed_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 max_pages, language, rate_limit_rps, llms_txt, status, proposed_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -447,6 +453,7 @@ def create_source(
                 max_pages,
                 language,
                 rate_limit_rps,
+                llms_txt,
                 status,
                 proposed_by,
             ),
@@ -465,7 +472,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
     (`name` is immutable via this function; `source_id` is the identity) and
     does not touch `status`/`enabled`/`schedule_cron`/`proposed_by` — use
     `set_status` for status changes. DB-dependent."""
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -474,7 +481,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
             UPDATE doc_sources
             SET base_url = %s, sitemap = %s, include_prefixes = %s,
                 exclude_prefixes = %s, max_pages = %s, language = %s,
-                rate_limit_rps = %s
+                rate_limit_rps = %s, llms_txt = %s
             WHERE id = %s
             """,
             (
@@ -485,6 +492,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
                 max_pages,
                 language,
                 rate_limit_rps,
+                llms_txt,
                 source_id,
             ),
         )

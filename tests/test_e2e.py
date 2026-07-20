@@ -219,6 +219,7 @@ print(json.dumps({{
 """
     env = os.environ.copy()
     env.update(PG_ENV)
+    env["SELF_DOCS_ALLOW_PRIVATE_ADDRESSES"] = "1"
     proc = subprocess.run(
         [str(INGESTION_PY), "-c", script],
         cwd=str(INGESTION_ROOT),
@@ -241,6 +242,7 @@ print(result)
 """
     env = os.environ.copy()
     env.update(PG_ENV)
+    env["SELF_DOCS_ALLOW_PRIVATE_ADDRESSES"] = "1"
     proc = subprocess.run(
         [str(MCP_PY), "-c", script],
         cwd=str(MCP_ROOT),

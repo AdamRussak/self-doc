@@ -45,8 +45,13 @@ the memory boundary that governs agents in this repo.
 
 - **Local-first embeddings.** FastEmbed (`BAAI/bge-small-en-v1.5`) runs
   in-process; documentation never leaves your network.
-- **Hybrid retrieval.** Vector similarity + Postgres full-text search over
-  `pgvector`, so exact terms and semantic matches both surface.
+- **Hybrid retrieval.** Vector similarity + per-source-language Postgres
+  full-text search over `pgvector`, so exact terms and semantic matches both
+  surface.
+- **Efficient re-crawling.** Sources can prefer a site's
+  [llms.txt](https://llmstxt.org) index over HTML crawling, and re-syncs use
+  HTTP conditional GET (`ETag`/`If-Modified-Since`) to skip unchanged pages
+  before download — see [ADR-003](docs/adr/003-llms-txt-etag-multilang-fts.md).
 - **Agent-native.** Ships as MCP tools (`search_docs`, `list_doc_sources`,
   `propose_doc_source`) over streamable HTTP — wire it into any MCP client.
 - **Operator-friendly.** Crawl targets live in the database, managed through a

@@ -39,7 +39,19 @@
       <input type="number" id="max_pages" name="max_pages" min="1" required value="{{ values.max_pages or '' }}">
 
       <label for="language">language</label>
-      <input type="text" id="language" name="language" value="{{ values.language or 'english' }}">
+      <select id="language" name="language">
+        {% for lang in supported_fts_languages %}
+        <option value="{{ lang }}" {% if (values.language or 'english') == lang %}selected{% endif %}>{{ lang }}</option>
+        {% endfor %}
+      </select>
+
+      <label for="llms_txt">llms_txt</label>
+      <select id="llms_txt" name="llms_txt">
+        <option value="auto" {% if (values.llms_txt or 'auto') == 'auto' %}selected{% endif %}>auto</option>
+        <option value="off" {% if values.llms_txt == 'off' %}selected{% endif %}>off</option>
+        <option value="only" {% if values.llms_txt == 'only' %}selected{% endif %}>only</option>
+      </select>
+      <p class="hint">auto = try llms.txt/llms-full.txt then fall back to HTML crawl; off = HTML only; only = llms.txt or nothing.</p>
     </div>
 
     <div class="form-section">

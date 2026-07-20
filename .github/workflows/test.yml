@@ -50,8 +50,14 @@ jobs:
 
       - name: Init database schema
         run: |
-          PGPASSWORD=testpass123 psql -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
+          # Apply both init files, matching scripts/migrate.sh's production
+          # flow: 01_schema.sql creates the base tables, 02_sources_config.sql
+          # adds the extended doc_sources columns (including llms_txt/
+          # llms_etag/llms_last_modified) that the DB-dependent tests rely on.
+          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
             -f db/init/01_schema.sql
+          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
+            -f db/init/02_sources_config.sql
 
       - name: Run tests
         run: make test

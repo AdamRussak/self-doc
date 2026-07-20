@@ -34,17 +34,20 @@
 -- NOT NULL constraint here.
 
 ALTER TABLE doc_sources
-    ADD COLUMN IF NOT EXISTS sitemap          TEXT,
-    ADD COLUMN IF NOT EXISTS include_prefixes TEXT[]      NOT NULL DEFAULT '{}',
-    ADD COLUMN IF NOT EXISTS exclude_prefixes TEXT[]      NOT NULL DEFAULT '{}',
-    ADD COLUMN IF NOT EXISTS max_pages        INT,
-    ADD COLUMN IF NOT EXISTS language         TEXT        NOT NULL DEFAULT 'english',
-    ADD COLUMN IF NOT EXISTS rate_limit_rps   REAL        NOT NULL DEFAULT 1.0,
-    ADD COLUMN IF NOT EXISTS schedule_cron    TEXT,
-    ADD COLUMN IF NOT EXISTS enabled          BOOLEAN     NOT NULL DEFAULT TRUE,
-    ADD COLUMN IF NOT EXISTS status           TEXT        NOT NULL DEFAULT 'active',
-    ADD COLUMN IF NOT EXISTS proposed_by      TEXT,
-    ADD COLUMN IF NOT EXISTS created_at       TIMESTAMPTZ NOT NULL DEFAULT now();
+    ADD COLUMN IF NOT EXISTS sitemap            TEXT,
+    ADD COLUMN IF NOT EXISTS include_prefixes   TEXT[]      NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS exclude_prefixes   TEXT[]      NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS max_pages          INT,
+    ADD COLUMN IF NOT EXISTS language           TEXT        NOT NULL DEFAULT 'english',
+    ADD COLUMN IF NOT EXISTS rate_limit_rps     REAL        NOT NULL DEFAULT 1.0,
+    ADD COLUMN IF NOT EXISTS schedule_cron      TEXT,
+    ADD COLUMN IF NOT EXISTS enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS status             TEXT        NOT NULL DEFAULT 'active',
+    ADD COLUMN IF NOT EXISTS proposed_by        TEXT,
+    ADD COLUMN IF NOT EXISTS created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ADD COLUMN IF NOT EXISTS llms_txt           TEXT        NOT NULL DEFAULT 'auto',
+    ADD COLUMN IF NOT EXISTS llms_etag          TEXT,
+    ADD COLUMN IF NOT EXISTS llms_last_modified TEXT;
 
 -- CHECK constraints have no "ADD CONSTRAINT IF NOT EXISTS" form in Postgres,
 -- so guard the add with an explicit pg_constraint lookup to make re-running
@@ -63,3 +66,34 @@ BEGIN
     END IF;
 END;
 $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'doc_sources_llms_txt_check'
+          AND conrelid = 'doc_sources'::regclass
+    ) THEN
+        ALTER TABLE doc_sources
+            ADD CONSTRAINT doc_sources_llms_txt_check
+            CHECK (llms_txt IN ('auto', 'off', 'only'));
+    END IF;
+END;
+$$;
+
+-- doc_pages: per-page HTTP caching metadata (conditional GET support).
+ALTER TABLE doc_pages
+    ADD COLUMN IF NOT EXISTS etag          TEXT,
+    ADD COLUMN IF NOT EXISTS last_modified TEXT;
+
+-- doc_chunks: fts_config drives the language passed to to_tsvector() for the
+-- generated `fts` column below. Adding the column here is safe/idempotent on
+-- both fresh volumes (01_schema.sql already created it, so this is a no-op)
+-- and live databases predating this column (backfills 'english' for every
+-- existing row via the DEFAULT, matching the hardcoded 'english' that the
+-- original `fts` generated column used).
+ALTER TABLE doc_chunks
+    ADD COLUMN IF NOT EXISTS fts_config regconfig NOT NULL DEFAULT 'english';
+
+

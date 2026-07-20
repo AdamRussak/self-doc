@@ -70,6 +70,11 @@ CHUNK_B = (
 # CHUNK_C carries a second rare literal token, seeded in a *different* source,
 # used to prove the `source` filter actually restricts the candidate set.
 CHUNK_C = "The wibblefratz utility runs a background compatibility scan during startup."
+# CHUNK_D is French content seeded with fts_config='french' so the generated
+# `fts` column is stemmed with French rules — a French exact-token query
+# should only rank correctly if the fts arm uses dc.fts_config (per-chunk)
+# instead of a hardcoded 'english' websearch_to_tsquery().
+CHUNK_D = "Le xylophrenard permet de purger le cache interne du systeme rapidement."
 
 
 @pytest.fixture(scope="module")
@@ -82,7 +87,7 @@ def model() -> TextEmbedding:
 # table) keeps this suite from ever touching genuine indexed sources
 # (fastapi, traefik, docker-compose, pgvector-readme, ...) when run against
 # the live DB.
-_TEST_SOURCE_NAMES = ("source-a", "source-b")
+_TEST_SOURCE_NAMES = ("source-a", "source-b", "source-fr")
 
 
 def _purge_test_sources(c) -> None:
@@ -133,18 +138,26 @@ class _PoolShim:
         return _NoCloseCtx(self._conn)
 
 
-def _insert_source(conn, name: str, base_url: str = "https://example.com/") -> int:
+def _insert_source(conn, name: str, base_url: str = "https://example.com/", language: str = "english") -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO doc_sources (name, base_url) VALUES (%s, %s) RETURNING id",
-            (name, base_url),
+            "INSERT INTO doc_sources (name, base_url, language) VALUES (%s, %s, %s) RETURNING id",
+            (name, base_url, language),
         )
         row = cur.fetchone()
     conn.commit()
     return row["id"]
 
 
-def _insert_chunk(conn, model: TextEmbedding, source_id: int, url: str, heading_path: str, content: str) -> None:
+def _insert_chunk(
+    conn,
+    model: TextEmbedding,
+    source_id: int,
+    url: str,
+    heading_path: str,
+    content: str,
+    fts_config: str = "english",
+) -> None:
     (vec,) = list(model.passage_embed([content]))
     literal = retrieval._format_vector_literal(vec)
     with conn.cursor() as cur:
@@ -155,10 +168,10 @@ def _insert_chunk(conn, model: TextEmbedding, source_id: int, url: str, heading_
         page_id = cur.fetchone()["id"]
         cur.execute(
             """
-            INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding)
-            VALUES (%s, %s, 0, %s, %s::vector)
+            INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding, fts_config)
+            VALUES (%s, %s, 0, %s, %s::vector, %s)
             """,
-            (page_id, heading_path, content, literal),
+            (page_id, heading_path, content, literal, fts_config),
         )
     conn.commit()
 
@@ -195,6 +208,40 @@ def test_paraphrase_query_hits_its_chunk_via_vector_arm(seeded):
     result = retrieval.search("how do I switch the interface to a night theme", source="source-a", limit=5)
     top_hit = result.split("\n\n---\n\n")[0]
     assert "a-theme" in top_hit
+
+
+@pytest.fixture()
+def seeded_french(conn, model, monkeypatch):
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _PoolShim(conn))
+    monkeypatch.setattr(retrieval, "get_embedding_model", lambda: model)
+
+    source_fr = _insert_source(conn, "source-fr", language="french")
+    _insert_chunk(
+        conn,
+        model,
+        source_fr,
+        "https://example.com/fr-cache",
+        "Guide > Cache",
+        CHUNK_D,
+        fts_config="french",
+    )
+    return conn
+
+
+def test_french_exact_token_query_ranks_via_fts_arm_with_per_chunk_config(seeded_french):
+    # xylophrenard is a rare literal token present only in CHUNK_D, seeded
+    # with fts_config='french'. If the fts arm hardcoded 'english' instead of
+    # dc.fts_config, websearch_to_tsquery('english', ...) would still tokenize
+    # this literal token fine (it's a single unstemmed word), so this alone
+    # wouldn't prove per-chunk config is honored — the real proof is that the
+    # generated `fts` column for this row was built with to_tsvector('french',
+    # content) (fts_config='french'), and the query-side tsquery must use the
+    # same 'french' config for `fts @@ tsquery` to match at all when stemming
+    # differs. Querying the accented/stemmed French phrase exercises exactly
+    # that agreement.
+    result = retrieval.search("xylophrenard", source="source-fr", limit=5)
+    top_hit = result.split("\n\n---\n\n")[0]
+    assert "fr-cache" in top_hit
 
 
 def test_source_filter_restricts_results(seeded):

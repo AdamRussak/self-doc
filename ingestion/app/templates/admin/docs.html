@@ -9,7 +9,7 @@
   <form method="get" action="/admin/docs" class="filter-toolbar">
     <div>
       <label for="source_id" style="margin-top: 0; font-size: 0.8rem; color: var(--color-text-muted);">Filter by Source</label>
-      <select id="source_id" name="source_id" style="width: 100%; padding: 0.55rem 0.8rem; background: rgba(0,0,0,0.4); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); font-family: var(--font-mono); font-size: 0.85rem;">
+      <select id="source_id" name="source_id">
         <option value="">-- All Active Sources --</option>
         {% for s in sources %}
         <option value="{{ s.id }}" {% if selected_source_id and s.id == selected_source_id %}selected{% endif %}>{{ s.name }}</option>
@@ -18,7 +18,7 @@
     </div>
     <div>
       <label for="query" style="margin-top: 0; font-size: 0.8rem; color: var(--color-text-muted);">Search URL / Path</label>
-      <input type="text" id="query" name="query" value="{{ query or '' }}" placeholder="e.g. guide/routing or config..." style="padding: 0.55rem 0.8rem;">
+      <input type="text" id="query" name="query" value="{{ query or '' }}" placeholder="e.g. guide/routing or config...">
     </div>
     <div style="display: flex; gap: 0.5rem; align-items: center;">
       <button type="submit" class="btn btn-primary">Filter</button>

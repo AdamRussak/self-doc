@@ -46,7 +46,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
 from . import sources_repo, store
-from .config import ConfigError, SourceConfig
+from .config import SUPPORTED_FTS_LANGUAGES, ConfigError, SourceConfig
 from .logging_config import get_logger
 from .sources_repo import SourceRecord
 
@@ -493,6 +493,7 @@ def sitemap_host_differs(sitemap: str | None, base_url: str) -> bool:
 
 
 templates.env.globals["sitemap_host_differs"] = sitemap_host_differs
+templates.env.globals["supported_fts_languages"] = sorted(SUPPORTED_FTS_LANGUAGES)
 
 
 def _build_source_config(
@@ -505,6 +506,7 @@ def _build_source_config(
     max_pages: str,
     language: str,
     rate_limit_rps: str,
+    llms_txt: str = "auto",
 ) -> tuple[SourceConfig | None, str | None]:
     """Validate raw form strings into a `SourceConfig`. Returns
     `(cfg, None)` on success or `(None, error_message)` on failure — NEVER
@@ -520,6 +522,7 @@ def _build_source_config(
             max_pages=max_pages.strip(),
             language=language.strip() or "english",
             rate_limit_rps=rate_limit_rps.strip(),
+            llms_txt=(llms_txt.strip() or "auto"),
         )
         return cfg, None
     except ValidationError as e:
@@ -543,6 +546,7 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
         max_pages=record.max_pages if (record.max_pages is not None and record.max_pages > 0) else 100,
         language=record.language or "english",
         rate_limit_rps=record.rate_limit_rps if (record.rate_limit_rps is not None and record.rate_limit_rps > 0) else 1.0,
+        llms_txt=record.llms_txt or "auto",
     )
 
 
@@ -636,6 +640,7 @@ def create_source_submit(
     max_pages: str = Form(...),
     language: str = Form(default="english"),
     rate_limit_rps: str = Form(default="1.0"),
+    llms_txt: str = Form(default="auto"),
     _auth=Depends(require_csrf),
     conn=Depends(get_conn),
 ):
@@ -648,6 +653,7 @@ def create_source_submit(
         "max_pages": max_pages,
         "language": language,
         "rate_limit_rps": rate_limit_rps,
+        "llms_txt": llms_txt,
     }
     cfg, error = _build_source_config(
         name=name,
@@ -658,6 +664,7 @@ def create_source_submit(
         max_pages=max_pages,
         language=language,
         rate_limit_rps=rate_limit_rps,
+        llms_txt=llms_txt,
     )
     if cfg is None:
         return templates.TemplateResponse(
@@ -698,6 +705,7 @@ def edit_source_form(source_id: int, request: Request, _auth=Depends(require_ses
         "max_pages": str(record.max_pages) if record.max_pages is not None else "",
         "language": record.language,
         "rate_limit_rps": str(record.rate_limit_rps),
+        "llms_txt": record.llms_txt or "auto",
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
@@ -715,6 +723,7 @@ def update_source_submit(
     max_pages: str = Form(...),
     language: str = Form(default="english"),
     rate_limit_rps: str = Form(default="1.0"),
+    llms_txt: str = Form(default="auto"),
     schedule_cron: str = Form(default=""),
     enabled: str = Form(default=""),
     _auth=Depends(require_csrf),
@@ -733,6 +742,7 @@ def update_source_submit(
         "max_pages": max_pages,
         "language": language,
         "rate_limit_rps": rate_limit_rps,
+        "llms_txt": llms_txt,
         "schedule_cron": schedule_cron,
         "enabled": bool(enabled),
     }
@@ -749,6 +759,7 @@ def update_source_submit(
         max_pages=max_pages,
         language=language,
         rate_limit_rps=rate_limit_rps,
+        llms_txt=llms_txt,
     )
     if cfg is None:
         return templates.TemplateResponse(

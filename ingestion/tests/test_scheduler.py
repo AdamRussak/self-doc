@@ -47,6 +47,7 @@ def _make_record(
         max_pages=10,
         language="english",
         rate_limit_rps=1.0,
+        llms_txt="auto",
         schedule_cron=schedule_cron,
         enabled=enabled,
         status=status,

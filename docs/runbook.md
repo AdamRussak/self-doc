@@ -18,6 +18,39 @@ crawl-config columns — `sitemap`, `include_prefixes`, `exclude_prefixes`,
 one-way seed, imported *exclusively* when `IMPORT_SOURCES_YAML_ON_BOOT=1` is
 set at container start.
 
+**Update (ADR-003): `02_sources_config.sql` also carries the llms.txt /
+conditional-GET / multilingual-FTS columns.** The same file now additionally
+adds (all idempotent `ADD COLUMN IF NOT EXISTS`, same as the columns above):
+- `doc_sources.llms_txt` — `TEXT NOT NULL DEFAULT 'auto'`, constrained by
+  `doc_sources_llms_txt_check` to `'auto' | 'off' | 'only'`.
+- `doc_sources.llms_etag`, `doc_sources.llms_last_modified` — conditional-GET
+  validators for the llms.txt index fetch itself.
+- `doc_pages.etag`, `doc_pages.last_modified` — per-page conditional-GET
+  validators (see [HTTP conditional skip](#http-conditional-skip-etag--if-modified-since)
+  below).
+- `doc_chunks.fts_config` — `regconfig NOT NULL DEFAULT 'english'`, plus a
+  **non-idempotent-cost** (though idempotently *guarded*) redefinition of the
+  `fts` generated column from a hardcoded `to_tsvector('english', content)`
+  to `to_tsvector(fts_config, content)`.
+
+  **This one step is not "just another `ADD COLUMN`" — read before running
+  it against a large, live corpus.** Postgres has no `ALTER COLUMN ...`
+  form for a generated column's expression, so this migration drops and
+  re-adds `doc_chunks.fts`, which **rewrites the entire `doc_chunks` table
+  and rebuilds `doc_chunks_fts_idx` (the GIN index)**. This takes an
+  `ACCESS EXCLUSIVE`-equivalent lock on `doc_chunks` for the duration and
+  its cost scales with corpus size (rows × avg chunk size) — plan a
+  **maintenance window** for this specific step on any deployment with a
+  non-trivial corpus (the three seed sources are small enough this is
+  seconds; a much larger corpus should not assume that). It runs at most
+  once — the migration's `DO` block detects the old hardcoded expression via
+  `pg_attrdef` and no-ops on every subsequent re-run, including accidental
+  ones. On a **fresh volume** (nuke-and-rebuild path, ADR-002) this cost
+  never applies: `01_schema.sql` creates `fts_config`/`fts` correctly from
+  first init.
+- See ADR-003 (`docs/adr/003-llms-txt-etag-multilang-fts.md`) for the full
+  design rationale behind all three of these additions.
+
 `db/init/*.sql` scripts run **only** against an empty Postgres data
 directory (first cluster init). On any **existing** database — which is the
 case for this deployment — `02_sources_config.sql` must be applied by hand:
@@ -30,7 +63,11 @@ set -a; source .env; set +a
 `scripts/migrate.sh` runs `psql -v ON_ERROR_STOP=1` against the running
 `self-docs-db` container with `02_sources_config.sql`. It is **idempotent**
 (every statement is `ADD COLUMN IF NOT EXISTS` or a guarded `DO` block for
-the `CHECK` constraint) — safe to re-run at any time, including by accident.
+the `CHECK` constraint / the `fts` redefinition above) — safe to re-run at
+any time, including by accident. `.github/workflows/test.yml` applies both
+`01_schema.sql` and `02_sources_config.sql` when building the CI database, so
+CI exercises the same live-migration path documented here, not just the
+fresh-volume path.
 
 **Status: this migration has already been applied to this deployment's live
 database.** Nobody needs to (and nobody should assume they still need to) run
@@ -144,11 +181,33 @@ proposal):
    line), `max_pages` (**required, no default** — omitting it fails
    validation, same rule as before, now enforced by `app.config.SourceConfig`
    against the form data instead of a YAML loader), `language` (default
-   `english`), `rate_limit_rps` (default `1.0`). Validation errors
-   re-render the form with the exact problem (duplicate name, bad
-   `base_url`, missing `max_pages`, a sitemap-less source whose `base_url`
-   isn't covered by its own `include_prefixes`) — nothing is written until
-   it passes.
+   `english`), `rate_limit_rps` (default `1.0`), `llms_txt` (default
+   `auto`). Validation errors re-render the form with the exact problem
+   (duplicate name, bad `base_url`, missing `max_pages`, a sitemap-less
+   source whose `base_url` isn't covered by its own `include_prefixes`, an
+   unsupported `language`) — nothing is written until it passes.
+
+   - **`llms_txt` mode (`auto` | `off` | `only`, default `auto`).** Controls
+     whether the crawler prefers a source's [llms.txt](https://llmstxt.org)
+     index over the normal HTML sitemap/BFS crawl. `auto` tries
+     `{base_url origin}/llms-full.txt` then `/llms.txt`; if either is found,
+     it indexes that pre-cleaned markdown (split into per-section pages)
+     instead of crawling HTML, and falls back to the normal HTML crawl if
+     neither exists. `off` disables the llms.txt lookup entirely (the prior,
+     only behavior). `only` uses the llms.txt content if found and indexes
+     **nothing** for that source if it isn't — no HTML fallback. See
+     `docs/adr/003-llms-txt-etag-multilang-fts.md` for the design rationale.
+     **Changing `llms_txt` on an existing source triggers a full re-index of
+     that source on its next sync** (the set of indexed URLs changes), bound
+     by the existing purge-ratio/coverage guards — expected, not a bug.
+   - **`language`** must be one of the ~30 Postgres built-in text-search
+     configuration names in `SUPPORTED_FTS_LANGUAGES`
+     (`ingestion/app/config.py`) — e.g. `english`, `french`, `german`,
+     `spanish`, `simple`, etc. This drives `doc_chunks.fts_config`, which in
+     turn drives the language passed to `to_tsvector`/`websearch_to_tsquery`
+     for that source's chunks at both index and search time. An unsupported
+     value is rejected at save time with the full allowed list in the error,
+     not left to fail later at query time.
 3. A source created this way lands with `status='active'` immediately (the
    human creating it via an authenticated admin session is itself the
    approval). Use the source's **Sync** button (or `POST /sync
@@ -446,6 +505,43 @@ therefore on the order of 20–40 minutes.
 
 ---
 
+## HTTP conditional skip (ETag / If-Modified-Since)
+
+`doc_pages` stores `etag`/`last_modified` from each page's most recent
+successful fetch. On a re-sync, the crawler sends `If-None-Match`/
+`If-Modified-Since` for any URL that has a previously-recorded validator; an
+upstream `304 Not Modified` response skips download *and* markdown
+extraction entirely for that page — a stronger short-circuit than the
+existing content-hash skip (`pages_skipped`), which still required a full
+fetch+extract before comparing hashes.
+
+- **New Prometheus counter: `pages_not_modified_total{source="..."}`.**
+  Counts pages skipped via a `304` on a given source. Distinct from
+  `pages_skipped_total` (hash-diff match after a full fetch) — a source
+  whose origin supports conditional GET should show most of its steady-state
+  re-syncs landing in `pages_not_modified_total` rather than
+  `pages_fetched_total`.
+
+  ```bash
+  curl -sS http://localhost:8080/metrics | grep -E "^pages_(not_modified|skipped|fetched)_total"
+  ```
+
+- **`GET /status` also reports `pages_not_modified`** per source, alongside
+  the existing `pages_fetched`/`pages_skipped`/`pages_failed`/
+  `pages_soft_failed` counts.
+- **Not every origin supports conditional GET.** A source whose responses
+  never carry `ETag`/`Last-Modified` will simply never populate
+  `pages_not_modified` — its pages fall back to the existing full-fetch +
+  content-hash path (`pages_skipped` on repeat, unchanged syncs). This is
+  expected, not a misconfiguration.
+- `doc_sources.llms_etag`/`llms_last_modified` carry the same validators for
+  a source's llms.txt index fetch. The read/write plumbing exists today; a
+  `304` short-circuit for the whole-index fetch (skipping the parse step,
+  not just per-page fetches) is a documented future enhancement, not yet
+  wired into the sync path — see `docs/adr/003-llms-txt-etag-multilang-fts.md`.
+
+---
+
 ## Page Classification & Source Status Semantics
 
 The ingestion pipeline separates transient, expected site quirks (`pages_soft_failed`) from actionable internal defects (`pages_failed`) so operational alarms and status checks remain high-signal.
@@ -539,7 +635,7 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
 
   ```bash
   curl http://localhost:8080/health          # ingestion liveness (if published locally)
-  curl http://localhost:8080/metrics         # pages_fetched_total, chunks_indexed_total, ...
+  curl http://localhost:8080/metrics         # pages_fetched_total, pages_not_modified_total, chunks_indexed_total, ...
   curl http://mcp-server:8000/metrics        # from inside the compose network — search_requests_total, search_latency_seconds
   ```
 

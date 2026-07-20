@@ -50,6 +50,7 @@ adding a new source's include_prefixes/exclude_prefixes:
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 from urllib.parse import urlparse
 from xml.etree import ElementTree
@@ -70,6 +71,8 @@ _SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 def _addr_is_private(addr: str) -> bool:
     """True if a *literal* address string is in a non-routable range."""
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
@@ -155,6 +158,8 @@ def _resolve_is_private(host: str) -> bool:
     crawl-time gate in `crawler.py` re-runs this check (with a fresh
     resolution) against the FINAL post-redirect URL.
     """
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     try:
         addrs = _resolve_host_addrs(host)
     except UnresolvableHost:
@@ -179,6 +184,8 @@ def url_host_is_private(url: str, *, unresolvable_is_private: bool = True) -> bo
 
     A URL with no parseable host is always private (fails closed).
     """
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     try:
         host = urlparse(url).hostname
     except ValueError:

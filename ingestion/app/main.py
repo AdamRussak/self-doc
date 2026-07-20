@@ -289,6 +289,9 @@ PAGES_FETCHED = Counter(
 PAGES_SKIPPED = Counter(
     "pages_skipped_unchanged_total", "Pages skipped because their content hash is unchanged", ["source"]
 )
+PAGES_NOT_MODIFIED = Counter(
+    "pages_not_modified_total", "Pages skipped via HTTP 304 conditional request", ["source"]
+)
 PAGES_SOFT_FAILED = Counter(
     "pages_soft_failed_total", "Pages soft-failed due to expected site quirks (404/503 fetch or stub content)", ["source"]
 )
@@ -438,6 +441,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
 
             PAGES_FETCHED.labels(source=name).inc(outcome.pages_fetched)
             PAGES_SKIPPED.labels(source=name).inc(outcome.pages_skipped)
+            PAGES_NOT_MODIFIED.labels(source=name).inc(outcome.pages_not_modified)
             PAGES_SOFT_FAILED.labels(source=name).inc(outcome.pages_soft_failed)
             CHUNKS_INDEXED.labels(source=name).inc(outcome.chunks_indexed)
             SYNC_DURATION.labels(source=name).observe(duration)
@@ -447,6 +451,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             _state["results"][name] = {
                 "pages_fetched": outcome.pages_fetched,
                 "pages_skipped": outcome.pages_skipped,
+                "pages_not_modified": outcome.pages_not_modified,
                 "pages_failed": outcome.pages_failed,
                 "pages_soft_failed": outcome.pages_soft_failed,
                 "pages_removed": outcome.pages_removed,
@@ -465,6 +470,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
         total_fetched = sum(r.get("pages_fetched", 0) for r in _state["results"].values())
         total_chunks = sum(r.get("chunks_indexed", 0) for r in _state["results"].values())
         total_skipped = sum(r.get("pages_skipped", 0) for r in _state["results"].values())
+        total_not_modified = sum(r.get("pages_not_modified", 0) for r in _state["results"].values())
         total_failed = sum(r.get("pages_failed", 0) + r.get("pages_soft_failed", 0) for r in _state["results"].values())
         any_failed = any(r.get("last_status") == "failed" for r in _state["results"].values())
         errors = [str(r["error"]) for r in _state["results"].values() if r.get("error")]
@@ -474,6 +480,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             "pages_fetched": total_fetched,
             "chunks_indexed": total_chunks,
             "pages_skipped": total_skipped,
+            "pages_not_modified": total_not_modified,
             "pages_failed": total_failed,
             "error": "; ".join(errors) if errors else None,
             "finished_at": time.time(),

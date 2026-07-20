@@ -25,7 +25,7 @@ Validation fails fast (raises `ConfigError`) on:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -34,6 +34,45 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, fie
 from .urlscope import url_host_is_private
 
 NAME_PATTERN = r"^[a-z0-9-]+$"
+
+# Postgres built-in text-search configuration names (see `\dF` / pg_catalog
+# `pg_ts_config` in a default install). `language` must be one of these,
+# lowercased, since it is passed straight through to `to_tsvector(language, ...)`
+# / `to_tsquery(language, ...)` — an invalid name errors at query time, not at
+# config-load time, so we validate it up front instead.
+SUPPORTED_FTS_LANGUAGES = frozenset(
+    {
+        "simple",
+        "arabic",
+        "armenian",
+        "basque",
+        "catalan",
+        "danish",
+        "dutch",
+        "english",
+        "finnish",
+        "french",
+        "german",
+        "greek",
+        "hindi",
+        "hungarian",
+        "indonesian",
+        "irish",
+        "italian",
+        "lithuanian",
+        "nepali",
+        "norwegian",
+        "portuguese",
+        "romanian",
+        "russian",
+        "serbian",
+        "spanish",
+        "swedish",
+        "tamil",
+        "turkish",
+        "yiddish",
+    }
+)
 
 
 class ConfigError(ValueError):
@@ -63,11 +102,23 @@ class SourceConfig(BaseModel):
     max_pages: int = Field(gt=0)
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
+    llms_txt: Literal["auto", "off", "only"] = "auto"
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod
     def _none_to_empty(cls, v: Any) -> Any:
         return v if v is not None else []
+
+    @field_validator("language", mode="after")
+    @classmethod
+    def _language_must_be_supported(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in SUPPORTED_FTS_LANGUAGES:
+            raise ValueError(
+                f"language {v!r} is not a supported Postgres text-search configuration "
+                f"— must be one of SUPPORTED_FTS_LANGUAGES: {sorted(SUPPORTED_FTS_LANGUAGES)}"
+            )
+        return normalized
 
     @model_validator(mode="after")
     def _sitemap_shares_base_url_host(self) -> "SourceConfig":

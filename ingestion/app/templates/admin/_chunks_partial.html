@@ -1,4 +1,4 @@
-<td colspan="6" style="background: rgba(4, 14, 31, 0.6); padding: 1.25rem 1.5rem; border-bottom: 2px solid var(--color-primary); border-top: 1px solid var(--color-border);">
+<td colspan="6" style="background: var(--color-surface-lowest); padding: 1.25rem 1.5rem; border-bottom: 2px solid var(--color-primary); border-top: 1px solid var(--color-border);">
   <div class="chunk-drawer">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
       <h3 style="margin: 0; font-size: 0.95rem; color: var(--color-primary-tint); display: flex; align-items: center; gap: 0.5rem;">
@@ -21,7 +21,7 @@
             Chunk #{{ c.chunk_index }}
           </span>
         </div>
-        <pre style="margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.5; color: var(--color-text); background: rgba(0,0,0,0.3); padding: 0.85rem; border-radius: var(--radius-sm); border: 1px solid rgba(255,255,255,0.04); max-height: 400px; overflow-y: auto;">{{ c.content }}</pre>
+        <pre style="margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.5; color: var(--color-text); background: #020617; padding: 0.85rem; border-radius: var(--radius-sm); border: 1px solid var(--color-border); max-height: 400px; overflow-y: auto;">{{ c.content }}</pre>
       </div>
       {% endfor %}
     </div>

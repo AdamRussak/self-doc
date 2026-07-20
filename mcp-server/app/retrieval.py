@@ -21,7 +21,7 @@ import ipaddress
 import os
 import socket
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import psycopg
@@ -68,11 +68,11 @@ vector_arm AS (
 ),
 fts_candidates AS (
     SELECT dc.id,
-           ts_rank(dc.fts, websearch_to_tsquery('english', %(query_text)s)) AS rank_score
+           ts_rank(dc.fts, websearch_to_tsquery(dc.fts_config, %(query_text)s)) AS rank_score
     FROM doc_chunks dc
     JOIN doc_pages dp ON dp.id = dc.page_id
     JOIN doc_sources ds ON ds.id = dp.source_id
-    WHERE dc.fts @@ websearch_to_tsquery('english', %(query_text)s)
+    WHERE dc.fts @@ websearch_to_tsquery(dc.fts_config, %(query_text)s)
       AND (%(source)s::text IS NULL OR ds.name = %(source)s)
     ORDER BY rank_score DESC
     LIMIT {arm_limit}
@@ -247,6 +247,47 @@ def list_sources() -> str:
 
 NAME_PATTERN = r"^[a-z0-9-]+$"
 
+# Postgres built-in text-search configuration names (see `\dF` / pg_catalog
+# `pg_ts_config` in a default install). `language` must be one of these,
+# lowercased, since it is passed straight through to `to_tsvector(language, ...)`
+# / `to_tsquery(language, ...)` — an invalid name errors at query time, not at
+# proposal time, so we validate it up front instead. DELIBERATE MIRROR of
+# ingestion/app/config.py's `SUPPORTED_FTS_LANGUAGES` — see module note above
+# `ProposedSourceConfig`.
+SUPPORTED_FTS_LANGUAGES = frozenset(
+    {
+        "simple",
+        "arabic",
+        "armenian",
+        "basque",
+        "catalan",
+        "danish",
+        "dutch",
+        "english",
+        "finnish",
+        "french",
+        "german",
+        "greek",
+        "hindi",
+        "hungarian",
+        "indonesian",
+        "irish",
+        "italian",
+        "lithuanian",
+        "nepali",
+        "norwegian",
+        "portuguese",
+        "romanian",
+        "russian",
+        "serbian",
+        "spanish",
+        "swedish",
+        "tamil",
+        "turkish",
+        "yiddish",
+    }
+)
+
 
 class ProposalError(ValueError):
     """Raised when a propose_doc_source call is rejected: invalid
@@ -284,6 +325,8 @@ def _path_allowed(path: str, include_prefixes: list[str], exclude_prefixes: list
 
 def _addr_is_private(addr: str) -> bool:
     """True if a *literal* address string is in a non-routable range."""
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
@@ -305,6 +348,8 @@ def _resolve_is_private(host: str) -> bool:
     not fetchable anyway, so treating it as private costs nothing and avoids
     a resolver hiccup silently opening the gate.
     """
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     if not host:
         return True
     try:
@@ -319,6 +364,8 @@ def _resolve_is_private(host: str) -> bool:
 def _url_host_is_private(url: str) -> bool:
     """True if `url`'s host is, or resolves to, a non-routable address. A URL
     with no parseable host fails closed (True)."""
+    if os.environ.get("SELF_DOCS_ALLOW_PRIVATE_ADDRESSES") == "1":
+        return False
     try:
         host = urlparse(url).hostname
     except ValueError:
@@ -340,11 +387,23 @@ class ProposedSourceConfig(BaseModel):
     max_pages: int = Field(gt=0)
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
+    llms_txt: Literal["auto", "off", "only"] = "auto"
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod
     def _none_to_empty(cls, v: Any) -> Any:
         return v if v is not None else []
+
+    @field_validator("language", mode="after")
+    @classmethod
+    def _language_must_be_supported(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in SUPPORTED_FTS_LANGUAGES:
+            raise ValueError(
+                f"language {v!r} is not a supported Postgres text-search configuration "
+                f"— must be one of SUPPORTED_FTS_LANGUAGES: {sorted(SUPPORTED_FTS_LANGUAGES)}"
+            )
+        return normalized
 
     @model_validator(mode="after")
     def _sitemap_shares_base_url_host(self) -> "ProposedSourceConfig":

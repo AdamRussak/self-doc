@@ -60,6 +60,10 @@
       --color-accent-hover: #60A5FA;
       --color-accent-bg: rgba(59, 130, 246, 0.12);
 
+      /* === Secondary === */
+      --color-secondary: #B7C8E1;
+      --color-secondary-container: #3A4A5F;
+
       /* === Status Accents (ONLY for feedback indicators) === */
       --color-success: #00E599;
       --color-success-bg: rgba(0, 229, 153, 0.12);
@@ -148,10 +152,12 @@
     .nav-section-label {
       display: block;
       padding: 1.5rem 1rem 0.5rem;
-      font-size: 0.65rem;
+      font-family: var(--font-sans);
+      font-size: 11px;
       font-weight: 700;
+      line-height: 16px;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.05em;
       color: var(--color-text-muted);
     }
     .nav-item {
@@ -180,10 +186,10 @@
     .nav-item.active::before {
       content: '';
       position: absolute;
-      left: -0.5rem;
-      top: 0.35rem;
-      bottom: 0.35rem;
-      width: 3px;
+      left: 0;
+      top: 0.25rem;
+      bottom: 0.25rem;
+      width: 2px;
       background: var(--color-primary);
       border-radius: 2px;
     }
@@ -191,6 +197,7 @@
       width: 20px;
       height: 20px;
       flex-shrink: 0;
+      color: var(--color-text-muted);
     }
     @media (max-width: 1024px) {
       .sidebar { width: var(--sidebar-collapsed); }
@@ -201,9 +208,9 @@
     }
     /* Cards */
     .card {
-      background: rgba(21, 32, 49, 0.82);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
+      background: rgba(15, 23, 42, 0.80);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       border: 1px solid var(--color-border);
       border-radius: var(--radius-md);
       padding: 1.5rem;
@@ -219,14 +226,16 @@
       border-spacing: 0;
       margin-top: 0.75rem;
       margin-bottom: 1.5rem;
-      font-size: 0.9rem;
+      font-size: 13px;
     }
     th, .table th {
       background: rgba(0, 0, 0, 0.25);
       color: var(--color-text-muted);
-      font-weight: 600;
+      font-family: var(--font-sans);
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 16px;
       text-transform: uppercase;
-      font-size: 0.75rem;
       letter-spacing: 0.05em;
       padding: 0.75rem 1rem;
       border-bottom: 1px solid var(--color-border);
@@ -236,13 +245,18 @@
     td, .table td {
       padding: 0.6rem 1rem;
       border-bottom: 1px solid var(--color-border);
-      vertical-align: top;
+      vertical-align: middle;
+      font-size: 13px;
+      line-height: 18px;
+    }
+    tbody tr, .table tbody tr {
+      height: 40px;
     }
     tr:last-child td, .table tr:last-child td {
       border-bottom: none;
     }
     tbody tr:nth-child(even), .table tbody tr:nth-child(even) {
-      background: rgba(255, 255, 255, 0.015);
+      background: rgba(255, 255, 255, 0.02);
     }
     tbody tr:hover, .table tbody tr:hover {
       background: var(--color-surface-hover);
@@ -364,7 +378,7 @@
       width: 100%;
       padding: 0.6rem 0.8rem;
       box-sizing: border-box;
-      background: rgba(0, 0, 0, 0.3);
+      background: var(--color-surface-lowest);
       border: 1px solid var(--color-border);
       border-radius: var(--radius-sm);
       color: var(--color-text);
@@ -374,8 +388,8 @@
     }
     input[type=text]:focus, input[type=url]:focus, input[type=number]:focus, input[type=password]:focus, textarea:focus, select:focus {
       outline: none;
-      border-color: var(--color-primary-tint);
-      box-shadow: 0 0 0 3px var(--color-primary-bg);
+      border-color: var(--color-primary);
+      box-shadow: 0 0 0 2px var(--color-primary-glow);
     }
     input:disabled {
       background: rgba(255, 255, 255, 0.03);
