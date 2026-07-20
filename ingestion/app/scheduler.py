@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .logging_config import get_logger
 from .sources_repo import SourceRecord, _select_due_records
@@ -90,7 +90,7 @@ def next_due(records: list[SourceRecord], now: datetime) -> list[SourceRecord]:
 
 
 def _default_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _default_fetch_candidates() -> list[SourceRecord]:
@@ -99,8 +99,10 @@ def _default_fetch_candidates() -> list[SourceRecord]:
     seam only needs to hand it a full, unfiltered batch. Never executed by
     this test suite (pytest cannot reach Postgres from the host); tests
     replace `fetch_candidates_fn` directly."""
-    from . import store  # local import: keep a hard DB dependency out of the pure test path
-    from . import sources_repo
+    from . import (
+        sources_repo,
+        store,  # local import: keep a hard DB dependency out of the pure test path
+    )
 
     conn = store.get_connection()
     try:
@@ -223,5 +225,5 @@ async def run_scheduler(stop: asyncio.Event) -> None:
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=poll_interval_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

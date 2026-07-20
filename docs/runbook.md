@@ -415,6 +415,52 @@ with `\dx` (pgvector extension) and `\dt` (three tables) via
 
 ---
 
+## Switch the embedding model
+
+The embedding model is selected from a registry (`config/models.yaml`, the
+single source of truth). Selecting a model auto-derives its vector dimension and
+the two services' Docker memory limits. The default is
+`mixedbread-ai/mxbai-embed-large-v1` (1024-dim). To see the options:
+
+```bash
+grep -E '^  [A-Za-z]' config/models.yaml   # the model keys under `models:`
+```
+
+Switching models changes the vectors AND (usually) the `vector(N)` column width,
+so it requires re-rendering the schema, rebuilding the images (the model is
+baked in at build time), and a full re-embed. Because change-detection
+(content-hash) skips unchanged pages, an in-place re-sync is not enough — the
+corpus must be truncated and re-embedded.
+
+```bash
+# 1. Select the model: writes EMBEDDING_* + *_MEM_LIMIT into .env and renders
+#    db/init/01_schema.sql to the new vector(N). No MODEL => the registry default.
+make configure MODEL=intfloat/multilingual-e5-large
+
+# 2. Rebuild images so the new model is pre-baked, and recreate the DB schema.
+#    If the vector dimension changed, the column must be recreated — the
+#    simplest correct path is the nuke-and-rebuild above:
+docker compose build ingestion mcp-server
+docker compose down -v db && docker compose up -d db   # re-runs the rendered schema
+docker compose ps db                                   # wait for healthy
+docker compose up -d                                   # (make up)
+
+# 3. Re-embed the corpus. If you kept the DB (same dimension), use `make reindex`
+#    instead of the nuke above; it truncates doc_pages/doc_chunks and re-syncs:
+make reindex
+
+# 4. Verify quality held/improved against your eval set:
+make eval
+```
+
+`make configure` requires PyYAML on the machine running it (`pip install pyyaml`,
+or use the ingestion venv: `ingestion/.venv/bin/python scripts/configure_model.py <model>`).
+The ingestion and mcp-server services MUST run the same model — `make configure`
+keeps both in sync via `.env`, and a startup dimension mismatch surfaces as a
+pgvector error on the first embed/search.
+
+---
+
 ## Backup
 
 ### Manual

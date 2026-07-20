@@ -16,7 +16,6 @@ import os
 
 import psycopg
 import pytest
-
 from app import store
 from app.config import SourceConfig
 
@@ -670,8 +669,10 @@ def test_replace_page_atomic_no_partial_chunks_on_failure(conn, monkeypatch):
         cur.execute("SELECT id FROM doc_sources WHERE name = %s", (source.name,))
         (source_id,) = cur.fetchone()
 
+    from app.embedder import EMBEDDING_DIM
+
     bad_chunks = [
-        {"heading_path": ["H1"], "chunk_index": 0, "content": "Chunk 0 good", "embedding": [0.1] * 384},
+        {"heading_path": ["H1"], "chunk_index": 0, "content": "Chunk 0 good", "embedding": [0.1] * EMBEDDING_DIM},
         {"heading_path": ["H2"], "chunk_index": 1, "content": "Chunk 1 bad", "embedding": [0.1] * 10},
     ]
 

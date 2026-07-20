@@ -1,26 +1,24 @@
-import pytest
 
+import app.embedder as embedder
 from app.embedder import EMBEDDING_DIM, embed_chunks
 
 
 class _FakeModel:
-    """Stand-in for fastembed.TextEmbedding — asserts passage_embed (not
-    query_embed / embed) is the method used, per the asymmetric-embedding
-    contract."""
+    """Stand-in for fastembed.TextEmbedding — records the exact texts passed to
+    `embed`, so tests can assert the passage prompt is applied and that plain
+    `embed` (not query_embed) is the method used."""
 
     def __init__(self):
         self.calls = []
 
-    def passage_embed(self, texts):
-        self.calls.append(list(texts))
+    def embed(self, texts):
+        texts = list(texts)
+        self.calls.append(texts)
         for _ in texts:
             yield [0.1] * EMBEDDING_DIM
 
-    def query_embed(self, texts):  # pragma: no cover - must never be called here
-        raise AssertionError("embedder must use passage_embed, not query_embed")
 
-
-def test_embed_chunks_uses_passage_embed_and_sets_384_dim_vectors():
+def test_embed_chunks_sets_dim_vectors():
     fake = _FakeModel()
     chunks = [
         {"url": "u", "heading_path": "H", "chunk_index": 0, "content": "hello world"},
@@ -32,10 +30,24 @@ def test_embed_chunks_uses_passage_embed_and_sets_384_dim_vectors():
         assert "embedding" in c
         assert len(c["embedding"]) == EMBEDDING_DIM
         assert all(isinstance(v, float) for v in c["embedding"])
-    assert fake.calls  # passage_embed was invoked
+    assert fake.calls  # embed was invoked
 
 
-def test_embed_chunks_batches(monkeypatch):
+def test_embed_chunks_applies_passage_prompt(monkeypatch):
+    monkeypatch.setattr(embedder, "PASSAGE_PROMPT", "passage: ")
+    fake = _FakeModel()
+    embed_chunks([{"content": "hello world"}], model=fake)
+    assert fake.calls == [["passage: hello world"]]
+
+
+def test_embed_chunks_empty_passage_prompt_leaves_text_unchanged(monkeypatch):
+    monkeypatch.setattr(embedder, "PASSAGE_PROMPT", "")
+    fake = _FakeModel()
+    embed_chunks([{"content": "hello world"}], model=fake)
+    assert fake.calls == [["hello world"]]
+
+
+def test_embed_chunks_batches():
     fake = _FakeModel()
     chunks = [{"url": "u", "heading_path": "H", "chunk_index": i, "content": f"c{i}"} for i in range(70)]
     embed_chunks(chunks, model=fake, batch_size=32)

@@ -16,17 +16,16 @@ database.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
-from datetime import datetime, timezone
 from app import admin
-from app.config import ConfigError, SourceConfig
+from app.config import SourceConfig
 from app.sources_repo import SourceRecord
 from app.store import ChunkRecord, PageRecord, SourceOutcome
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 SYNC_TOKEN = "test-admin-token-xyz"
 
@@ -739,7 +738,7 @@ def test_list_docs_view(client, csrf_token, monkeypatch):
         source_name="widget",
         url="https://widget.example.com/docs/guide",
         content_hash="abc123hash",
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=datetime.now(UTC),
         chunk_count=4,
     )
     monkeypatch.setattr(admin.store, "list_doc_pages", MagicMock(return_value=[page_rec]))
@@ -799,7 +798,7 @@ def test_sync_target_submit(client, csrf_token, monkeypatch):
 
 
 def test_store_row_records():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     page = admin.store._row_to_page_record((1, 5, "widget", "https://example.com", "hash123", now, 3))
     assert page.id == 1
     assert page.source_name == "widget"

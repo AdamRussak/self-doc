@@ -1,7 +1,6 @@
 import socket
 
 import pytest
-
 from app.urlscope import (
     _resolve_host_addrs,
     _resolve_is_private,

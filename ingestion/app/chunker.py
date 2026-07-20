@@ -19,6 +19,7 @@ embedder and by store.py in T4):
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 
@@ -29,7 +30,11 @@ from .logging_config import get_logger
 MIN_TOKENS = 400
 MAX_TOKENS = 600
 OVERLAP_RATIO = 0.15
-BGE_MODEL_ID = "BAAI/bge-small-en-v1.5"
+# Token counting follows the embedding model so chunk sizing matches the model
+# that will actually embed the text (mismatched tokenizers can push a chunk
+# past the model's context and silently truncate). Env-driven, same default as
+# the embedder (config/models.yaml registry default).
+TOKENIZER_MODEL_ID = os.environ.get("EMBEDDING_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
 
 logger = get_logger(component="chunker")
 
@@ -41,16 +46,16 @@ _tokenizer: Tokenizer | None = None
 
 
 def get_tokenizer() -> Tokenizer:
-    """Lazily load (and cache) the BGE tokenizer.
+    """Lazily load (and cache) the embedding model's tokenizer.
 
-    Downloads/loads BAAI/bge-small-en-v1.5's tokenizer.json (via the
-    tokenizers `from_pretrained` HF Hub path, which shares the local HF cache
-    with FastEmbed's model download).
+    Downloads/loads TOKENIZER_MODEL_ID's tokenizer.json (via the tokenizers
+    `from_pretrained` HF Hub path, which shares the local HF cache with
+    FastEmbed's model download).
     """
     global _tokenizer
     with _tokenizer_lock:
         if _tokenizer is None:
-            _tokenizer = Tokenizer.from_pretrained(BGE_MODEL_ID)
+            _tokenizer = Tokenizer.from_pretrained(TOKENIZER_MODEL_ID)
         return _tokenizer
 
 

@@ -2,7 +2,6 @@ import socket
 from pathlib import Path
 
 import pytest
-
 from app.config import ConfigError, load_sources
 from app.urlscope import _resolve_host_addrs
 

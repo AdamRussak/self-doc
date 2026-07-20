@@ -15,6 +15,10 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
+    "pyyaml",
+    # Only for the cross-package parity test that loads ingestion/app/config.py
+    # (which imports ingestion/app/urlscope.py -> defusedxml) from disk.
+    "defusedxml",
 ]
 
 [build-system]

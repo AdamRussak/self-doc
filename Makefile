@@ -1,7 +1,25 @@
 -include .env
 export
 
-.PHONY: up down up-prod down-prod sync test eval backup backup-prune backup-auto restore
+.PHONY: up down up-prod down-prod sync test eval lint typecheck configure reindex backup backup-prune backup-auto restore
+
+# Select the embedding model from config/models.yaml. Resolves the model's
+# vector dimension and per-service memory limits, writes them into .env, and
+# renders db/init/01_schema.sql. No MODEL => the registry default.
+# Usage: make configure                              (default model)
+#        make configure MODEL=BAAI/bge-base-en-v1.5  (a specific model)
+configure:
+	python3 scripts/configure_model.py "$(MODEL)"
+
+# Re-embed the entire corpus with the currently-configured model. Required
+# after `make configure` changes the model (content-hash change-detection would
+# otherwise skip unchanged pages and leave stale/mismatched vectors). Truncates
+# the crawled pages/chunks (NOT doc_sources) then triggers a fresh sync.
+reindex:
+	@echo "Truncating doc_pages/doc_chunks (sources preserved) then re-syncing..."
+	docker compose exec -T db psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} \
+		-c "TRUNCATE doc_pages, doc_chunks RESTART IDENTITY CASCADE;"
+	$(MAKE) sync
 
 # Bring up the full stack locally (db + ingestion + mcp-server) using loopback ports.
 up:
@@ -54,11 +72,13 @@ test:
 	@test -d mcp-server/.venv || python3 -m venv mcp-server/.venv
 	@mcp-server/.venv/bin/pip install -q -U pip
 	@mcp-server/.venv/bin/pip install -q -e mcp-server
-	@mcp-server/.venv/bin/pip install -q pytest
+	@mcp-server/.venv/bin/pip install -q pytest pyyaml defusedxml
+	@ingestion/.venv/bin/pip install -q pytest-cov
+	@mcp-server/.venv/bin/pip install -q pytest-cov
 	@echo "=== ingestion test suite ==="
-	cd ingestion && ../ingestion/.venv/bin/pytest -q
+	cd ingestion && ../ingestion/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
 	@echo "=== mcp-server test suite ==="
-	cd mcp-server && ../mcp-server/.venv/bin/pytest -q
+	cd mcp-server && ../mcp-server/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
 	@echo "=== e2e (cross-package) test suite ==="
 	cd tests && ../ingestion/.venv/bin/python -m pytest -q
 	@echo "make test: all suites green (DB-dependent tests skip cleanly if 'docker compose up -d db' wasn't run first)."
@@ -74,6 +94,29 @@ eval:
 	@mcp-server/.venv/bin/pip install -q pytest pyyaml psycopg[binary]
 	@echo "=== retrieval quality eval ==="
 	cd tests/eval && ../../mcp-server/.venv/bin/python -m pytest -q -m eval
+
+# Tooling venv for lint/typecheck (ruff + mypy). Kept separate from the two
+# package venvs; ruff is a standalone binary, mypy runs with
+# --ignore-missing-imports so it needn't install every runtime dependency.
+TOOLS_VENV = .tooling-venv
+$(TOOLS_VENV):
+	python3 -m venv $(TOOLS_VENV)
+	@$(TOOLS_VENV)/bin/pip install -q -U pip ruff mypy
+
+# Lint across both packages, scripts, and tests. (Formatting is available via
+# `ruff format` but intentionally NOT gated — this codebase uses deliberate
+# hand-alignment in its long explanatory comments/tables.)
+lint: $(TOOLS_VENV)
+	$(TOOLS_VENV)/bin/ruff check .
+
+# Static type-check the application code and scripts. Each package is checked
+# separately (both use a top-level `app` package, so a single invocation would
+# see two modules named `app`). mypy.ini quarantines the pre-existing typing
+# backlog so the gate enforces types on new/changed code.
+typecheck: $(TOOLS_VENV)
+	cd ingestion && MYPYPATH=. ../$(TOOLS_VENV)/bin/mypy --config-file ../mypy.ini app
+	cd mcp-server && MYPYPATH=. ../$(TOOLS_VENV)/bin/mypy --config-file ../mypy.ini app
+	$(TOOLS_VENV)/bin/mypy --config-file mypy.ini scripts
 
 # Dump the docs database to a timestamped custom-format archive under ./backups.
 backup:

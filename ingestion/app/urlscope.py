@@ -53,7 +53,10 @@ import ipaddress
 import os
 import socket
 from urllib.parse import urlparse
-from xml.etree import ElementTree
+from xml.etree import ElementTree  # kept for ElementTree.ParseError below
+
+from defusedxml import ElementTree as DefusedET
+from defusedxml.common import DefusedXmlException
 
 _SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
@@ -275,9 +278,13 @@ def parse_sitemap(xml_bytes: bytes) -> tuple[list[str], list[str]]:
     if not xml_bytes:
         raise ValueError("parse_sitemap: empty input")
     try:
-        root = ElementTree.fromstring(xml_bytes)
-    except ElementTree.ParseError as e:
-        raise ValueError(f"parse_sitemap: malformed XML: {e}") from e
+        # defusedxml forbids DTDs / entity expansion / external entities by
+        # default — sitemap XML is fetched from untrusted upstream sources, so
+        # this closes billion-laughs / XXE against the crawler. Both malformed
+        # XML and a rejected entity/DTD attack surface as ValueError here.
+        root = DefusedET.fromstring(xml_bytes)
+    except (ElementTree.ParseError, DefusedXmlException) as e:
+        raise ValueError(f"parse_sitemap: malformed or unsafe XML: {e}") from e
 
     root_tag = _strip_ns(root.tag)
 

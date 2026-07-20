@@ -121,7 +121,7 @@ class SourceConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _sitemap_shares_base_url_host(self) -> "SourceConfig":
+    def _sitemap_shares_base_url_host(self) -> SourceConfig:
         # SSRF guard (security review H1): `sitemap` is fetched BEFORE any of
         # its `<loc>` entries are host-filtered, and a `<sitemapindex>` fans
         # out to its children equally unvalidated. Constraining the sitemap to
@@ -142,7 +142,7 @@ class SourceConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _hosts_must_not_be_private(self) -> "SourceConfig":
+    def _hosts_must_not_be_private(self) -> SourceConfig:
         # SSRF guard (security review H2): source URLs are untrusted input
         # (admin web form + an MCP tool callable by an AI agent), so reject a
         # host that IS or RESOLVES TO private/loopback/link-local/reserved
@@ -166,7 +166,7 @@ class SourceConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _base_url_passes_own_prefix_filters(self) -> "SourceConfig":
+    def _base_url_passes_own_prefix_filters(self) -> SourceConfig:
         # Without a sitemap, the crawler seeds its BFS queue with base_url
         # itself; if base_url's path is excluded (or not included) by this
         # source's own include/exclude_prefixes, the seed is filtered out

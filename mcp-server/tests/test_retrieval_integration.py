@@ -1,8 +1,9 @@
 """Integration tests for retrieval.py's hybrid RRF search against a live
 Postgres (the compose `db` service, T1 schema).
 
-Seeds known chunks with *real* `passage_embed` embeddings (same asymmetric
-FastEmbed model used at ingest time) and exercises the real `search()`
+Seeds known chunks with *real* `embed()` embeddings (same FastEmbed model and
+passage side used at ingest time — no passage prefix for the default model) and
+exercises the real `search()`
 entrypoint end-to-end through the hybrid RRF SQL:
 
   - an exact-token query (a rare literal string that appears in only one
@@ -158,7 +159,7 @@ def _insert_chunk(
     content: str,
     fts_config: str = "english",
 ) -> None:
-    (vec,) = list(model.passage_embed([content]))
+    (vec,) = list(model.embed([content]))
     literal = retrieval._format_vector_literal(vec)
     with conn.cursor() as cur:
         cur.execute(

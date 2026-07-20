@@ -30,8 +30,13 @@ USER app
 # Pre-download the FastEmbed model at build time so the image works fully
 # offline at runtime and the first request isn't paying a multi-second
 # cold-load / download penalty (see IMPLEMENTATION_PLAN.md: "FastEmbed model
-# cache — pre-baked into both images at build; runtime works offline").
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+# cache — pre-baked into both images at build; runtime works offline"). The
+# model is a build arg so `make configure` / compose can bake the selected
+# model (default = config/models.yaml registry default); the runtime env var
+# must match the ingestion service's model.
+ARG EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
+ENV EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
+RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['EMBEDDING_MODEL_NAME'])"
 
 EXPOSE 8000
 

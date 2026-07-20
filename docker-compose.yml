@@ -33,6 +33,8 @@ services:
   ingestion:
     build:
       context: ./ingestion
+      args:
+        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
     container_name: self-docs-ingestion
     restart: unless-stopped
     profiles:
@@ -51,6 +53,12 @@ services:
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
       SOURCES_YAML: /config/sources.yaml
+      # Embedding model config — resolved by `make configure` into .env from
+      # config/models.yaml. The defaults below mirror the registry default
+      # (mixedbread-ai/mxbai-embed-large-v1) so `make up` works unconfigured.
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT:-}"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -65,12 +73,16 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.5G
+          # Sized per embedding model by `make configure` (config/models.yaml);
+          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
+          memory: ${INGESTION_MEM_LIMIT:-2g}
     # No Traefik exposure — reachable inside the compose network.
 
   mcp-server:
     build:
       context: ./mcp-server
+      args:
+        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
     container_name: self-docs-mcp-server
     restart: unless-stopped
     profiles:
@@ -88,6 +100,11 @@ services:
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
+      # Must match the ingestion service's model for vectors to be comparable;
+      # `make configure` keeps both in sync via .env. Defaults mirror the
+      # registry default (config/models.yaml).
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+      EMBEDDING_QUERY_PROMPT: "${EMBEDDING_QUERY_PROMPT:-Represent this sentence for searching relevant passages: }"
     ports:
       - "127.0.0.1:${DOCS_MCP_HOST_PORT:-8081}:8000"
     networks:
@@ -95,7 +112,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          # Sized per embedding model by `make configure` (config/models.yaml);
+          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
+          memory: ${MCP_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=3)"]
       interval: 15s

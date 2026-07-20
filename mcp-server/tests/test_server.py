@@ -26,15 +26,14 @@ from pathlib import Path
 
 os.environ.setdefault("MCP_TOKEN", "test-mcp-token-for-server-tests")
 
+import app.server as server
 import httpx
 import psycopg
 import pytest
+from app import retrieval
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.auth import AccessToken
-
-import app.server as server
-from app import retrieval
 
 TEST_TOKEN = os.environ["MCP_TOKEN"]
 

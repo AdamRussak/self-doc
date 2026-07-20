@@ -1,4 +1,3 @@
-import pytest
 
 from app.chunker import chunk_markdown, count_tokens, get_tokenizer
 
