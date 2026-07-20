@@ -179,7 +179,7 @@ def test_is_private_ip_host_detects_rfc1918_and_link_local():
     assert _is_private_ip_host("example.com") is False  # hostname, not an IP literal
 
 
-def test_validate_final_url_rejects_private_ip_literal_when_base_host_public():
+def test_validate_final_url_rejects_private_ip_literal():
     # Same "host" string on both sides so the same-host check alone would
     # pass — the private-IP check is the thing rejecting this.
     assert _validate_final_url(
@@ -187,18 +187,214 @@ def test_validate_final_url_rejects_private_ip_literal_when_base_host_public():
         base_url="http://169.254.169.254/",
         include_prefixes=[],
         exclude_prefixes=[],
-        base_host_is_public=True,
     ) is False
 
 
-def test_validate_final_url_allows_private_ip_when_base_host_is_itself_private():
+def test_validate_final_url_private_check_is_unconditional(monkeypatch):
+    """Security review H2: the private-address check used to be gated on the
+    source's own host being public, which meant a private base_url did not
+    fail the check — it DISABLED it. A private base_url is now no licence to
+    reach further into private space."""
     assert _validate_final_url(
         final_url="http://169.254.169.254/",
         base_url="http://169.254.169.254/",
         include_prefixes=[],
         exclude_prefixes=[],
-        base_host_is_public=False,
-    ) is True
+    ) is False
+    assert _validate_final_url(
+        final_url="http://192.168.1.10/docs",
+        base_url="http://192.168.1.10/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+    ) is False
+
+
+def test_crawl_refuses_private_base_url_unconditionally():
+    """H2: `base_url = http://192.168.1.10/` must be REFUSED, and must not
+    even issue the robots.txt request. Built via `model_construct` because
+    SourceConfig itself now rejects this at validation time."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig.model_construct(
+        name="internal",
+        base_url="http://192.168.1.10/",
+        sitemap=None,
+        include_prefixes=[],
+        exclude_prefixes=[],
+        max_pages=10,
+        language="english",
+        rate_limit_rps=1000,
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages == []
+    assert requested == []  # not even robots.txt was fetched
+
+
+def test_redirect_into_private_space_refused_before_request_is_issued():
+    """M1: httpx used to follow every hop internally and only the FINAL url
+    was inspected — the request to private space was actually issued, just
+    discarded. The hop must now never be sent."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            return httpx.Response(302, headers={"Location": "http://10.0.0.5:8080/reboot"})
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    # Deliberately a follow-redirects client: `_visit` passes
+    # follow_redirects=False per request, so a caller-supplied client cannot
+    # re-open the hole.
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, follow_redirects=True, max_redirects=5)
+    pages = list(crawl(source, client=client))
+
+    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
+    assert not any("10.0.0.5" in u for u in requested)
+
+
+def test_same_host_in_scope_redirect_is_still_followed():
+    """The manual redirect walk must not break legitimate redirects."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/docs/old":
+            return httpx.Response(301, headers={"Location": "/docs/new"})
+        if url == "https://example.com/docs/new":
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/docs/old",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages[0]["url"] == "https://example.com/docs/old"
+    assert pages[0]["fetch_ok"] is True
+    assert pages[0]["html"] == PAGE_HTML
+
+
+def test_redirect_loop_beyond_max_redirects_yields_fetch_ok_false():
+    """A hop budget is enforced explicitly, and exhausting it preserves the
+    fetch_ok=False contract (it must NOT silently drop the URL)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        n = int(url.rsplit("/", 1)[-1] or 0)
+        return httpx.Response(302, headers={"Location": f"/hop/{n + 1}"})
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/hop/0",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages == [{"url": "https://example.com/hop/0", "html": None, "fetch_ok": False}]
+
+
+def test_redirect_without_location_header_yields_fetch_ok_false():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        return httpx.Response(302)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
+
+
+def test_off_host_child_sitemap_is_never_fetched():
+    """H1 fan-out: children of a <sitemapindex> are attacker-influenced
+    content and must be host-checked BEFORE the child request is issued."""
+    requested: list[str] = []
+    index_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.com/child-sitemap.xml</loc></sitemap>
+  <sitemap><loc>http://169.254.169.254/latest/meta-data/sitemap.xml</loc></sitemap>
+</sitemapindex>
+"""
+    child_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/docs/a</loc></url>
+</urlset>
+"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/sitemap.xml":
+            return httpx.Response(200, text=index_xml)
+        if url == "https://example.com/child-sitemap.xml":
+            return httpx.Response(200, text=child_xml)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        sitemap="https://example.com/sitemap.xml",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert [p["url"] for p in pages] == ["https://example.com/docs/a"]
+    assert not any("169.254.169.254" in u for u in requested)
+
+
+def test_crawl_is_generator_and_preserves_fetch_ok_false_contract():
+    """Both load-bearing invariants asserted together: crawl() stays a
+    generator (memory bounding / per-page commit), and an attempted-but-
+    failed fetch is YIELDED with fetch_ok=False rather than dropped, so
+    store.sync_source does not purge good rows on a transient failure."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        return httpx.Response(503)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    result = crawl(source, client=make_client(handler))
+    assert inspect.isgenerator(result)
+    pages = list(result)
+    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
 
 
 def test_robots_disallow_blocks_page():
@@ -727,3 +923,41 @@ def test_extract_links_suppresses_xml_warning(recwarn):
     extract_links(xml_content, "https://example.com/sitemap.xml")
     assert not [w for w in recwarn if issubclass(w.category, XMLParsedAsHTMLWarning)]
 
+
+
+def test_crawl_refuses_unresolvable_host_fail_closed(monkeypatch):
+    """Crawl time fails CLOSED on an unresolvable host (unlike config
+    validation, which deliberately does not — see test_config)."""
+    import socket as _socket
+
+    from app.urlscope import _resolve_host_addrs
+
+    _resolve_host_addrs.cache_clear()
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        raise _socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig.model_construct(
+        name="gone",
+        base_url="https://gone.invalid/",
+        sitemap=None,
+        include_prefixes=[],
+        exclude_prefixes=[],
+        max_pages=10,
+        language="english",
+        rate_limit_rps=1000,
+    )
+    try:
+        pages = list(crawl(source, client=make_client(handler)))
+        assert pages == []
+        assert requested == []
+    finally:
+        _resolve_host_addrs.cache_clear()

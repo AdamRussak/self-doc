@@ -31,6 +31,7 @@ from .config import SourceConfig
 from .logging_config import get_logger
 from .urlscope import parse_sitemap
 from .urlscope import path_allowed as _path_allowed
+from .urlscope import url_host_is_private
 
 USER_AGENT = "self-docs-crawler/0.1"
 
@@ -76,14 +77,18 @@ def _allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[str]
 
 
 def _is_private_ip_host(host: str) -> bool:
-    """True if `host` is an IP literal within a private/link-local/loopback
-    range. Returns False for plain hostnames — no DNS resolution is performed
-    here (out of scope for this check; see security review L1)."""
+    """True if `host` is an IP LITERAL within a private/link-local/loopback/
+    reserved range. Returns False for plain hostnames — no DNS resolution.
+
+    This is the cheap literal-only precheck; the authoritative check is
+    `urlscope.url_host_is_private`, which resolves and therefore also catches
+    a public hostname with a private A record and the decimal/octal integer
+    encodings of an IPv4 literal."""
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_private or ip.is_link_local or ip.is_loopback
+    return ip.is_private or ip.is_link_local or ip.is_loopback or ip.is_reserved
 
 
 def _validate_final_url(
@@ -91,18 +96,21 @@ def _validate_final_url(
     base_url: str,
     include_prefixes: list[str],
     exclude_prefixes: list[str],
-    base_host_is_public: bool,
 ) -> bool:
-    """Re-validate a response's FINAL url (after any redirects) is still
-    same-host, allowed by include/exclude, and — when the source's configured
-    host is public — not an IP literal in a private/link-local range.
-    Guards against a redirect bouncing the crawler off-host (security review
-    L1)."""
+    """Validate that a candidate url — a response's final url, or a redirect
+    target BEFORE the hop is issued — is same-host, allowed by include/
+    exclude, and not in private address space.
+
+    The private-address check is UNCONDITIONAL (security review H2). It used
+    to be gated on the source's own host being public, which meant a private
+    `base_url` did not fail validation, it DISABLED the only private-address
+    check in the codebase — a private literal was treated as a licence to
+    skip checking."""
     if not _same_host(final_url, base_url):
         return False
     if not _allowed(urlparse(final_url).path, include_prefixes, exclude_prefixes):
         return False
-    if base_host_is_public and _is_private_ip_host(urlparse(final_url).hostname or ""):
+    if url_host_is_private(final_url):
         return False
     return True
 
@@ -270,6 +278,13 @@ def _discover_sitemap_urls_recursive(
                 truncation["truncated"] = True
                 truncation["unprocessed_child_sitemaps"] += len(child_sitemaps) - i
                 break
+            # SSRF guard (security review H1): a <sitemapindex> is fetched
+            # content, so its children are attacker-influenced. Check the
+            # child's host BEFORE requesting it — the <loc> filtering below
+            # happens strictly after the request would have been sent.
+            if not _same_host(child_url, base_url) or url_host_is_private(child_url):
+                log.info("child_sitemap_out_of_scope", sitemap_url=child_url)
+                continue
             try:
                 child_urls = _discover_sitemap_urls_recursive(
                     client,
@@ -328,12 +343,22 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
     """
     own_client = client is None
     if own_client:
-        client = httpx.Client(follow_redirects=True, max_redirects=MAX_REDIRECTS)
+        # follow_redirects=False: hops are walked MANUALLY in `_visit` so each
+        # Location is validated BEFORE its request is issued (security review
+        # M1). Delegating to httpx meant every hop was actually fetched and
+        # only the final url was inspected — blind SSRF with up to
+        # MAX_REDIRECTS hops.
+        client = httpx.Client(follow_redirects=False)
 
     log = logger.bind(source=source.name)
     try:
         base_url = str(source.base_url)
-        base_host_is_public = not _is_private_ip_host(urlparse(base_url).hostname or "")
+        # UNCONDITIONAL private-address gate (security review H2). Checked
+        # once per source, before the robots.txt fetch — which is itself a
+        # request to base_url's origin and was previously unguarded.
+        if url_host_is_private(base_url):
+            log.info("crawl_refused_private_host", base_url=base_url)
+            return
         rp = load_robots(client, base_url)
         limiter = RateLimiter(source.rate_limit_rps)
 
@@ -341,7 +366,12 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
         visited: set[str] = set()
 
         candidate_urls: list[str] | None = None
-        if source.sitemap:
+        if source.sitemap and not _same_host(str(source.sitemap), base_url):
+            # Defence in depth: SourceConfig already rejects an off-host
+            # sitemap (H1). This catches a SourceConfig built via
+            # `model_construct` or mutated after validation.
+            log.info("sitemap_off_host_ignored", sitemap=str(source.sitemap))
+        elif source.sitemap:
             try:
                 candidate_urls = discover_sitemap_urls(
                     client,
@@ -366,12 +396,47 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
             if not can_fetch(rp, url):
                 log.info("robots_disallowed", url=url)
                 return {"url": url, "html": None, "fetch_ok": False}
-            limiter.wait()
             start = time.monotonic()
-            try:
-                resp = client.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
-            except httpx.HTTPError as e:
-                log.info("page_fetch_failed", url=url, error=str(e))
+            # Manual redirect walk (security review M1): every hop's Location
+            # is validated BEFORE the next request is issued, and
+            # `follow_redirects=False` is passed PER REQUEST so a caller-
+            # supplied client that defaults to following cannot re-open the
+            # hole. Bounded by MAX_REDIRECTS, now explicit rather than
+            # delegated to httpx.
+            current_url = url
+            resp = None
+            for _hop in range(MAX_REDIRECTS + 1):
+                limiter.wait()
+                try:
+                    resp = client.get(
+                        current_url,
+                        headers={"User-Agent": USER_AGENT},
+                        timeout=15,
+                        follow_redirects=False,
+                    )
+                except httpx.HTTPError as e:
+                    log.info("page_fetch_failed", url=url, error=str(e))
+                    return {"url": url, "html": None, "fetch_ok": False}
+                if not resp.is_redirect:
+                    break
+                location = resp.headers.get("location", "").strip()
+                if not location:
+                    log.info("redirect_rejected", url=url, final_url=current_url, reason="no_location")
+                    return {"url": url, "html": None, "fetch_ok": False}
+                next_url = _strip_fragment(urljoin(current_url, location))
+                if not _validate_final_url(
+                    next_url,
+                    base_url,
+                    source.include_prefixes,
+                    source.exclude_prefixes,
+                ):
+                    # Refused BEFORE issuing the hop, so the request to a
+                    # private/off-host target is never sent at all.
+                    log.info("redirect_rejected", url=url, final_url=next_url)
+                    return {"url": url, "html": None, "fetch_ok": False}
+                current_url = next_url
+            else:
+                log.info("redirect_rejected", url=url, final_url=current_url, reason="too_many_redirects")
                 return {"url": url, "html": None, "fetch_ok": False}
             duration_ms = round((time.monotonic() - start) * 1000, 1)
             if resp.status_code != 200:
@@ -383,7 +448,6 @@ def crawl(source: SourceConfig, client: httpx.Client | None = None) -> Iterator[
                 base_url,
                 source.include_prefixes,
                 source.exclude_prefixes,
-                base_host_is_public,
             ):
                 log.info("redirect_rejected", url=url, final_url=final_url)
                 return {"url": url, "html": None, "fetch_ok": False}

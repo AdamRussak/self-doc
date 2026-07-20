@@ -1,0 +1,68 @@
+{% extends "admin/base.html" %}
+{% block title %}knowledge base browser{% endblock %}
+{% block nav_docs %}active{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Knowledge Base Browser</h2>
+  <p class="hint">Inspect all ingested document pages and their pre-chunked markdown segments across active sources.</p>
+  
+  <form method="get" action="/admin/docs" class="filter-toolbar">
+    <div>
+      <label for="source_id" style="margin-top: 0; font-size: 0.8rem; color: var(--color-text-muted);">Filter by Source</label>
+      <select id="source_id" name="source_id" style="width: 100%; padding: 0.55rem 0.8rem; background: rgba(0,0,0,0.4); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); font-family: var(--font-mono); font-size: 0.85rem;">
+        <option value="">-- All Active Sources --</option>
+        {% for s in sources %}
+        <option value="{{ s.id }}" {% if selected_source_id and s.id == selected_source_id %}selected{% endif %}>{{ s.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="query" style="margin-top: 0; font-size: 0.8rem; color: var(--color-text-muted);">Search URL / Path</label>
+      <input type="text" id="query" name="query" value="{{ query or '' }}" placeholder="e.g. guide/routing or config..." style="padding: 0.55rem 0.8rem;">
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+      <button type="submit" class="btn btn-primary">Filter</button>
+      {% if selected_source_id or query %}
+      <a href="/admin/docs" class="btn">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <table class="table" style="font-family: var(--font-mono); font-size: 0.85rem;">
+    <thead>
+      <tr>
+        <th style="width: 5%;">id</th>
+        <th style="width: 15%;">source</th>
+        <th style="width: 45%;">url</th>
+        <th style="width: 15%;">fetched at</th>
+        <th style="width: 10%;">chunks</th>
+        <th style="width: 10%;">actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in pages %}
+      <tr>
+        <td style="color: var(--color-text-muted);">#{{ p.id }}</td>
+        <td><strong style="color: var(--color-primary-tint);">{{ p.source_name }}</strong></td>
+        <td style="word-break: break-all;"><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.url }}</a></td>
+        <td style="font-size: 0.8rem; color: var(--color-text-muted);">{{ p.fetched_at.strftime('%Y-%m-%d %H:%M:%S UTC') if p.fetched_at else '-' }}</td>
+        <td><span class="badge" style="background: rgba(255,255,255,0.06); border: 1px solid var(--color-border);">{{ p.chunk_count }}</span></td>
+        <td class="actions">
+          <button type="button" class="btn"
+                  hx-get="/admin/docs/pages/{{ p.id }}/chunks"
+                  hx-target="#chunks-row-{{ p.id }}"
+                  hx-swap="innerHTML">
+            Inspect Chunks
+          </button>
+        </td>
+      </tr>
+      <tr id="chunks-row-{{ p.id }}"></tr>
+      {% else %}
+      <tr>
+        <td colspan="6" class="muted" style="text-align: center; padding: 2rem;">No ingested document pages match the selected filters.</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

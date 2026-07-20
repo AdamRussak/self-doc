@@ -1,5 +1,31 @@
 # n8n — `self-docs weekly sync` workflow
 
+> **SUPERSEDED.** This n8n workflow is replaced by an in-process scheduler
+> built into the `ingestion` service (per-source `schedule_cron`, opt-in via
+> `SCHEDULER_ENABLED`) — see `docs/runbook.md`'s [The scheduler (replaces
+> n8n)](../runbook.md#the-scheduler-replaces-n8n) section for the full
+> replacement: supported cron syntax, the `SCHEDULER_ENABLED` opt-in, and
+> how to answer "why didn't source X sync last night?" from structured logs.
+>
+> **If you are migrating to the internal scheduler, you MUST disable/
+> deactivate this n8n workflow BEFORE setting `SCHEDULER_ENABLED=true`.**
+> The two schedulers do not coordinate with each other — if both are active,
+> both can independently trigger a sync against the same source at
+> overlapping times ("double scheduling"), which is exactly the
+> interleaved-crawl hazard the internal scheduler's unified sync lock exists
+> to prevent for its own two other callers (`POST /sync`, the admin UI's
+> manual-sync button) but **cannot** prevent against a fully external
+> caller like n8n beyond the existing `409`/no-op behavior on a lock
+> collision — relying on that as your *only* safeguard is not the intent.
+> Deactivate this workflow first: n8n UI → open the workflow → toggle
+> **Inactive** (or `n8n update:workflow --id=<id> --active=false`).
+>
+> This document and [`docs-sync.json`](./docs-sync.json) are kept as
+> **historical reference** — the exported workflow file is not deleted, in
+> case an operator has not yet migrated or wants to reason about what n8n
+> used to do. Everything below describes the now-superseded n8n workflow as
+> it existed before the internal scheduler.
+
 Exported workflow: [`docs-sync.json`](./docs-sync.json). This is the automation from
 IMPLEMENTATION_PLAN.md §T6 — it owns *scheduling* the weekly re-crawl; the ingestion container
 itself stays cron-free and only reacts to `POST /sync`.

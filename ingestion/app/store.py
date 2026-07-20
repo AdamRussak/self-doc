@@ -29,6 +29,8 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable
 
 import psycopg
 
@@ -357,7 +359,11 @@ def mark_source_failed(name: str) -> None:
         logger.error("mark_source_failed_also_failed", source=name, error=str(e))
 
 
-def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome:
+def sync_source(
+    source: SourceConfig,
+    conn: psycopg.Connection,
+    progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+) -> SourceOutcome:
     """Run one full sync of `source` against `conn`. Never raises for
     per-page failures (recorded in the outcome); only a source-level failure
     (e.g. the crawl itself raising) short-circuits with status="failed".
@@ -421,6 +427,8 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
                 fetch_failed_urls.add(url)
                 outcome.pages_soft_failed += 1
                 log.info("page_fetch_skipped", url=url)
+                if progress_cb:
+                    progress_cb(outcome, url)
                 continue
 
             html = page["html"]
@@ -430,6 +438,8 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
                 if extraction.status != "ok":
                     outcome.pages_soft_failed += 1
                     log.info("page_content_skipped", url=url, reason=extraction.reason)
+                    if progress_cb:
+                        progress_cb(outcome, url)
                     continue
 
                 content_hash = hash_markdown(extraction.markdown)
@@ -437,6 +447,8 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
                 if existing_hash == content_hash:
                     outcome.pages_skipped += 1
                     log.info("page_unchanged_skip", url=url)
+                    if progress_cb:
+                        progress_cb(outcome, url)
                     continue
 
                 chunks = chunker.chunk_markdown(url, extraction.markdown)
@@ -445,11 +457,15 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
                 outcome.pages_fetched += 1
                 outcome.chunks_indexed += n
                 log.info("page_indexed", url=url, chunks=n, changed=existing_hash is not None)
+                if progress_cb:
+                    progress_cb(outcome, url)
             except Exception as e:  # noqa: BLE001 - isolate per-page failures
                 if not conn.autocommit:
                     conn.rollback()
                 outcome.pages_failed += 1
                 log.error("page_index_failed", url=url, error=str(e))
+                if progress_cb:
+                    progress_cb(outcome, url)
     finally:
         # Explicitly close the generator on every exit path (StopIteration,
         # mid-iteration failure, or an unexpected exception) rather than
@@ -521,13 +537,118 @@ def sync_source(source: SourceConfig, conn: psycopg.Connection) -> SourceOutcome
     return outcome
 
 
-def sync_all(sources: list[SourceConfig]) -> dict[str, SourceOutcome]:
+def sync_all(
+    sources: list[SourceConfig],
+    progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+) -> dict[str, SourceOutcome]:
     """Sync each of `sources` in turn, each with its own connection."""
     results: dict[str, SourceOutcome] = {}
     for source in sources:
         conn = get_connection()
         try:
-            results[source.name] = sync_source(source, conn)
+            results[source.name] = sync_source(source, conn, progress_cb=progress_cb)
         finally:
             conn.close()
     return results
+
+
+@dataclass(frozen=True)
+class PageRecord:
+    id: int
+    source_id: int
+    source_name: str
+    url: str
+    content_hash: str
+    fetched_at: datetime
+    chunk_count: int
+
+
+@dataclass(frozen=True)
+class ChunkRecord:
+    id: int
+    heading_path: str | None
+    chunk_index: int
+    content: str
+
+
+def _row_to_page_record(row: tuple) -> PageRecord:
+    id_, source_id, source_name, url, content_hash, fetched_at, chunk_count = row
+    return PageRecord(
+        id=id_,
+        source_id=source_id,
+        source_name=source_name,
+        url=url,
+        content_hash=content_hash,
+        fetched_at=fetched_at,
+        chunk_count=chunk_count,
+    )
+
+
+def _row_to_chunk_record(row: tuple) -> ChunkRecord:
+    id_, heading_path, chunk_index, content = row
+    return ChunkRecord(
+        id=id_,
+        heading_path=heading_path,
+        chunk_index=chunk_index,
+        content=content,
+    )
+
+
+def list_doc_pages(
+    conn: psycopg.Connection,
+    *,
+    source_id: int | None = None,
+    query: str | None = None,
+    limit: int = 100,
+) -> list[PageRecord]:
+    """Fetch `doc_pages` rows joined with `doc_sources` and count of `doc_chunks`,
+    optionally filtered by `source_id` or `query` (URL/heading/content search)."""
+    where_clauses = ["1=1"]
+    params: list[Any] = []
+    if source_id is not None:
+        where_clauses.append("p.source_id = %s")
+        params.append(source_id)
+    if query:
+        pattern = f"%{query}%"
+        where_clauses.append(
+            "(p.url ILIKE %s OR EXISTS ("
+            "SELECT 1 FROM doc_chunks c2 WHERE c2.page_id = p.id AND "
+            "(c2.heading_path ILIKE %s OR c2.content ILIKE %s)"
+            "))"
+        )
+        params.extend([pattern, pattern, pattern])
+    params.append(limit)
+    where_sql = " AND ".join(where_clauses)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT p.id, p.source_id, s.name AS source_name, p.url, p.content_hash, p.fetched_at, COUNT(c.id) AS chunk_count
+            FROM doc_pages p
+            JOIN doc_sources s ON p.source_id = s.id
+            LEFT JOIN doc_chunks c ON c.page_id = p.id
+            WHERE {where_sql}
+            GROUP BY p.id, p.source_id, s.name, p.url, p.content_hash, p.fetched_at
+            ORDER BY p.fetched_at DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+    return [_row_to_page_record(row) for row in rows]
+
+
+def get_page_chunks(conn: psycopg.Connection, page_id: int) -> list[ChunkRecord]:
+    """Fetch all `doc_chunks` for a specific `page_id` ordered by `chunk_index`."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, heading_path, chunk_index, content
+            FROM doc_chunks
+            WHERE page_id = %s
+            ORDER BY chunk_index ASC
+            """,
+            (page_id,),
+        )
+        rows = cur.fetchall()
+    return [_row_to_chunk_record(row) for row in rows]
+

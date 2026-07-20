@@ -1,0 +1,18 @@
+{% extends "admin/base.html" %}
+{% block title %}admin login{% endblock %}
+{% block nav_sources %}{% endblock %}
+{% block content %}
+<div class="card" style="border-top: 2px solid var(--color-primary); max-width: 32rem; margin: 3rem auto; box-shadow: var(--shadow-glow);">
+  <h2>Sign in</h2>
+  <p class="hint">Paste the ingestion service's <code>SYNC_TOKEN</code> below. On success you get a
+    session cookie scoped to <code>/admin</code>; no further header juggling needed to click around.</p>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label for="token">SYNC_TOKEN</label>
+    <input type="password" id="token" name="token" autocomplete="off" required placeholder="Enter SYNC_TOKEN...">
+    <div class="actions" style="margin-top: 1.5rem;">
+      <button type="submit" class="btn btn-primary" style="width: 100%;">Sign in</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

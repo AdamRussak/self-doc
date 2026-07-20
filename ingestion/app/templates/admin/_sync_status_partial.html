@@ -1,0 +1,82 @@
+{% if sync_status and sync_status.running %}
+<div id="sync-status-widget" hx-get="/admin/sync-status-widget" hx-trigger="every 1.5s, syncStatusUpdated from:body" hx-swap="outerHTML" class="message" style="border-color: var(--color-primary); background: var(--color-primary-bg); color: var(--color-text); margin-bottom: 1.5rem; border-radius: var(--radius-md); padding: 1rem 1.25rem;">
+  <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 0.75rem;">
+    <div style="display: flex; align-items: center; gap: 0.6rem;">
+      <span class="status-led status-led-syncing" style="margin-right: 0;"></span>
+      <strong style="color: var(--color-primary-tint); font-size: 1.05rem;">Active Sync in Progress</strong>
+      <span class="badge badge-primary" style="font-family: var(--font-mono);">{{ sync_status.get('source', '') or "Active Source" }}</span>
+    </div>
+    <div style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--color-text-muted);">
+      Processing pipeline...
+    </div>
+  </div>
+  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; background: rgba(0,0,0,0.3); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid rgba(37, 99, 235, 0.2); margin-bottom: 0.75rem; font-family: var(--font-mono);">
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Indexed Pages</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-success);">{{ sync_status.get('pages_fetched', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Chunks Created</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-primary-tint);">{{ sync_status.get('chunks_indexed', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Unchanged Skipped</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-text);">{{ sync_status.get('pages_skipped', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Errors / Skipped</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: {% if sync_status.get('pages_failed', 0) > 0 %}var(--color-error){% else %}var(--color-text-muted){% endif %}">{{ sync_status.get('pages_failed', 0) }}</div>
+    </div>
+  </div>
+  {% if sync_status.get('last_url') %}
+  <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+    <strong style="color: var(--color-primary-tint);">Current Target:</strong> {{ sync_status.get('last_url') }}
+  </div>
+  {% endif %}
+</div>
+{% elif sync_status and sync_status.get('last_completed_summary') %}
+{% set summary = sync_status.last_completed_summary %}
+{% set is_ok = summary.get('status', 'ok') == 'ok' %}
+<div id="sync-status-widget" hx-get="/admin/sync-status-widget" hx-trigger="syncStatusUpdated from:body" hx-swap="outerHTML" style="background: var(--color-surface); border: 1px solid {% if is_ok %}rgba(0, 229, 153, 0.35){% else %}rgba(255, 75, 75, 0.35){% endif %}; border-radius: var(--radius-md); padding: 1rem 1.25rem; margin-bottom: 1.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.2);">
+  <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 0.75rem;">
+    <div style="display: flex; align-items: center; gap: 0.6rem;">
+      <span class="status-led {% if is_ok %}status-led-ok{% else %}status-led-error{% endif %}" style="margin-right: 0;"></span>
+      <strong style="color: {% if is_ok %}var(--color-success){% else %}var(--color-error){% endif %}; font-size: 1.05rem;">
+        {% if is_ok %}Operation Status: SUCCESS{% else %}Operation Status: FAILED{% endif %}
+      </strong>
+      <span class="badge {% if is_ok %}badge-success{% else %}badge-error{% endif %}" style="font-family: var(--font-mono);">{{ summary.get('source', 'Sync Target') }}</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <form method="post" action="/admin/sync-status/clear" hx-post="/admin/sync-status/clear" hx-target="#sync-status-widget" hx-swap="outerHTML" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn" style="padding: 0.25rem 0.6rem; font-size: 0.75rem; background: transparent; border-color: var(--color-border); color: var(--color-text-muted);">Dismiss</button>
+      </form>
+    </div>
+  </div>
+  <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; background: rgba(0,0,0,0.25); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--color-border); font-family: var(--font-mono);">
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Indexed Pages</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-success);">{{ summary.get('pages_fetched', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Chunks Created</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-primary-tint);">{{ summary.get('chunks_indexed', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Unchanged Skipped</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: var(--color-text);">{{ summary.get('pages_skipped', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.75rem; color: var(--color-text-muted); text-transform: uppercase;">Errors / Skipped</div>
+      <div style="font-size: 1.2rem; font-weight: bold; color: {% if summary.get('pages_failed', 0) > 0 %}var(--color-error){% else %}var(--color-text-muted){% endif %}">{{ summary.get('pages_failed', 0) }}</div>
+    </div>
+  </div>
+  {% if summary.get('error') %}
+  <div style="margin-top: 0.75rem; font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-error); background: rgba(255, 75, 75, 0.08); padding: 0.5rem 0.75rem; border-radius: var(--radius-sm); border: 1px solid rgba(255, 75, 75, 0.2);">
+    <strong>Error details:</strong> {{ summary.get('error') }}
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<div id="sync-status-widget" hx-get="/admin/sync-status-widget" hx-trigger="every 5s, syncStatusUpdated from:body" hx-swap="outerHTML" style="display: none;"></div>
+{% endif %}

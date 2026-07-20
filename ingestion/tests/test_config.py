@@ -1,8 +1,10 @@
+import socket
 from pathlib import Path
 
 import pytest
 
 from app.config import ConfigError, load_sources
+from app.urlscope import _resolve_host_addrs
 
 
 def write_yaml(tmp_path: Path, text: str) -> Path:
@@ -195,3 +197,104 @@ def test_sitemap_source_skips_base_url_prefix_check(tmp_path):
     )
     sources = load_sources(p)
     assert sources[0].name == "sitemap-src"
+
+
+# --- SSRF guard at validation time (security review H1/H2) ----------------
+#
+# Source URLs are untrusted input (admin web form + an MCP tool callable by
+# an AI agent), so a bad proposal must be rejected BEFORE a human is shown an
+# approval prompt.
+
+
+def _yaml_source(**kv) -> str:
+    lines = ["sources:", "  - name: widget"]
+    for k, v in kv.items():
+        lines.append(f"    {k}: {v}")
+    lines.append("    max_pages: 10")
+    return "\n".join(lines) + "\n"
+
+
+@pytest.fixture(autouse=True)
+def _clear_resolver_cache():
+    _resolve_host_addrs.cache_clear()
+    yield
+    _resolve_host_addrs.cache_clear()
+
+
+def _fake_getaddrinfo(mapping):
+    def fake(host, *args, **kwargs):
+        if host not in mapping:
+            raise socket.gaierror(-2, "Name or service not known")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (mapping[host], 0))]
+
+    return fake
+
+
+def test_sitemap_on_different_host_than_base_url_is_rejected(tmp_path):
+    """H1: the sitemap is fetched before any of its <loc> entries are
+    host-filtered, so an off-host sitemap is a direct SSRF vector."""
+    p = write_yaml(tmp_path, _yaml_source(
+        base_url="https://widget.example.com/",
+        sitemap="http://169.254.169.254/latest/meta-data/",
+    ))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "sitemap host" in str(e.value)
+
+
+def test_sitemap_on_same_host_is_accepted(tmp_path):
+    p = write_yaml(tmp_path, _yaml_source(
+        base_url="https://widget.example.com/",
+        sitemap="https://widget.example.com/sitemap.xml",
+    ))
+    sources = load_sources(p)
+    assert str(sources[0].sitemap) == "https://widget.example.com/sitemap.xml"
+
+
+def test_private_literal_base_url_is_rejected(tmp_path):
+    p = write_yaml(tmp_path, _yaml_source(base_url="http://192.168.1.10/"))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "private" in str(e.value)
+
+
+def test_decimal_encoded_loopback_base_url_is_rejected(tmp_path, monkeypatch):
+    """`ipaddress.ip_address("2130706433")` raises — a literal-only check
+    lets this through. The resolver normalizes it to 127.0.0.1."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({"2130706433": "127.0.0.1"}))
+    p = write_yaml(tmp_path, _yaml_source(base_url="http://2130706433/"))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "private" in str(e.value)
+
+
+def test_public_hostname_resolving_into_private_space_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({
+        "docs.attacker.example": "10.0.0.5",
+    }))
+    p = write_yaml(tmp_path, _yaml_source(base_url="https://docs.attacker.example/"))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "private" in str(e.value)
+
+
+def test_private_sitemap_is_rejected_even_when_host_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({
+        "docs.attacker.example": "127.0.0.1",
+    }))
+    p = write_yaml(tmp_path, _yaml_source(
+        base_url="https://docs.attacker.example/",
+        sitemap="https://docs.attacker.example/sitemap.xml",
+    ))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "private" in str(e.value)
+
+
+def test_unresolvable_host_is_not_rejected_at_validation_time(tmp_path, monkeypatch):
+    """Deliberate: validation fetches nothing, so a DNS blip must not
+    permanently reject a legitimate source. `crawl()` still fails closed and
+    refuses to fetch an unresolvable host (see test_crawler)."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({}))
+    p = write_yaml(tmp_path, _yaml_source(base_url="https://widget.example.com/"))
+    assert load_sources(p)[0].name == "widget"

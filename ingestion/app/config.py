@@ -31,6 +31,8 @@ from urllib.parse import urlparse
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
+from .urlscope import url_host_is_private
+
 NAME_PATTERN = r"^[a-z0-9-]+$"
 
 
@@ -66,6 +68,51 @@ class SourceConfig(BaseModel):
     @classmethod
     def _none_to_empty(cls, v: Any) -> Any:
         return v if v is not None else []
+
+    @model_validator(mode="after")
+    def _sitemap_shares_base_url_host(self) -> "SourceConfig":
+        # SSRF guard (security review H1): `sitemap` is fetched BEFORE any of
+        # its `<loc>` entries are host-filtered, and a `<sitemapindex>` fans
+        # out to its children equally unvalidated. Constraining the sitemap to
+        # base_url's host closes both: the root request is in-scope by
+        # construction and every child is checkable against the same host.
+        # This is a real constraint on every real doc site.
+        if self.sitemap is None:
+            return self
+        base_host = urlparse(str(self.base_url)).netloc
+        sitemap_host = urlparse(str(self.sitemap)).netloc
+        if sitemap_host != base_host:
+            raise ValueError(
+                f"source '{self.name}': sitemap host {sitemap_host!r} differs from base_url "
+                f"host {base_host!r} — a sitemap is fetched before its entries are "
+                "host-filtered, so an off-host sitemap is a server-side request forgery "
+                "vector. Point the sitemap at base_url's own host."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _hosts_must_not_be_private(self) -> "SourceConfig":
+        # SSRF guard (security review H2): source URLs are untrusted input
+        # (admin web form + an MCP tool callable by an AI agent), so reject a
+        # host that IS or RESOLVES TO private/loopback/link-local/reserved
+        # space at validation time — before a human is ever shown an approval
+        # prompt. Fails closed on an unresolvable host. See
+        # `urlscope._resolve_is_private` for the accepted DNS-rebinding
+        # residual.
+        for field_name, value in (("base_url", self.base_url), ("sitemap", self.sitemap)):
+            if value is None:
+                continue
+            # unresolvable_is_private=False: validation must not permanently
+            # reject a source because DNS blipped or the host does not resolve
+            # from this machine. The crawl-time gate fails closed instead.
+            if url_host_is_private(str(value), unresolvable_is_private=False):
+                raise ValueError(
+                    f"source '{self.name}': {field_name} host "
+                    f"{urlparse(str(value)).hostname!r} is, resolves to, or cannot be "
+                    "resolved away from a private/loopback/link-local/reserved address — "
+                    "refusing to crawl internal network space."
+                )
+        return self
 
     @model_validator(mode="after")
     def _base_url_passes_own_prefix_filters(self) -> "SourceConfig":

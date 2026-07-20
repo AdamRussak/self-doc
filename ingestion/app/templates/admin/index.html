@@ -1,0 +1,175 @@
+{% extends "admin/base.html" %}
+{% block title %}sources{% endblock %}
+{% block nav_sources %}active{% endblock %}
+{% block content %}
+{% if message %}<div class="message">{{ message }}</div>{% endif %}
+
+<div class="card" style="border-top: 2px solid var(--color-primary);">
+  <h2>Sync Controls</h2>
+  {% include "admin/_sync_status_partial.html" %}
+  <div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: center;">
+    <div>
+      <form method="post" action="/admin/sync-all" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-primary" {% if sync_status and sync_status.running %}disabled{% endif %}>&#8635; Run Full Sync (All Active Sources)</button>
+      </form>
+    </div>
+    <div style="flex: 1; min-width: 320px;">
+      <form method="post" action="/admin/sources/sync-target" style="display: flex; gap: 0.5rem; align-items: center; margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <select name="source_id" required style="padding: 0.45rem 0.8rem; background: rgba(0,0,0,0.3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); font-family: var(--font-mono); font-size: 0.85rem; flex: 1;">
+          <option value="" disabled selected>-- Select single data source to sync --</option>
+          {% for s in active %}
+          <option value="{{ s.id }}">{{ s.name }} ({{ s.base_url }})</option>
+          {% endfor %}
+        </select>
+        <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>Sync Target</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% if pending %}
+<div class="pending-section card">
+  <h2>&#9888; Pending review (agent-proposed)</h2>
+  <p class="hint">These sources were proposed via the MCP tool by an AI agent, not entered by hand here &mdash;
+    review <strong>every</strong> field below before approving, especially the <code>sitemap</code> URL:
+    it is the field the crawler actually fetches from, and it can point anywhere &mdash; including hosts that
+    have nothing to do with the public <code>base_url</code> shown next to it. Approval makes the crawler
+    fetch it.</p>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>name</th>
+        <th>base_url</th>
+        <th class="col-sitemap">sitemap</th>
+        <th>include prefixes</th>
+        <th>exclude prefixes</th>
+        <th>max pages</th>
+        <th>proposed by</th>
+        <th>actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in pending %}
+      {% set mismatch = sitemap_host_differs(s.sitemap, s.base_url) %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{{ s.base_url }}</td>
+        <td class="col-sitemap{% if mismatch %} sitemap-mismatch{% endif %}">
+          {% if s.sitemap %}
+            {{ s.sitemap }}
+            {% if mismatch %}
+              <br><span class="mismatch-warning">&#9888; sitemap host differs from base_url host &mdash; verify this is intentional before approving</span>
+            {% endif %}
+          {% else %}
+            <span class="muted">(none &mdash; crawler falls back to BFS from base_url)</span>
+          {% endif %}
+        </td>
+        <td>{% if s.include_prefixes %}{{ s.include_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
+        <td>{% if s.exclude_prefixes %}{{ s.exclude_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
+        <td>{{ s.max_pages if s.max_pages is not none else "(none)" }}</td>
+        <td><span class="proposed-by">agent: {{ s.proposed_by or "unknown" }}</span></td>
+        <td class="actions">
+          <div class="btn-group">
+            <a class="btn" href="/admin/sources/{{ s.id }}">view/edit</a>
+            <form method="post" action="/admin/sources/{{ s.id }}/approve">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-primary">Approve</button>
+            </form>
+            <form method="post" action="/admin/sources/{{ s.id }}/reject">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-danger">Reject</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Active sources</h2>
+  <p><a class="btn btn-primary" href="/admin/sources/new">+ add a source</a></p>
+  <table class="table">
+    <thead>
+      <tr><th>name</th><th>base_url</th><th>schedule</th><th>last synced</th><th>last status</th><th>actions</th></tr>
+    </thead>
+    <tbody>
+      {% for s in active %}
+      <tr>
+        <td><strong>{{ s.name }}</strong></td>
+        <td>{{ s.base_url }}</td>
+        <td>{{ s.schedule_cron or "(manual only)" }}{% if not s.enabled %} <span class="badge badge-warning">disabled</span>{% endif %}</td>
+        <td>{{ s.last_synced or "never" }}</td>
+        <td>
+          {% if sync_status and sync_status.running and (sync_status.source == s.name or sync_status.source_name == s.name) %}
+            <span class="status-led status-led-syncing"></span>
+            <span class="badge badge-primary">syncing</span>
+          {% elif s.last_status == 'ok' %}
+            <span class="status-led status-led-ok"></span>
+            <span class="badge badge-success">{{ s.last_status }}</span>
+          {% elif s.last_status %}
+            <span class="status-led status-led-error"></span>
+            <span class="badge badge-error">{{ s.last_status }}</span>
+          {% else %}
+            <span class="status-led status-led-idle"></span>
+            <span class="muted">-</span>
+          {% endif %}
+        </td>
+        <td class="actions">
+          <div class="btn-group">
+            <a class="btn" href="/admin/sources/{{ s.id }}">edit</a>
+            <form method="post" action="/admin/sources/{{ s.id }}/sync">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn">Sync now</button>
+            </form>
+            <form method="post" action="/admin/sources/{{ s.id }}/delete"
+                  data-confirm-delete
+                  data-source-name="{{ s.name }}"
+                  data-confirm-extra="This cascades to all its pages and chunks and cannot be undone.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">no active sources yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if rejected %}
+<div class="card">
+  <h2>Rejected</h2>
+  <table class="table">
+    <thead><tr><th>name</th><th>base_url</th><th>proposed by</th><th>actions</th></tr></thead>
+    <tbody>
+      {% for s in rejected %}
+      <tr>
+        <td>{{ s.name }}</td>
+        <td>{{ s.base_url }}</td>
+        <td>{{ s.proposed_by or "-" }}</td>
+        <td class="actions">
+          <div class="btn-group">
+            <form method="post" action="/admin/sources/{{ s.id }}/delete"
+                  data-confirm-delete
+                  data-source-name="{{ s.name }}"
+                  data-confirm-extra="This is a permanent delete of a rejected source.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}
+

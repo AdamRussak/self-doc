@@ -1,0 +1,11 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ heading }}{% endblock %}
+{% block content %}
+<div class="card" style="border-top: 2px solid var(--color-primary); max-width: 36rem; margin: 3rem auto; box-shadow: var(--shadow-glow);">
+  <h2>{{ heading }}</h2>
+  <div class="error">{{ message }}</div>
+  <div class="actions" style="margin-top: 1.5rem;">
+    <a class="btn" href="/admin">&larr; back to sources</a>
+  </div>
+</div>
+{% endblock %}

@@ -77,9 +77,11 @@ self-docs/
 │   │   ├── embedder.py         # FastEmbed passage_embed wrapper
 │   │   └── store.py            # hash-diff upsert into Postgres
 │   └── config/
-│       └── sources.yaml        # declarative list of doc sites to index
-│                               # (bind-mounted read-only; re-read on every
-│                               # /sync, not baked into the image)
+│       └── sources.yaml        # PHASE 6: historical/seed only — doc_sources
+│                               # (Postgres) is now the source of truth for
+│                               # crawl config; this file is imported ONLY
+│                               # when IMPORT_SOURCES_YAML_ON_BOOT=1 is set
+│                               # at container start. See §8.
 ├── mcp-server/
 │   ├── Dockerfile
 │   ├── pyproject.toml
@@ -147,16 +149,21 @@ so the documented upgrade path is **nuke and rebuild**: `docker compose down -v 
 with the new init scripts, trigger a full sync. If the DB ever accumulates non-rebuildable
 state, adopt Alembic then (recorded as an ADR).
 
-### `ingestion/config/sources.yaml` schema
+### `ingestion/config/sources.yaml` schema — **superseded as of Phase 6, see §8**
 
-Lives at `ingestion/config/sources.yaml`, bind-mounted read-only into the
-`ingestion` container (`SOURCES_YAML=/config/sources.yaml`) and re-read from
-disk on every `/sync` request — no rebuild/restart needed to pick up an edit.
-Validated at process startup with pydantic (fail-fast: an invalid file at
-boot aborts the container); a bad edit discovered at runtime instead fails
-soft — `/sync` returns HTTP 400 and the service keeps serving its
-last-known-good config. See `docs/runbook.md` "Add a new doc source" for the
-full procedure and validation command.
+> **This section describes the pre-Phase-6 design and is retained only for
+> historical schema reference.** As of Phase 6, `doc_sources` (Postgres) is
+> the source of truth for crawl config; `sources.yaml` is a one-way seed
+> file imported only when `IMPORT_SOURCES_YAML_ON_BOOT=1` is set at
+> container start, and is never re-read on `/sync` or any other request
+> path. See §8 "Phase 6 — Sources-in-Postgres, Admin UI, Scheduler, MCP
+> Proposals" and `docs/runbook.md` for the current behavior.
+
+Lives at `ingestion/config/sources.yaml`. The field schema below (name,
+base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language,
+rate_limit_rps) is unchanged — it's now validated as form input / MCP-tool
+input against the same `SourceConfig` pydantic model, on write into
+`doc_sources`, instead of as a YAML document re-read on every `/sync`.
 
 ```yaml
 sources:
@@ -292,8 +299,10 @@ The critical design points, in order of how much they affect answer quality:
 4. **Hash-diff sync** — page-level SHA-256 makes weekly re-syncs cheap (only changed pages
    re-embed) and gives n8n a precise change summary.
 Crawler etiquette: 1 req/sec, honor robots.txt, identifiable User-Agent, hard `max_pages` cap
-per source. Sources are declarative in `sources.yaml`, so adding a doc set is a config change
-plus a webhook call — no code.
+per source. **As of Phase 6** (§8), sources are rows in `doc_sources` (Postgres), managed via the
+admin UI or a `propose_doc_source` MCP proposal — not `sources.yaml` — so adding a doc set is a
+no-code operation performed there (`sources.yaml` was the pre-Phase-6 mechanism for this and now
+survives only as a one-way, opt-in seed).
 
 ### Phase 3 — Retrieval Server (T3, T5)
 FastMCP 3.x (`fastmcp>=3,<4`), streamable-HTTP transport, stateless (`stateless_http=True`
@@ -392,3 +401,32 @@ scheduling (GAP-6), per-source FTS language configs, `/mcp` auth for internet ex
 - FastEmbed (default model, query/passage prefixes): https://qdrant.tech/articles/fastembed/ · https://github.com/qdrant/fastembed
 - BGE query-instruction discussion: https://huggingface.co/BAAI/bge-small-en-v1.5/discussions/4
 - Prior art: https://github.com/joungminsung/OpenDocuments · https://github.com/2dogsandanerd/Knowledge-Base-Self-Hosting-Kit
+
+---
+
+## 8. Phase 6 — Sources-in-Postgres, Admin UI, Scheduler, MCP Proposals
+
+Post-MVP phase. Moves crawl-source config out of `ingestion/config/sources.yaml`
+and into the `doc_sources` table, adds a loopback-only admin UI, replaces the
+n8n weekly-cron workflow with an opt-in in-process scheduler, and lets an MCP
+agent propose new sources subject to human approval. Full operator-facing
+detail lives in `docs/runbook.md`; this section is the design-level summary
+and supersedes §2's "sources.yaml schema" subsection and any narrative text
+elsewhere in this document that still describes `sources.yaml` as the live
+config path (see the superseded-notice callouts added at each such spot).
+
+| Area | What changed | Why |
+|---|---|---|
+| **Config storage** | `doc_sources` gains `sitemap`, `include_prefixes`, `exclude_prefixes`, `max_pages`, `language`, `rate_limit_rps`, `schedule_cron`, `enabled`, `status`, `proposed_by`, `created_at` (`db/init/02_sources_config.sql`). `sources.yaml` becomes a one-way seed, imported only when `IMPORT_SOURCES_YAML_ON_BOOT=1`. | A YAML file re-read on every `/sync` request can't hold per-source `schedule_cron`/`enabled`/`status` state cleanly, and gives no place for an MCP-proposed source to land pending review. |
+| **Migration** | `db/init/*.sql` only runs against an empty Postgres data directory. On an existing DB, `02_sources_config.sql` must be applied by hand via `scripts/migrate.sh` (idempotent — `ADD COLUMN IF NOT EXISTS` / guarded `DO` block for the `CHECK` constraint). | `db/init` scripts are a first-boot-only mechanism; there is intentionally no auto-migration path for a running Postgres volume (§2 "Schema evolution" / GAP-8's nuke-and-rebuild philosophy still holds — this migration is the one exception because bulk re-crawling isn't needed, only a schema extension). |
+| **Admin UI** | Server-rendered (Jinja2 + vendored htmx) CRUD at `/admin` on the `ingestion` service, loopback-only (`127.0.0.1:8080`, no Traefik router) — full source CRUD, manual per-source sync, pending-proposal approve/reject. Auth: `SYNC_TOKEN` exchanged at `/admin/login` for an HMAC-derived session cookie + CSRF token (both deterministic functions of `SYNC_TOKEN` — no per-session store; rotating `SYNC_TOKEN` is the only revocation mechanism for a leaked cookie). | A CRUD surface over crawl config needs a human-operable UI, but must stay off the LAN/Traefik because it can trigger crawls and mutate `doc_sources` directly. |
+| **Scheduler** | New `app.scheduler` module: per-source `schedule_cron`, evaluated by a restricted 5-field cron subset (`*`, `*/N`, bare int, comma-list — no ranges, no named values) implemented from scratch in `sources_repo.py` (no `croniter`/`APScheduler` dependency). `SCHEDULER_ENABLED` defaults OFF. Every scheduling decision logs a distinct structlog event (`fired`/`skipped-not-due`/`skipped-locked`/`errored`), with `skipped-not-due` carrying a `reason`. | Replaces n8n's weekly cron trigger with an in-process equivalent that's per-source-configurable and answerable from logs alone; defaulting OFF avoids double-scheduling against a still-active n8n workflow. |
+| **Unified sync lock** | `POST /sync`, the admin UI's manual-sync route, and the scheduler now share ONE `threading.Lock` (`app.main._sync_lock`, wired into `admin.py`/`scheduler.py` via injectable seams to avoid a circular import). | Before this, the three entrypoints had three independent, non-cooperating locks — any two could run a sync concurrently against the same source, corrupting `_delete_missing_pages`'s purge accounting. |
+| **MCP proposals** | New `propose_doc_source` MCP tool. Writes a `status='pending'` `doc_sources` row; `proposed_by` stores a truncated SHA-256 hash of the caller's bearer token (`sources_repo.derive_proposed_by`), never the token itself. A `pending` source is uncrawlable (`/sync` refuses it with `403`) until a human approves it in the admin UI. | Lets an agent surface "this doc set should be indexed" without giving it write access to what actually gets crawled — approval stays a human-in-the-loop admin-UI action. |
+| **`/sync` API** | Accepts `{"source": id\|name}` (single-source, admin-UI-facing) alongside the existing `{"sources": [names]}`. A DB read failure now returns `503` (previously a `sources.yaml` `ConfigError` returned `400`). Unscoped "sync all" now means "sync all `status='active'`" (excludes pending/rejected). A non-active source is refused `403`; an unknown id/name on the single-source path is `404` (list path's unknown-name case stays `400`). | The DB is now the config source of truth, so its own unavailability is a distinct failure mode from a config *validation* error (which no longer exists at request time); the active/pending/rejected lifecycle needs enforcement at the one chokepoint every sync path funnels through. |
+| **n8n** | `docs/n8n/README.md` marked **SUPERSEDED**; `docs-sync.json` kept as historical reference, not deleted. Operators migrating to the internal scheduler **must** deactivate the n8n workflow before setting `SCHEDULER_ENABLED=true`. | Two independent unscheduled-relative-to-each-other triggers (n8n + internal scheduler) both able to fire the same source is exactly the double-scheduling/interleaved-crawl hazard the unified lock (row above) exists to prevent for the scheduler's own callers — it does not protect against a fully external caller like n8n. |
+
+**Status:** this migration has already been applied to this deployment's
+live database (see `docs/runbook.md`'s migration section for the exact
+command, kept for anyone standing up a second instance or rebuilding from a
+pre-Phase-6 volume).

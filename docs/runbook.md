@@ -5,6 +5,46 @@ in the repo root with a populated `.env` (see `.env.example`).
 
 ---
 
+## REQUIRED — apply the `doc_sources` config migration (read this first)
+
+**Source of truth for crawl config moved from `ingestion/config/sources.yaml`
+to the `doc_sources` table in Postgres.** `doc_sources` gained the full
+crawl-config columns — `sitemap`, `include_prefixes`, `exclude_prefixes`,
+`max_pages`, `language`, `rate_limit_rps`, `schedule_cron`, `enabled`,
+`status`, `proposed_by`, `created_at` — via `db/init/02_sources_config.sql`.
+**This reverses previously-documented guidance in this runbook**: editing
+`sources.yaml` no longer takes effect on the next `/sync` (see the corrected
+"Add a new doc source" section below) — `sources.yaml` is now only a
+one-way seed, imported *exclusively* when `IMPORT_SOURCES_YAML_ON_BOOT=1` is
+set at container start.
+
+`db/init/*.sql` scripts run **only** against an empty Postgres data
+directory (first cluster init). On any **existing** database — which is the
+case for this deployment — `02_sources_config.sql` must be applied by hand:
+
+```bash
+set -a; source .env; set +a
+./scripts/migrate.sh
+```
+
+`scripts/migrate.sh` runs `psql -v ON_ERROR_STOP=1` against the running
+`self-docs-db` container with `02_sources_config.sql`. It is **idempotent**
+(every statement is `ADD COLUMN IF NOT EXISTS` or a guarded `DO` block for
+the `CHECK` constraint) — safe to re-run at any time, including by accident.
+
+**Status: this migration has already been applied to this deployment's live
+database.** Nobody needs to (and nobody should assume they still need to) run
+it against the current production Postgres instance. Document/run it only
+when:
+- standing up a **second instance** from scratch on an existing (non-empty)
+  data directory carried over from before this change, or
+- rebuilding via the nuke-and-rebuild path documented below onto a **fresh**
+  volume, where `db/init/*.sql` (including this file) already runs
+  automatically and re-running by hand is a redundant no-op, not a required
+  step.
+
+---
+
 ## Deploy / Upgrade — MCP_TOKEN requirement (read before restarting mcp-server)
 
 This applies to any deploy/upgrade that brings the `mcp-server` image up to a
@@ -81,87 +121,230 @@ checklist that prevents the failure mode in the first place).
 
 ## Add a new doc source
 
-1. Edit `ingestion/config/sources.yaml` and add an entry per the schema (see
-   `IMPLEMENTATION_PLAN.md` §2 "sources.yaml schema"):
+**`doc_sources` in Postgres is the source of truth for crawl config —
+`ingestion/config/sources.yaml` is NOT.** `sources.yaml` survives only as a
+one-way seed file, imported once when the `ingestion` container boots with
+`IMPORT_SOURCES_YAML_ON_BOOT=1` set; it is never read on any request path
+and editing it has **no effect** on a running deployment. (Superseded
+guidance, corrected here: an earlier revision of this runbook said editing
+`sources.yaml` took effect on the next `/sync` — that has not been true
+since sources moved into Postgres.)
 
-   ```yaml
-   - name: my-new-source        # unique, [a-z0-9-]
-     base_url: https://example.com/docs/
-     sitemap: https://example.com/sitemap.xml   # optional; BFS fallback if absent
-     include_prefixes: ["/docs/"]                # optional allowlist
-     exclude_prefixes: ["/blog/"]                 # optional denylist (wins over include)
-     max_pages: 300                               # REQUIRED — no default (see below)
-     language: english                            # optional, default english
-     rate_limit_rps: 1.0                          # optional, default 1.0
-   ```
+There are two ways to add a source, human (admin UI) and agent (MCP
+proposal):
 
-   `max_pages` is **required with no default** — omitting it fails config
-   validation. This is not a hypothetical: it's the exact mistake that once
-   made an edit to this file silently have no effect at all (the file
-   failed validation, so the last-known-good config kept serving instead).
-   Before syncing, validate the file directly with the same loader the
-   service uses:
+### A. Human: the admin UI
 
-   ```bash
-   cd ingestion && ./.venv/bin/python -c "from app.config import load_sources; load_sources('config/sources.yaml')"
-   ```
-
-   A clean exit (no output) means the file is valid; a `ConfigError`
-   traceback tells you exactly what's wrong (duplicate name, bad
-   `base_url`, unknown key, missing `max_pages`, or a sitemap-less source
-   whose `base_url` isn't covered by its own `include_prefixes`) before you
-   ever hit `/sync`.
-
-2. Get the change live. `ingestion/config/sources.yaml` is bind-mounted
-   read-only into the container (`./ingestion/config:/config:ro`,
-   `SOURCES_YAML=/config/sources.yaml`) and is **re-read from disk on every
-   `/sync` request** — no rebuild, no restart, just save the file and call
-   `/sync`. There are two distinct failure modes to understand, because they
-   behave very differently:
-
-   - **Container startup (fail-fast).** `sources.yaml` is also loaded once
-     at process start, before uvicorn binds. If it's invalid at that point,
-     the container prints `FATAL: invalid sources.yaml (...)` to stderr and
-     exits non-zero — it will **not** boot. This only bites you after a
-     restart/recreate of the `ingestion` container (e.g. `docker compose up
-     -d ingestion`, or a host reboot), not from editing the file while the
-     service is already running.
-   - **Runtime re-read on `/sync` (fail-soft).** If you edit the file while
-     `ingestion` is already running and introduce an error, the *next*
-     `/sync` call re-reads it, gets a `ConfigError`, and returns **HTTP
-     400** with the validation message in the response body — the service
-     itself keeps running unaffected, still serving the previous
-     last-known-good config for any other request. Nothing crashes; you
-     just don't get your new/changed source until the file is fixed.
-
-   In short: a bad edit that's only ever read at runtime degrades gracefully
-   (400, old config keeps working); a bad edit that's present when the
-   container itself starts up prevents it from coming up at all. Use the
-   pre-sync validation command above to avoid hitting either path.
-
-3. Trigger a sync of just the new source:
-
-   ```bash
-   make sync
-   ```
-
-   (`make sync` syncs all sources; to target one, call `/sync` directly)
-
-   ```bash
-   curl -sS -X POST http://localhost:8080/sync \
-     -H "Authorization: Bearer $SYNC_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"sources": ["my-new-source"]}'
-   ```
-
-4. Poll `GET /status` until `running: false`, then confirm
-   `last_status: "ok"` and `chunks_indexed > 0` for the new source:
+1. Open `http://127.0.0.1:8080/admin/login` (loopback-only — see
+   [Admin UI](#admin-ui) below for exposure/auth details) and log in with
+   `SYNC_TOKEN`.
+2. **Sources → New source**, fill in the same fields the old YAML schema
+   had — `name` (unique, `[a-z0-9-]`), `base_url`, `sitemap` (optional; BFS
+   fallback if absent), `include_prefixes`/`exclude_prefixes` (one per
+   line), `max_pages` (**required, no default** — omitting it fails
+   validation, same rule as before, now enforced by `app.config.SourceConfig`
+   against the form data instead of a YAML loader), `language` (default
+   `english`), `rate_limit_rps` (default `1.0`). Validation errors
+   re-render the form with the exact problem (duplicate name, bad
+   `base_url`, missing `max_pages`, a sitemap-less source whose `base_url`
+   isn't covered by its own `include_prefixes`) — nothing is written until
+   it passes.
+3. A source created this way lands with `status='active'` immediately (the
+   human creating it via an authenticated admin session is itself the
+   approval). Use the source's **Sync** button (or `POST /sync
+   {"source": "my-new-source"}`, see the [migration
+   note](#migration-note-post-sync-changes) below) to trigger its first
+   crawl, then poll `GET /status` as before:
 
    ```bash
    curl -sS http://localhost:8080/status | jq '."my-new-source"'
    ```
 
    *(Note: A source reporting `last_status: "ok"` with `pages_soft_failed > 0` is completely healthy and normal — it indicates expected real-world site quirks like 404/503 links or stub pages. Only `pages_failed > 0` triggers `"partial"` or `"failed"`. See [Page Classification & Source Status Semantics](#page-classification--source-status-semantics) below.)*
+
+4. Optionally set a `schedule_cron` on the source's edit form to have it
+   sync automatically — see [The scheduler](#the-scheduler-replaces-n8n)
+   below for the supported cron subset and the `SCHEDULER_ENABLED` opt-in.
+
+### B. Agent: `propose_doc_source` (MCP tool)
+
+An AI agent with `search_docs`/`list_doc_sources` access can also call the
+MCP tool `propose_doc_source(name, base_url, max_pages, sitemap?,
+include_prefixes?, exclude_prefixes?, language?, rate_limit_rps?)`. This
+**never** crawls anything directly:
+
+- It validates the same `SourceConfig` fields as the admin form and, on
+  success, inserts a row with `status='pending'`.
+- `proposed_by` records a **truncated SHA-256 hash of the caller's bearer
+  token** (`sources_repo.derive_proposed_by`) — never the raw token — so an
+  operator can tell "was this the same agent/token as that other proposal"
+  without the admin UI ever displaying a live credential.
+- A `pending` source is **uncrawlable**: `/sync` refuses it with `403`
+  whether targeted directly, by name in a `sources` list, or swept up in an
+  unscoped "sync everything" call (see the [migration
+  note](#migration-note-post-sync-changes) below) — until a human approves
+  it.
+
+**Approval workflow:** open the admin UI (`/admin`) — pending proposals are
+listed separately from active sources. Review the proposal (name, URL,
+prefixes, `proposed_by`), then:
+- **Approve** (`POST /admin/sources/{id}/approve`) → `status='active'`,
+  crawlable from then on.
+- **Reject** (`POST /admin/sources/{id}/reject`) → `status='rejected'`,
+  permanently excluded from "sync all active sources" and from being
+  targeted by name/id on `/sync` (403) until manually re-approved.
+
+No source proposed via MCP is ever crawled without this explicit,
+human-in-the-loop admin-UI step.
+
+---
+
+## Admin UI
+
+Server-rendered CRUD UI over `doc_sources`, mounted at `/admin` on the
+`ingestion` service.
+
+**Exposure: loopback only, by design.** `docker-compose.yml` publishes
+`ingestion` as `127.0.0.1:8080:8080` — bound to the Docker host's loopback
+interface, not `0.0.0.0` — and there is **no Traefik router for
+`ingestion`** (only `mcp-server` gets a Traefik label; see
+`docker-compose.prod.yml`). This is a **deliberate security property, not an
+oversight**: the admin UI can create/edit/delete crawl targets and trigger
+crawls, so it is reachable only from the Docker host itself (SSH tunnel or
+sitting at the box), never from the LAN or the internet through Traefik. Do
+not add a Traefik router for it as a "convenience" without re-running the
+security review — that would turn a host-local admin surface into a
+network-reachable one.
+
+**Auth.** `GET /admin/login` renders a form; paste `SYNC_TOKEN` (the same
+token `POST /sync` already requires) into it. On success you get an
+`httponly`, `SameSite=Lax` session cookie scoped to `path=/admin`. Every
+state-changing (POST) route additionally requires a hidden CSRF token
+rendered into the form.
+
+**Full CRUD + workflow surface:**
+- Create/edit/delete a source (same `SourceConfig` fields as the removed
+  `sources.yaml` schema, plus `schedule_cron` and `enabled`).
+- Manual per-source sync button (`POST /admin/sources/{id}/sync`) — refuses
+  a non-`active` source with a clear message ("approve it first") rather
+  than a bare error.
+- Approve/reject pending MCP proposals (see above).
+
+**Known limitation — read this before treating a leaked admin cookie as
+low-severity.** Both the session cookie value and the CSRF token are
+**deterministic functions of `SYNC_TOKEN`** (`HMAC-SHA256(SYNC_TOKEN,
+"session-v1")` / `"csrf-v1"`), not per-login random nonces — there is no
+server-side session store. This means:
+- Every login produces the *same* cookie/CSRF pair until `SYNC_TOKEN`
+  changes.
+- **Rotating `SYNC_TOKEN` is the only way to revoke a leaked admin session
+  cookie.** There is no per-session logout/revoke; if a cookie is captured
+  (browser history, a shared log line, XSS on some other page sharing the
+  browser profile), it remains valid indefinitely until you rotate the
+  token. Treat a suspected admin-cookie leak exactly like a suspected
+  `SYNC_TOKEN` leak: rotate `SYNC_TOKEN` in `.env` and restart `ingestion`.
+
+---
+
+## The scheduler (replaces n8n)
+
+**n8n's weekly cron workflow (`docs/n8n/docs-sync.json`) is SUPERSEDED by an
+in-process scheduler in `ingestion`.** See `docs/n8n/README.md` for the full
+decommission notice — the short version: **you must disable/deactivate the
+n8n workflow before enabling this scheduler, or both fire and you get
+double scheduling** (two independent triggers both able to start a sync
+against the same source, which is exactly the interleaved-crawl hazard the
+unified sync lock below exists to prevent).
+
+**Opt-in, per-source.** Each source has its own `schedule_cron` column
+(`NULL` by default — no automatic firing). Set it via the admin UI's edit
+form or `sources_repo.set_schedule`.
+
+**`SCHEDULER_ENABLED` defaults to OFF.** Set `SCHEDULER_ENABLED=true` (or
+`1`/`yes`) in `.env` to turn the scheduler loop on at all — with it unset or
+falsy, the scheduler task never starts, regardless of how many sources have
+a `schedule_cron` set. It defaults off specifically because an operator's
+n8n workflow may still be active in production; defaulting it on would mean
+the very deploy that ships this code silently starts a second scheduler
+alongside n8n's. **Before setting `SCHEDULER_ENABLED=true`, deactivate the
+n8n workflow first** (n8n UI → the workflow → toggle inactive, or `n8n
+update:workflow --id=<id> --active=false`).
+
+**Supported cron syntax — a restricted 5-field subset, not full POSIX cron.**
+A `schedule_cron` value MUST be exactly 5 whitespace-separated fields
+(`minute hour day month weekday`, standard field order/ranges: minute
+0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6 with 0=Sunday). Each
+field must be one of:
+
+| Form | Meaning | Example |
+|---|---|---|
+| `*` | every value in range | `*` |
+| `*/N` | every Nth value starting at the range floor | `*/15` (minute field → every 15 min) |
+| a bare integer | exactly that value | `0` |
+| a comma-list of bare integers | any of those values | `0,15,30,45` |
+
+**NOT supported — rejected at save time, not silently ignored:** ranges
+(`1-5`), step-on-range (`1-10/2`), named values (`MON`, `JAN`), and the
+`?`/`L`/`W`/`#` special characters. An operator who writes `1-5` in the
+day-of-week field to mean "weekdays" gets the save **refused** with a
+`ValueError` naming exactly which field and token was rejected — it is not
+silently accepted and then ignored at run time. Express "weekdays" as an
+explicit list instead: `0 3 * * 1,2,3,4,5` (03:00, Mon–Fri).
+
+Example — every Sunday at 03:00 (the old n8n cadence): `0 3 * * 0`.
+
+**Observability — answering "why didn't source X sync last night?" from
+logs alone.** Every scheduling decision the loop makes is a distinct
+`structlog` event:
+
+- `fired` — the source was due and its sync completed the trigger call.
+- `skipped-not-due` — carries a `reason` field:
+  - `disabled` — `enabled=false` on the source.
+  - `status=<...>` — not `status='active'` (e.g. `pending`, `rejected`).
+  - `no-schedule` — `schedule_cron` is `NULL`.
+  - `cron-not-due` — has a schedule, but it doesn't match the current
+    minute.
+  - `already-fired-this-window` — already fired for this minute-bucket
+    (double-fire guard within one poll cycle).
+- `skipped-locked` — due, but another sync (manual, `/sync`, or another
+  scheduled source) held the shared sync lock at trigger time.
+- `errored` — the trigger call itself raised; the source stays eligible
+  next poll.
+
+```bash
+docker compose logs ingestion | grep '"source": "my-new-source"' | grep -E '"event": "(fired|skipped-not-due|skipped-locked|errored)"'
+```
+
+Read the `reason` field on a `skipped-not-due` line to get the exact answer
+— e.g. `reason: "status='pending'"` means the source was never approved,
+`reason: "no-schedule"` means nobody ever set `schedule_cron` on it,
+`reason: "cron-not-due"` means the schedule simply didn't match that
+minute.
+
+---
+
+## Migration note: `POST /sync` API changes
+
+The `/sync` endpoint's contract changed. Existing automation (n8n or
+otherwise) calling it with `{"sources": [names]}` or no body is
+**unaffected**; everything below is additive or narrows an error case.
+
+- **NEW:** accepts `{"source": id|name}` for single-source sync (used by
+  the admin UI's manual-sync button) — `int` targets `doc_sources.id`,
+  `str` targets `doc_sources.name`. Mutually exclusive with the existing
+  `{"sources": [names]}`; if both are somehow sent, `source` wins.
+- **CHANGED:** a database read failure now returns **`503`** (previously a
+  `sources.yaml` config error returned `400` — there is no longer a
+  `sources.yaml` config error path at request time at all, since the DB is
+  the source of truth).
+- **CHANGED:** "sync all" (no `source`/`sources` in the body) now means
+  **"sync all `status='active'` sources"** — `pending` and `rejected`
+  sources are excluded from an unscoped sync.
+- A source targeted by id/name whose `status != 'active'` is refused with
+  **`403`** (approve it first). An unknown id or name on the single-source
+  (`source`) path is **`404`**; an unknown name in the list (`sources`) path
+  remains **`400`** (unchanged, matches the existing contract for that
+  path).
 
 ---
 
@@ -257,8 +440,10 @@ recover the point-in-time index.
 
 ## Expected sync durations
 
-Driven by `max_pages` and `rate_limit_rps` in `ingestion/config/sources.yaml`
-(crawler etiquette: ~1 req/sec per source, sequential fetch):
+Driven by each source's `max_pages` and `rate_limit_rps` (`doc_sources`
+columns — see the admin UI or `ingestion/config/sources.yaml` only as the
+original one-way seed values for these three) (crawler etiquette: ~1 req/sec
+per source, sequential fetch):
 
 | Source            | `max_pages` | Rough duration            |
 |--------------------|------------:|----------------------------|
@@ -271,9 +456,11 @@ URLs get filtered by `include_prefixes`/`exclude_prefixes` before counting
 against the cap; unchanged pages on repeat syncs are skipped almost
 instantly via hash-diff, so weekly re-syncs are much faster than the first
 full crawl). A full first-time sync of all three seed sources together is
-therefore on the order of 20–40 minutes; budget the n8n poll timeout
-(default 60 min, see `docs/n8n/docs-sync.json`) accordingly if you add
-larger sources.
+therefore on the order of 20–40 minutes; if you still have the n8n workflow
+active (see the [decommission notice](#the-scheduler-replaces-n8n) above —
+it should be deactivated once the scheduler is enabled), budget its poll
+timeout (default 60 min, see `docs/n8n/docs-sync.json`, now historical)
+accordingly if you add larger sources.
 
 ---
 
@@ -379,9 +566,28 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   `self-docs-internal` network, or temporarily add an uncommitted compose
   override to publish a port for local debugging.
 
-- **`409` on `POST /sync`.** A sync is already running (the endpoint is
-  guarded by a lock). Not an error — wait and poll `GET /status`, or treat it
-  as a no-op (this is exactly how the n8n workflow handles it).
+- **`409` on `POST /sync`.** A sync is already running — one shared lock now
+  covers `POST /sync`, the admin UI's manual-sync button, and the
+  scheduler, so any of the three can be the reason another is blocked. Not
+  an error — wait and poll `GET /status`, or treat it as a no-op (this is
+  exactly how the (now-superseded) n8n workflow handled it, and how the
+  scheduler's `skipped-locked` log event handles it too).
+
+- **`503` on `POST /sync`.** The database read failed (Postgres
+  unreachable, connection error, ...) — see the [migration
+  note](#migration-note-post-sync-changes) above; this replaces what used
+  to be a `400` back when `sources.yaml` was the config source. The service
+  itself stays up; retry once the DB is reachable again.
+
+- **`403` on `POST /sync`.** The targeted source (by id, by name, or swept
+  into an unscoped sync) has `status != 'active'` — most commonly
+  `pending` (an MCP proposal awaiting approval) or `rejected`. Approve it
+  in the admin UI first (see [Add a new doc
+  source](#add-a-new-doc-source) above).
+
+- **`404` on `POST /sync`.** Only on the single-source `{"source": id|name}`
+  path — the id/name doesn't exist in `doc_sources`. (An unknown name in
+  the `{"sources": [names]}` list form still returns `400`, unchanged.)
 
 - **`401` on `POST /sync`.** Missing or wrong `Authorization: Bearer
   $SYNC_TOKEN` header. Confirm the token matches `.env`'s `SYNC_TOKEN` — the
@@ -411,7 +617,7 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   indicate a broken sync.
 
 - **A source keeps coming back `partial` or `failed`.**
-  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` in `ingestion/config/sources.yaml` and re-sync; other sources are unaffected by one source's failure.
+  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` on the source's admin UI edit form (`doc_sources` — no longer `ingestion/config/sources.yaml`, see the migration note at the top of this runbook) and re-sync; other sources are unaffected by one source's failure.
 
   **A source reports `ok` but `pages_seen == 0` (silently indexed nothing)**,
   or a previously-healthy source suddenly goes empty after a sitemap moves.
@@ -425,6 +631,8 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   then filters out immediately, before the first fetch — and the source
   syncs "successfully" with zero pages indexed. This is exactly what
   happened with the `traefik` source (its original sitemap URL 404d) and is
-  why the `mcp` source in `ingestion/config/sources.yaml` carries an inline
-  `WARNING:` comment about this same shape. If a source goes quiet, check
+  why the `mcp` source in `ingestion/config/sources.yaml` — that file's
+  historical, one-way-seed content only; the live row for this same source
+  is in `doc_sources` now — carries an inline `WARNING:` comment about this
+  same shape. If a source goes quiet, check
   whether its declared `sitemap` still 200s before looking anywhere else.

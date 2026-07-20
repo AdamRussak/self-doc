@@ -21,10 +21,13 @@ Two knowledge stores. Never mix them.
    any library covered by an indexed source. Check `list_doc_sources` first
    if unsure whether a source is indexed — do not guess syntax from training
    data when a live doc source exists.
-2. **Never store project state in the docs index.** The docs pipeline only
-   ingests upstream documentation sites via `ingestion/config/sources.yaml` +
-   `/sync`. Do not propose writing decisions, task notes, or project-specific
-   config into `doc_chunks`/`doc_sources` — that belongs in Mem0.
+2. **Never store project state in the docs index.** The docs pipeline
+   ingests upstream documentation sites via sources configured in the
+   `doc_sources` table (Postgres, not `ingestion/config/sources.yaml` — that
+   file is only a one-way seed, imported once when
+   `IMPORT_SOURCES_YAML_ON_BOOT=1`) + `/sync`. Do not propose writing
+   decisions, task notes, or project-specific config into
+   `doc_chunks`/`doc_sources` — that belongs in Mem0.
 3. **Never store framework/library syntax in Mem0.** If you learn a fact
    about how a library's API works, that fact belongs in the docs index
    (add/re-sync the source) or is transient — it does not belong in Mem0.
@@ -34,9 +37,13 @@ Two knowledge stores. Never mix them.
    index with an empty `heading_path`; this is cosmetic, the URL is still
    valid.
 5. **If `search_docs` returns nothing relevant**, say so explicitly rather
-   than falling back to unverified memory of the library's API. Suggest
-   adding/expanding the source in `ingestion/config/sources.yaml` (see
-   `docs/runbook.md`).
+   than falling back to unverified memory of the library's API. If you have
+   the `propose_doc_source` tool, use it to propose adding the missing
+   source (name/base_url/max_pages/...) — this only queues a `pending` row
+   for a human to review and approve in the admin UI, it never crawls
+   anything on its own. Tell the user the proposal is queued for approval,
+   not that the docs are "being indexed." See `docs/runbook.md` for the
+   full approval workflow.
 
 ## Endpoint
 

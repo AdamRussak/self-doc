@@ -12,6 +12,7 @@ import sys
 import structlog
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
+from fastmcp.server.dependencies import get_access_token
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.requests import Request
 from starlette.responses import Response
@@ -81,6 +82,58 @@ def search_docs(query: str, source: str | None = None, limit: int = 5) -> str:
 def list_doc_sources() -> str:
     """List indexed documentation sets with their last-sync time."""
     return retrieval.list_sources()
+
+
+@mcp.tool
+def propose_doc_source(
+    name: str,
+    base_url: str,
+    max_pages: int,
+    sitemap: str | None = None,
+    include_prefixes: list[str] | None = None,
+    exclude_prefixes: list[str] | None = None,
+    language: str = "english",
+    rate_limit_rps: float = 1.0,
+) -> str:
+    """Propose a NEW documentation source for indexing. This does NOT create a
+    live source: it queues a `status='pending'` row that a HUMAN must review
+    and approve in the admin UI before anything is ever crawled. Do not tell
+    the user their docs are "being indexed" — tell them the proposal is
+    queued for human approval. `name` must match ^[a-z0-9-]+$ and be unique;
+    `base_url`/`sitemap` must be valid http(s) URLs; `max_pages` and
+    `rate_limit_rps` must be positive. Rejected (with a clear reason) on
+    invalid input or a name that is already taken, pending or not."""
+    token = get_access_token()
+    if token is None:
+        # Should not happen in practice: every /mcp request is already
+        # bearer-authenticated by BearerTokenVerifier before any tool runs.
+        # Fail closed rather than writing a proposal with no attributable
+        # proposer.
+        return (
+            "Rejected: no authenticated token available for this call, so the "
+            "proposal cannot be attributed to a proposer. Nothing was written."
+        )
+
+    try:
+        source_id = retrieval.propose_source(
+            name=name,
+            base_url=base_url,
+            max_pages=max_pages,
+            sitemap=sitemap,
+            include_prefixes=include_prefixes,
+            exclude_prefixes=exclude_prefixes,
+            language=language,
+            rate_limit_rps=rate_limit_rps,
+            proposed_by_token=token.token,
+        )
+    except retrieval.ProposalError as e:
+        return f"Rejected: {e}"
+
+    return (
+        f"Proposal queued (id={source_id}, name='{name}', status=pending). "
+        "This source has NOT been crawled and will NOT be indexed until a "
+        "human approves it in the admin UI."
+    )
 
 
 @mcp.custom_route("/metrics", methods=["GET"])

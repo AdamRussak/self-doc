@@ -1,6 +1,14 @@
+import socket
+
 import pytest
 
-from app.urlscope import parse_sitemap, path_allowed
+from app.urlscope import (
+    _resolve_host_addrs,
+    _resolve_is_private,
+    parse_sitemap,
+    path_allowed,
+    url_host_is_private,
+)
 
 # --- path_allowed ---------------------------------------------------------
 
@@ -191,3 +199,89 @@ def test_parse_sitemap_malformed_xml_raises():
 def test_parse_sitemap_unexpected_root_raises():
     with pytest.raises(ValueError):
         parse_sitemap(b"<rss><channel></channel></rss>")
+
+
+# --- SSRF guard: _resolve_is_private / url_host_is_private ----------------
+#
+# NOTE: these tests monkeypatch `socket.getaddrinfo` and clear the resolver
+# cache so no real DNS query is made for the synthetic hostnames.
+
+
+@pytest.fixture(autouse=True)
+def _clear_resolver_cache():
+    _resolve_host_addrs.cache_clear()
+    yield
+    _resolve_host_addrs.cache_clear()
+
+
+def _fake_getaddrinfo(mapping):
+    def fake(host, *args, **kwargs):
+        if host not in mapping:
+            raise socket.gaierror(-2, "Name or service not known")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (mapping[host], 0))]
+
+    return fake
+
+
+def test_resolve_is_private_detects_private_literals(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({
+        "10.0.0.1": "10.0.0.1",
+        "192.168.1.1": "192.168.1.1",
+        "169.254.169.254": "169.254.169.254",
+        "127.0.0.1": "127.0.0.1",
+        "8.8.8.8": "8.8.8.8",
+    }))
+    assert _resolve_is_private("10.0.0.1") is True
+    assert _resolve_is_private("192.168.1.1") is True
+    assert _resolve_is_private("169.254.169.254") is True  # cloud metadata
+    assert _resolve_is_private("127.0.0.1") is True
+    assert _resolve_is_private("8.8.8.8") is False
+
+
+def test_resolve_is_private_catches_decimal_encoded_loopback(monkeypatch):
+    """`ipaddress.ip_address("2130706433")` raises, so a literal-only check
+    returns False and the encoding evades it. Running ip_address over the
+    getaddrinfo RESULT closes it: the OS resolver normalizes the integer form
+    to 127.0.0.1."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({
+        "2130706433": "127.0.0.1",
+        "0177.0.0.1": "127.0.0.1",
+    }))
+    assert _resolve_is_private("2130706433") is True
+    assert _resolve_is_private("0177.0.0.1") is True
+    assert url_host_is_private("http://2130706433/") is True
+
+
+def test_resolve_is_private_catches_public_hostname_with_private_record(monkeypatch):
+    """The evasion a literal-only check cannot see: an ordinary-looking
+    public hostname whose A record points into RFC1918 space."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({
+        "internal.attacker.example": "10.0.0.5",
+        "www.attacker.example": "93.184.216.34",
+    }))
+    assert _resolve_is_private("internal.attacker.example") is True
+    assert _resolve_is_private("www.attacker.example") is False
+    assert url_host_is_private("https://internal.attacker.example/x") is True
+
+
+def test_resolve_failure_fails_closed(monkeypatch):
+    """An unresolvable host is not fetchable, so it is treated as private —
+    a resolver hiccup must not silently open the gate."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({}))
+    assert _resolve_is_private("nope.invalid") is True
+    assert url_host_is_private("https://nope.invalid/") is True
+
+
+def test_unresolvable_is_not_private_at_validation_time(monkeypatch):
+    """Config validation opts out of fail-closed so a source is not
+    permanently rejected because DNS blipped; the crawl-time gate (default
+    fail-closed, above) still refuses to fetch it."""
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({}))
+    assert url_host_is_private("https://nope.invalid/", unresolvable_is_private=False) is False
+    # ...but an unresolvable PRIVATE LITERAL is still private either way.
+    assert url_host_is_private("http://10.0.0.5/", unresolvable_is_private=False) is True
+
+
+def test_url_with_no_host_fails_closed():
+    assert url_host_is_private("file:///etc/passwd") is True
+    assert url_host_is_private("not a url") is True

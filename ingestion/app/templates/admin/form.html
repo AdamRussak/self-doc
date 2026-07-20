@@ -1,0 +1,77 @@
+{% extends "admin/base.html" %}
+{% block title %}{% if record %}edit {{ record.name }}{% else %}new source{% endif %}{% endblock %}
+{% block nav_sources %}active{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>{% if record %}Edit {{ record.name }}{% else %}Add a source{% endif %}</h2>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <form method="post" action="{% if record %}/admin/sources/{{ record.id }}{% else %}/admin/sources/new{% endif %}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <div class="form-section">
+      <div class="form-section-title">1. Identity & Location</div>
+      <label for="name" style="margin-top: 0;">name</label>
+      {% if record %}
+      <input type="text" id="name" value="{{ values.name }}" disabled>
+      <p class="hint">name is immutable after creation.</p>
+      {% else %}
+      <input type="text" id="name" name="name" pattern="^[a-z0-9-]+$" required value="{{ values.name or '' }}">
+      <p class="hint">lowercase letters, digits, hyphens only (e.g. <code>fastapi</code>).</p>
+      {% endif %}
+
+      <label for="base_url">base_url</label>
+      <input type="url" id="base_url" name="base_url" required value="{{ values.base_url or '' }}">
+
+      <label for="sitemap">sitemap (optional)</label>
+      <input type="url" id="sitemap" name="sitemap" value="{{ values.sitemap or '' }}">
+    </div>
+
+    <div class="form-section">
+      <div class="form-section-title">2. Crawl Scope & Processing</div>
+      <label for="include_prefixes" style="margin-top: 0;">include_prefixes (one per line, optional &mdash; empty allows everything)</label>
+      <textarea id="include_prefixes" name="include_prefixes" rows="3">{{ values.include_prefixes or '' }}</textarea>
+
+      <label for="exclude_prefixes">exclude_prefixes (one per line, optional &mdash; always wins over include)</label>
+      <textarea id="exclude_prefixes" name="exclude_prefixes" rows="3">{{ values.exclude_prefixes or '' }}</textarea>
+
+      <label for="max_pages">max_pages</label>
+      <input type="number" id="max_pages" name="max_pages" min="1" required value="{{ values.max_pages or '' }}">
+
+      <label for="language">language</label>
+      <input type="text" id="language" name="language" value="{{ values.language or 'english' }}">
+    </div>
+
+    <div class="form-section">
+      <div class="form-section-title">3. Scheduling & Limits</div>
+      <label for="rate_limit_rps" style="margin-top: 0;">rate_limit_rps</label>
+      <input type="number" step="0.1" id="rate_limit_rps" name="rate_limit_rps" value="{{ values.rate_limit_rps or '1.0' }}">
+
+      {% if record %}
+      <label for="schedule_cron">schedule_cron (optional)</label>
+      <input type="text" id="schedule_cron" name="schedule_cron" value="{{ values.schedule_cron or '' }}"
+             placeholder="e.g. 0 3 * * * or */15 * * * *">
+      <p class="hint">Supported syntax only: <code>*</code>, <code>*/N</code>, a bare integer, or a
+        comma-separated list of integers &mdash; one per field, exactly 5 space-separated fields
+        (minute hour day month weekday). No ranges (<code>1-5</code>) and no named values
+        (<code>MON</code>/<code>JAN</code>). Leave blank for manual-sync-only.</p>
+
+      <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 1.25rem;">
+        <label class="toggle-switch">
+          <input type="checkbox" id="enabled" name="enabled" value="yes" {% if values.enabled %}checked{% endif %}>
+          <span class="toggle-slider"></span>
+        </label>
+        <label for="enabled" style="margin: 0; cursor: pointer; font-weight: 500;">
+          Scheduler enabled (scheduler will pick this source up when its cron fires)
+        </label>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="actions" style="margin-top: 2rem;">
+      <button type="submit" class="btn btn-primary">{% if record %}Save{% else %}Create{% endif %}</button>
+      <a class="btn" href="/admin">cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
