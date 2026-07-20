@@ -163,8 +163,8 @@ proposal):
    *(Note: A source reporting `last_status: "ok"` with `pages_soft_failed > 0` is completely healthy and normal — it indicates expected real-world site quirks like 404/503 links or stub pages. Only `pages_failed > 0` triggers `"partial"` or `"failed"`. See [Page Classification & Source Status Semantics](#page-classification--source-status-semantics) below.)*
 
 4. Optionally set a `schedule_cron` on the source's edit form to have it
-   sync automatically — see [The scheduler](#the-scheduler-replaces-n8n)
-   below for the supported cron subset and the `SCHEDULER_ENABLED` opt-in.
+   sync automatically — see [The scheduler](#the-scheduler) below for the
+   supported cron subset and the `SCHEDULER_ENABLED` opt-in.
 
 ### B. Agent: `propose_doc_source` (MCP tool)
 
@@ -246,15 +246,7 @@ server-side session store. This means:
 
 ---
 
-## The scheduler (replaces n8n)
-
-**n8n's weekly cron workflow (`docs/n8n/docs-sync.json`) is SUPERSEDED by an
-in-process scheduler in `ingestion`.** See `docs/n8n/README.md` for the full
-decommission notice — the short version: **you must disable/deactivate the
-n8n workflow before enabling this scheduler, or both fire and you get
-double scheduling** (two independent triggers both able to start a sync
-against the same source, which is exactly the interleaved-crawl hazard the
-unified sync lock below exists to prevent).
+## The scheduler
 
 **Opt-in, per-source.** Each source has its own `schedule_cron` column
 (`NULL` by default — no automatic firing). Set it via the admin UI's edit
@@ -263,12 +255,7 @@ form or `sources_repo.set_schedule`.
 **`SCHEDULER_ENABLED` defaults to OFF.** Set `SCHEDULER_ENABLED=true` (or
 `1`/`yes`) in `.env` to turn the scheduler loop on at all — with it unset or
 falsy, the scheduler task never starts, regardless of how many sources have
-a `schedule_cron` set. It defaults off specifically because an operator's
-n8n workflow may still be active in production; defaulting it on would mean
-the very deploy that ships this code silently starts a second scheduler
-alongside n8n's. **Before setting `SCHEDULER_ENABLED=true`, deactivate the
-n8n workflow first** (n8n UI → the workflow → toggle inactive, or `n8n
-update:workflow --id=<id> --active=false`).
+a `schedule_cron` set.
 
 **Supported cron syntax — a restricted 5-field subset, not full POSIX cron.**
 A `schedule_cron` value MUST be exactly 5 whitespace-separated fields
@@ -291,7 +278,7 @@ day-of-week field to mean "weekdays" gets the save **refused** with a
 silently accepted and then ignored at run time. Express "weekdays" as an
 explicit list instead: `0 3 * * 1,2,3,4,5` (03:00, Mon–Fri).
 
-Example — every Sunday at 03:00 (the old n8n cadence): `0 3 * * 0`.
+Example — every Sunday at 03:00: `0 3 * * 0`.
 
 **Observability — answering "why didn't source X sync last night?" from
 logs alone.** Every scheduling decision the loop makes is a distinct
@@ -325,9 +312,8 @@ minute.
 
 ## Migration note: `POST /sync` API changes
 
-The `/sync` endpoint's contract changed. Existing automation (n8n or
-otherwise) calling it with `{"sources": [names]}` or no body is
-**unaffected**; everything below is additive or narrows an error case.
+The `/sync` endpoint accepts `{"sources": [names]}` or no body to sync
+all configured sources. Additionally:
 
 - **NEW:** accepts `{"source": id|name}` for single-source sync (used by
   the admin UI's manual-sync button) — `int` targets `doc_sources.id`,
@@ -402,7 +388,7 @@ Use `scripts/backup.sh` with cron or a systemd timer. The script validates
 that the `db` container is running before attempting a backup.
 
 ```bash
-# Weekly backup, Mondays at 04:00 (day after the n8n sync)
+# Weekly backup, Mondays at 04:00
 # Add to crontab: crontab -e
 0 4 * * 1 /path/to/self-docs/scripts/backup.sh >> /var/log/self-docs-backup.log 2>&1
 ```
@@ -456,11 +442,7 @@ URLs get filtered by `include_prefixes`/`exclude_prefixes` before counting
 against the cap; unchanged pages on repeat syncs are skipped almost
 instantly via hash-diff, so weekly re-syncs are much faster than the first
 full crawl). A full first-time sync of all three seed sources together is
-therefore on the order of 20–40 minutes; if you still have the n8n workflow
-active (see the [decommission notice](#the-scheduler-replaces-n8n) above —
-it should be deactivated once the scheduler is enabled), budget its poll
-timeout (default 60 min, see `docs/n8n/docs-sync.json`, now historical)
-accordingly if you add larger sources.
+therefore on the order of 20–40 minutes.
 
 ---
 
@@ -570,8 +552,7 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   covers `POST /sync`, the admin UI's manual-sync button, and the
   scheduler, so any of the three can be the reason another is blocked. Not
   an error — wait and poll `GET /status`, or treat it as a no-op (this is
-  exactly how the (now-superseded) n8n workflow handled it, and how the
-  scheduler's `skipped-locked` log event handles it too).
+  how the scheduler's `skipped-locked` log event handles it too).
 
 - **`503` on `POST /sync`.** The database read failed (Postgres
   unreachable, connection error, ...) — see the [migration

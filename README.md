@@ -80,9 +80,9 @@ Source configuration (crawl targets, URL prefixes, schedule) lives in the
 `doc_sources` table — **not** a YAML file. Sources are managed through the
 loopback-only admin UI at `/admin`, or proposed by an agent via the
 `propose_doc_source` MCP tool (which queues a `pending` row for human approval
-and never crawls on its own). The legacy weekly n8n cron workflow is
-**superseded** by an opt-in internal scheduler; see the
-[Runbook](docs/runbook.md) for the migration.
+and never crawls on its own). The ingestion service includes an opt-in in-process
+cron scheduler (`app.scheduler`) for automated re-crawling; see the
+[Runbook](docs/runbook.md) for configuration details.
 
 ## Quickstart — Local Development
 
@@ -139,7 +139,6 @@ make sync                               # trigger the initial documentation sync
 | **[Client Setup](docs/client-setup.md)** | Connect Cursor, Claude Code, and Antigravity |
 | **[Runbook](docs/runbook.md)** | DB migration, adding sources, the internal scheduler, backup/restore, troubleshooting |
 | **[Architecture Decisions](docs/adr/)** | ADRs documenting key design choices |
-| **[n8n Workflow](docs/n8n/README.md)** | **Superseded** by the internal scheduler (historical reference) |
 
 ## Development
 

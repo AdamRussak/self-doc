@@ -57,23 +57,9 @@ if not SYNC_TOKEN:
 
 # --- Scheduler enable flag ---------------------------------------------------------------
 #
-# DEFAULT: OFF (disabled unless explicitly opted in). Context: the operator's
-# n8n workflow (docs/n8n/docs-sync.json, weekly Sunday 03:00) may still be
-# live in production — an unexplained sync was already observed running
-# during an earlier phase, which is exactly this scheduler's reason for
-# existing (see scheduler.py's module docstring). Defaulting this ON would
-# mean the very deploy that ships this code silently starts a SECOND
-# scheduler alongside whatever n8n is still doing, i.e. double scheduling —
-# two independent sources of "sync source X now" both able to fire, exactly
-# the interleaved-crawl hazard this task's lock unification exists to
-# prevent. Defaulting OFF is unambiguously the safe choice: it costs a
-# documented, one-line opt-in (`SCHEDULER_ENABLED=true` or `1`) once an
-# operator has confirmed the n8n workflow is retired/disabled, and costs
-# nothing if it never is retired. There is no default that avoids some
-# tradeoff here; OFF trades "scheduler must be turned on deliberately" for
-# "never double-schedules by accident", which is the right side to err on
-# for a mutation this expensive (45-60 minutes to regenerate embeddings if
-# corrupted).
+# DEFAULT: OFF (disabled unless explicitly opted in via SCHEDULER_ENABLED=true or 1).
+# The scheduler must be turned on deliberately (`SCHEDULER_ENABLED=true`) to prevent
+# unintended scheduled re-crawling on deployments where manual syncs via `/sync` are preferred.
 def _parse_scheduler_enabled(raw: str | None) -> bool:
     """Pure parsing helper, factored out so its truthy/falsy string handling
     is directly unit-testable without needing a subprocess reimport of this

@@ -25,7 +25,7 @@ Build a custom pipeline using:
 - **FastEmbed (BAAI/bge-small-en-v1.5)** for CPU-friendly ONNX embeddings
 - **FastMCP 3.x** for MCP-over-HTTP serving (streamable HTTP, stateless)
 - **Traefik** for reverse proxy / TLS termination / rate limiting
-- **n8n** for weekly sync scheduling and failure alerting
+- **n8n** for weekly sync scheduling and failure alerting *(Note: superseded in Phase 6 by an in-process scheduler inside `ingestion` to eliminate external dependencies and double-scheduling hazards)*
 
 ## Rationale
 

@@ -1,10 +1,6 @@
-"""In-process cron scheduler — replaces the n8n weekly cron workflow
-(`docs/n8n/docs-sync.json`).
+"""In-process cron scheduler for automated documentation re-crawling.
 
-Why this exists: the n8n workflow fired on an opaque weekly timer, and during
-an earlier phase a sync ran that nobody could account for — there was no way
-to see, from any log, why it fired or why it didn't fire for a given source.
-This module makes every scheduling decision an explicit structlog event with
+Why this exists: makes every scheduling decision an explicit structlog event with
 a distinct name (`fired` / `skipped-not-due` / `skipped-locked` / `errored`)
 so an operator can always answer "why didn't source X sync last night?" from
 logs alone.
