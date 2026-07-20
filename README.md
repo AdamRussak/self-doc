@@ -21,10 +21,6 @@ MCP client) a private, always-current reference library. It crawls upstream
 documentation sites, chunks and embeds them locally — no third-party embedding
 API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 
-Static reference knowledge lives here. Dynamic project state stays in
-[Mem0](https://mem0.ai). The two never mix — see [`CLAUDE.md`](CLAUDE.md) for
-the memory boundary that governs agents in this repo.
-
 ---
 
 ## Contents
