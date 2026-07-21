@@ -22,7 +22,7 @@ Several off-the-shelf RAG platforms were evaluated during the research phase:
 Build a custom pipeline using:
 
 - **PostgreSQL 16 + pgvector 0.8.2** for vector + full-text storage
-- **FastEmbed (BAAI/bge-small-en-v1.5)** for CPU-friendly ONNX embeddings
+- **FastEmbed (BAAI/bge-small-en-v1.5)** for CPU-friendly ONNX embeddings *(Note: the model is no longer fixed — superseded by [ADR-004](004-selectable-embedding-models.md), which makes it registry-selectable and moves the default to `mixedbread-ai/mxbai-embed-large-v1`. FastEmbed/ONNX/CPU is unchanged.)*
 - **FastMCP 3.x** for MCP-over-HTTP serving (streamable HTTP, stateless)
 - **Traefik** for reverse proxy / TLS termination / rate limiting
 - **n8n** for weekly sync scheduling and failure alerting *(Note: superseded in Phase 6 by an in-process scheduler inside `ingestion` to eliminate external dependencies and double-scheduling hazards)*

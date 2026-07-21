@@ -662,10 +662,13 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
 
 ## Troubleshooting
 
-- **Is the embedding model available offline?** Yes — `BAAI/bge-small-en-v1.5`
-  is pre-downloaded into both the `ingestion` and `mcp-server` images at
-  build time (see each Dockerfile). No network access is needed at runtime
-  for embedding; a fresh container start does not re-download the model.
+- **Is the embedding model available offline?** Yes — the configured model is
+  pre-downloaded into both the `ingestion` and `mcp-server` images at build time
+  via the `EMBEDDING_MODEL_NAME` build arg (see each Dockerfile), which
+  docker-compose feeds from `.env`. No network access is needed at runtime for
+  embedding; a fresh container start does not re-download the model. Note this
+  means **changing the model requires rebuilding both images** so the new
+  weights are baked in — see [Switch the embedding model](#switch-the-embedding-model).
 
 - **Reading logs.** Both services emit structured JSON lines to stdout via
   `structlog` (fields: `ts`, `level`, `service`, `event`, plus context like
