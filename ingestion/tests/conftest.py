@@ -66,6 +66,21 @@ from app.urlscope import _resolve_host_addrs
 # expects a public verdict. 93.184.216.34 (the historical example.com
 # address) is a real, public, non-reserved IPv4 literal.
 _STUB_PUBLIC_IP = "93.184.216.34"
+_real_getaddrinfo = socket.getaddrinfo
+
+# Hosts needed by FastEmbed / HuggingFace Hub / Qdrant when initializing or checking model files,
+# plus localhost hostnames so local database/service connections resolve cleanly.
+_ALLOW_REAL_DNS_HOSTS = (
+    "huggingface.co",
+    "hf.co",
+    "github.com",
+    "githubusercontent.com",
+    "qdrant.to",
+    "googleapis.com",
+    "python.org",
+    "pypi.org",
+    "localhost",
+)
 
 
 def _stub_getaddrinfo(host, port=0, family=0, type=0, proto=0, flags=0):
@@ -83,6 +98,8 @@ def _stub_getaddrinfo(host, port=0, family=0, type=0, proto=0, flags=0):
     semantics); anything else (an actual hostname) resolves to the fixed
     public `_STUB_PUBLIC_IP`, regardless of what hostname was asked for.
     """
+    if host and any(host == d or host.endswith("." + d) for d in _ALLOW_REAL_DNS_HOSTS):
+        return _real_getaddrinfo(host, port, family, type, proto, flags)
     try:
         ipaddress.ip_address(host)
     except ValueError:
