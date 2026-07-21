@@ -800,3 +800,157 @@ def get_page_chunks(conn: psycopg.Connection, page_id: int) -> list[ChunkRecord]
         rows = cur.fetchall()
     return [_row_to_chunk_record(row) for row in rows]
 
+
+def get_chunk_by_id(conn: psycopg.Connection, chunk_id: int) -> dict[str, Any] | None:
+    """Fetch a single `doc_chunk` by ID joined with its parent page and source."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id, s.name AS source, c.heading_path, p.url, c.content, p.fetched_at
+            FROM doc_chunks c
+            JOIN doc_pages p ON c.page_id = p.id
+            JOIN doc_sources s ON p.source_id = s.id
+            WHERE c.id = %s
+            """,
+            (chunk_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "source": row[1],
+        "heading_path": row[2],
+        "url": row[3],
+        "content": row[4],
+        "fetched_at": row[5].isoformat() if row[5] else None,
+    }
+
+
+def get_source_tree(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """Fetch hierarchical overview of indexed sources with page and chunk totals."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.id, s.name, s.base_url,
+                   COUNT(DISTINCT p.id) AS page_count,
+                   COUNT(c.id) AS chunk_count,
+                   s.last_synced
+            FROM doc_sources s
+            LEFT JOIN doc_pages p ON p.source_id = s.id
+            LEFT JOIN doc_chunks c ON c.page_id = p.id
+            GROUP BY s.id, s.name, s.base_url, s.last_synced
+            ORDER BY s.name ASC
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": r[0],
+            "name": r[1],
+            "base_url": r[2],
+            "page_count": r[3],
+            "chunk_count": r[4],
+            "last_synced": r[5].isoformat() if r[5] else None,
+        }
+        for r in rows
+    ]
+
+
+def search_chunks(
+    conn: psycopg.Connection,
+    query: str,
+    *,
+    source: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Perform hybrid RRF search (vector + fts) over doc_chunks, returning raw chunk dictionary items."""
+    from .embedder import get_model
+
+    query_prompt = os.environ.get(
+        "EMBEDDING_QUERY_PROMPT",
+        "Represent this sentence for searching relevant passages: ",
+    )
+    model = get_model()
+    (vec,) = list(model.embed([query_prompt + query]))
+    query_vec_str = "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+    sql = """
+    WITH vector_candidates AS (
+        SELECT dc.id, dc.embedding <=> %(query_vec)s::vector AS distance
+        FROM doc_chunks dc
+        JOIN doc_pages dp ON dp.id = dc.page_id
+        JOIN doc_sources ds ON ds.id = dp.source_id
+        WHERE %(source)s::text IS NULL OR ds.name = %(source)s
+        ORDER BY dc.embedding <=> %(query_vec)s::vector
+        LIMIT 30
+    ),
+    vector_arm AS (
+        SELECT id, row_number() OVER (ORDER BY distance) AS rnk
+        FROM vector_candidates
+    ),
+    fts_candidates AS (
+        SELECT dc.id,
+               ts_rank(dc.fts, websearch_to_tsquery(dc.fts_config, %(query_text)s)) AS rank_score
+        FROM doc_chunks dc
+        JOIN doc_pages dp ON dp.id = dc.page_id
+        JOIN doc_sources ds ON ds.id = dp.source_id
+        WHERE dc.fts @@ websearch_to_tsquery(dc.fts_config, %(query_text)s)
+          AND (%(source)s::text IS NULL OR ds.name = %(source)s)
+        ORDER BY rank_score DESC
+        LIMIT 30
+    ),
+    fts_arm AS (
+        SELECT id, row_number() OVER (ORDER BY rank_score DESC) AS rnk
+        FROM fts_candidates
+    ),
+    fused AS (
+        SELECT id, SUM(1.0 / (60 + rnk)) AS rrf_score
+        FROM (
+            SELECT id, rnk FROM vector_arm
+            UNION ALL
+            SELECT id, rnk FROM fts_arm
+        ) arms
+        GROUP BY id
+    )
+    SELECT dc.id, ds.name AS source, dc.heading_path, dp.url, dc.content, fused.rrf_score
+    FROM fused
+    JOIN doc_chunks dc ON dc.id = fused.id
+    JOIN doc_pages dp ON dp.id = dc.page_id
+    JOIN doc_sources ds ON ds.id = dp.source_id
+    ORDER BY fused.rrf_score DESC
+    LIMIT %(limit)s;
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(
+            sql,
+            {
+                "query_vec": query_vec_str,
+                "query_text": query,
+                "source": source,
+                "limit": limit,
+            },
+        )
+        rows = cur.fetchall()
+
+    results = []
+    for r in rows:
+        content = r[4] or ""
+        snippet = content.replace("\n", " ").strip()
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "..."
+        results.append(
+            {
+                "id": r[0],
+                "source": r[1],
+                "heading_path": r[2],
+                "url": r[3],
+                "score": float(r[5]),
+                "snippet": snippet,
+            }
+        )
+    return results
+
+
+

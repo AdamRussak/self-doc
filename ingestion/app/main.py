@@ -665,7 +665,59 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+# --- REST API Endpoints for doc-cli & HTTP Clients ----------------------------------------
+@app.get("/api/v1/search")
+async def api_search(
+    q: str,
+    source: str | None = None,
+    limit: int = 5,
+    authorization: str | None = Header(default=None),
+):
+    """Hybrid RRF search returning token-optimized chunk snippets for doc-cli."""
+    _check_auth(authorization)
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="search query 'q' cannot be empty")
+    clamped_limit = min(max(limit, 1), 50)
+    conn = store.get_connection()
+    try:
+        results = store.search_chunks(conn, query=q.strip(), source=source, limit=clamped_limit)
+        return results
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/chunks/{chunk_id}")
+async def api_get_chunk(
+    chunk_id: int,
+    authorization: str | None = Header(default=None),
+):
+    """Retrieve full text markdown body and metadata for a specific chunk ID."""
+    _check_auth(authorization)
+    conn = store.get_connection()
+    try:
+        chunk = store.get_chunk_by_id(conn, chunk_id)
+        if chunk is None:
+            raise HTTPException(status_code=404, detail=f"chunk ID {chunk_id} not found")
+        return chunk
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/tree")
+async def api_get_tree(
+    authorization: str | None = Header(default=None),
+):
+    """Retrieve indexed source hierarchy with page and chunk totals."""
+    _check_auth(authorization)
+    conn = store.get_connection()
+    try:
+        return store.get_source_tree(conn)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=8080)
+

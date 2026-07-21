@@ -51,7 +51,22 @@ services:
       - "traefik.http.serversTransports.self-docs-mcp-transport.forwardingTimeouts.idleConnTimeout=90s"
       - "traefik.http.services.self-docs-mcp.loadbalancer.serverstransport=self-docs-mcp-transport"
 
+  ingestion:
+    networks:
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}"
+      - "traefik.http.routers.self-docs-api.rule=Host(`${DOCS_MCP_HOSTNAME}`) && PathPrefix(`/api/v1`)"
+      - "traefik.http.routers.self-docs-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.self-docs-api.tls=true"
+      - "traefik.http.services.self-docs-api.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.self-docs-api-ratelimit.ratelimit.average=30"
+      - "traefik.http.middlewares.self-docs-api-ratelimit.ratelimit.burst=100"
+      - "traefik.http.routers.self-docs-api.middlewares=self-docs-api-ratelimit"
+
 networks:
   traefik:
     name: ${TRAEFIK_NETWORK:-traefik_proxy}
     external: true
+

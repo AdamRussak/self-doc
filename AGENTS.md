@@ -44,6 +44,12 @@ Two knowledge stores. Never mix them.
    anything on its own. Tell the user the proposal is queued for approval,
    not that the docs are "being indexed." See `docs/runbook.md` for the
    full approval workflow.
+6. **CLI Progressive Disclosure (`doc-cli`) Protocol**: Terminal AI agents may use the `doc-cli` Go binary for progressive disclosure documentation lookup:
+   - Step 1 (Search First): `doc-cli search "<query>" --limit 3` (returns candidate IDs + 1-line snippets).
+   - Step 2 (Inspect): Inspect candidate IDs, headings, and relevance scores.
+   - Step 3 (Targeted Fetch): `doc-cli get <id>` on the 1–2 target chunk IDs.
+   - Never pull broad uncalibrated text dumps when a narrow ID lookup works.
+
 
 ## Endpoint
 

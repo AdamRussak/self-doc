@@ -1,7 +1,9 @@
 -include .env
 export
 
-.PHONY: up down up-prod down-prod sync test eval lint typecheck configure reindex backup backup-prune backup-auto restore
+PREFIX ?= $(HOME)/.local
+
+.PHONY: up down up-prod down-prod sync test build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore
 
 # Select the embedding model from config/models.yaml. Resolves the model's
 # vector dimension and per-service memory limits, writes them into .env, and
@@ -20,6 +22,29 @@ reindex:
 	docker compose exec -T db psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} \
 		-c "TRUNCATE doc_pages, doc_chunks RESTART IDENTITY CASCADE;"
 	$(MAKE) sync
+
+# Build the doc-cli Go executable in the project root.
+build-cli:
+	cd cli && go build -o ../doc-cli .
+
+# Run Go unit and API client tests.
+test-cli:
+	cd cli && go test -v ./...
+
+# Install doc-cli executable to $(PREFIX)/bin.
+install-cli: build-cli
+	@mkdir -p $(PREFIX)/bin
+	cp doc-cli $(PREFIX)/bin/doc-cli
+	@chmod +x $(PREFIX)/bin/doc-cli
+	@echo "Installed doc-cli binary to $(PREFIX)/bin/doc-cli"
+
+# Install doc-cli AI agent skill globally to ~/.gemini/config/skills/doc-cli/SKILL.md.
+install-skill: build-cli
+	./doc-cli skill install --global --force
+
+# Combined installation: install binary to PATH and register AI agent skill.
+install: install-cli install-skill
+
 
 # Bring up the full stack locally (db + ingestion + mcp-server) using loopback ports.
 up:
@@ -42,27 +67,11 @@ sync:
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
 		-H "Content-Type: application/json"
 
-# Runs the full suite for BOTH packages (ingestion, mcp-server) plus the
+# Runs the full suite for BOTH packages (ingestion, mcp-server), doc-cli Go suite, plus the
 # cross-package e2e test, as the single `make test` entrypoint from repo root.
-#
-# Each package ships its own `app` top-level package name, so they cannot
-# share one venv/import namespace; each gets its own venv (created here if
-# missing) and is tested with its own interpreter. The e2e test spans both by
-# shelling out to each venv's interpreter in turn (see tests/test_e2e.py).
-#
-# DB-dependent tests (ingestion/tests/test_store.py, mcp-server/tests/
-# test_retrieval_integration.py, tests/test_e2e.py) need the compose `db` up
-# and reachable on 127.0.0.1:5433 with POSTGRES_USER=self_docs
-# POSTGRES_PASSWORD=testpass123 POSTGRES_DB=self_docs (or override via env).
-#
-# The base docker-compose.yml deliberately publishes NO db port (security
-# review finding M1: db must be reachable only inside the compose network in
-# production). The host-loopback mapping is an explicit opt-in test overlay —
-# bring db up (with the port) first via:
-#     docker compose -f docker-compose.yml -f docker-compose.test.yml up -d db
-# They skip cleanly (not fail) when no db is reachable, so `make test` stays
-# green without Docker too, but full coverage requires the db up as above.
 test:
+	@echo "=== doc-cli Go test suite ==="
+	cd cli && go test -v ./...
 	@echo "=== ensuring ingestion/.venv ==="
 	@test -d ingestion/.venv || python3 -m venv ingestion/.venv
 	@ingestion/.venv/bin/pip install -q -U pip
@@ -82,6 +91,7 @@ test:
 	@echo "=== e2e (cross-package) test suite ==="
 	cd tests && ../ingestion/.venv/bin/python -m pytest -q
 	@echo "make test: all suites green (DB-dependent tests skip cleanly if 'docker compose up -d db' wasn't run first)."
+
 
 # Run retrieval quality evaluation against a synced database.
 # Requires: compose db up with synced seed sources.

@@ -175,6 +175,49 @@ sources come back.
 
 ---
 
+## Go CLI & Progressive Disclosure Skill (`doc-cli`)
+
+Terminal AI agents (and human operators) can use the `doc-cli` binary and progressive disclosure skill for high-performance, token-optimized REST queries over `/api/v1/*`.
+
+### 1. Build and Install Binary & Skill
+
+Run from the `self-docs` repository root:
+
+```bash
+# Installs doc-cli executable to ~/.local/bin/doc-cli and registers global skill
+make install
+```
+
+Or install individually:
+
+```bash
+# Build & install executable to ~/.local/bin/doc-cli
+make install-cli
+
+# Register AI agent skill to ~/.gemini/config/skills/doc-cli/SKILL.md
+doc-cli skill install --global
+
+# Register AI agent skill to a specific project (.agents/skills/doc-cli/SKILL.md)
+doc-cli skill install --project
+```
+
+### 2. Environment Configuration
+
+Add the API endpoint and Bearer authentication token to your shell environment (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+export SELF_DOCS_API_URL="http://localhost:8080"  # or https://<DOCS_MCP_HOSTNAME> in production
+export API_TOKEN="<your-sync-token>"
+```
+
+### 3. Verify Health & Status
+
+```bash
+doc-cli skill status
+```
+
+---
+
 ## Troubleshooting a failed connection
 
 - **TLS/hostname errors** — confirm `DOCS_MCP_HOSTNAME` resolves on your LAN
