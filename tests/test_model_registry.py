@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -54,18 +56,59 @@ def test_registry_rows_are_complete(name):
     assert "passage_prompt" in row
 
 
-def test_committed_schema_matches_rendered_default():
-    """db/init/01_schema.sql must equal render(template, default-model dim). If
-    this fails, run `make configure` (default model) to regenerate it."""
+def _active_dim() -> int:
+    """The embedding dimension this checkout is currently configured for.
+
+    `make configure` writes EMBEDDING_DIM into .env and the Makefile exports it,
+    so a checkout reconfigured for a non-default model (CI does exactly this to
+    avoid downloading the 1.2GB default) reports that model's dimension here.
+    Falls back to the registry default when unset.
+    """
+    raw = os.environ.get("EMBEDDING_DIM")
+    if raw:
+        return int(raw)
+    return REGISTRY["models"][REGISTRY["default"]]["dim"]
+
+
+def test_schema_is_faithful_render_of_template():
+    """db/init/01_schema.sql must be exactly render(template, active dim) — i.e.
+    generated, never hand-edited. The active dim follows `make configure`, so
+    this holds both for a default checkout and for one reconfigured to another
+    model. If it fails, re-run `make configure` instead of editing the SQL."""
     configure_model = _load_configure_model()
-    default_dim = REGISTRY["models"][REGISTRY["default"]]["dim"]
-    expected = configure_model.render_schema_text(default_dim)
+    expected = configure_model.render_schema_text(_active_dim())
     assert SCHEMA_FILE.read_text(encoding="utf-8") == expected
 
 
-def test_committed_schema_vector_dim_matches_default():
+def test_schema_vector_dim_matches_active_model():
+    assert f"vector({_active_dim()})" in SCHEMA_FILE.read_text(encoding="utf-8")
+
+
+def test_git_committed_schema_matches_registry_default():
+    """The schema COMMITTED TO GIT must be the default-model render, so a fresh
+    clone gets the advertised default without running `make configure`.
+
+    Deliberately reads git HEAD rather than the working tree: `make configure`
+    legitimately rewrites the working copy (CI reconfigures to a small model),
+    and that must not be mistaken for drift. What must never happen is
+    *committing* a schema rendered for a non-default model.
+    """
+    try:
+        committed = subprocess.run(
+            ["git", "show", "HEAD:db/init/01_schema.sql"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        pytest.skip(f"git unavailable: {exc}")
+    if committed.returncode != 0:  # pragma: no cover - shallow/exportless checkout
+        pytest.skip(f"cannot read schema from git HEAD: {committed.stderr.strip()}")
+
+    configure_model = _load_configure_model()
     default_dim = REGISTRY["models"][REGISTRY["default"]]["dim"]
-    assert f"vector({default_dim})" in SCHEMA_FILE.read_text(encoding="utf-8")
+    assert committed.stdout == configure_model.render_schema_text(default_dim)
 
 
 def test_ingestion_embedder_defaults_match_registry_default():
