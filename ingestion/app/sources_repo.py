@@ -301,7 +301,7 @@ def parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[i
         )
     return tuple(  # type: ignore[return-value]
         _parse_cron_field(token, name, lo, hi)
-        for token, name, (lo, hi) in zip(fields, _CRON_FIELD_NAMES, _CRON_FIELD_RANGES)
+        for token, name, (lo, hi) in zip(fields, _CRON_FIELD_NAMES, _CRON_FIELD_RANGES, strict=True)
     )
 
 

@@ -1,6 +1,4 @@
 import pytest
-from pydantic import ValidationError
-
 from app.retrieval import (
     ARM_CANDIDATE_LIMIT,
     HYBRID_SEARCH_SQL,
@@ -9,6 +7,7 @@ from app.retrieval import (
     _format_vector_literal,
     format_hit,
 )
+from pydantic import ValidationError
 
 
 def test_format_hit_matches_contract():

@@ -23,11 +23,15 @@ RUN pip install --no-cache-dir uv \
     && uv export --no-dev --no-editable --format requirements-txt -o /tmp/requirements.txt \
     && uv pip install --system --no-cache -r /tmp/requirements.txt
 
-# Pre-download the FastEmbed embedding model (BAAI/bge-small-en-v1.5) and the
-# BGE tokenizer at build time so the first real sync doesn't pay a cold-start
-# download. Cached under /home/ingest/.cache, owned by the runtime user below.
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')" \
-    && python -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('BAAI/bge-small-en-v1.5')"
+# Pre-download the FastEmbed embedding model and its tokenizer at build time so
+# the first real sync doesn't pay a cold-start download. Cached under
+# /home/ingest/.cache, owned by the runtime user below. The model is a build
+# arg so `make configure` / compose can bake the selected model (default =
+# config/models.yaml registry default); the runtime env var must match it.
+ARG EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
+ENV EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
+RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['EMBEDDING_MODEL_NAME'])" \
+    && python -c "import os; from tokenizers import Tokenizer; Tokenizer.from_pretrained(os.environ['EMBEDDING_MODEL_NAME'])"
 
 # Non-root runtime user.
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin ingest \

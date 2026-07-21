@@ -1,0 +1,32 @@
+# Ruff config for the whole repo (both packages, scripts, tests).
+# Run via `make lint` (ruff check + ruff format --check).
+target-version = "py312"
+line-length = 120
+
+extend-exclude = [
+    ".venv",
+    "*/.venv",
+    ".tooling-venv",
+    "backups",
+]
+
+[lint]
+# A pragmatic, low-noise set: pyflakes (F), a subset of pycodestyle (E/W),
+# isort (I), pyupgrade (UP), and flake8-bugbear (B). This catches real bugs and
+# unused/dead code without imposing opinionated style churn on a codebase with
+# deliberately long, rationale-rich comments.
+select = ["F", "E", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length — long explanatory comments are intentional here
+    "E741",  # ambiguous var names (e.g. `m` for model) used deliberately
+    "B008",  # function calls in argument defaults (FastAPI/pydantic patterns)
+]
+
+[lint.per-file-ignores]
+# Tests deliberately assert on broad exceptions in a few negative cases.
+"**/tests/**" = ["B011", "B017"]
+# crawler.py must call warnings.filterwarnings() BEFORE importing the bs4-using
+# submodules, so those imports are intentionally not at the top of the file.
+"ingestion/app/crawler.py" = ["E402"]
+# test_push_sources.py inserts the repo root on sys.path before importing scripts.
+"tests/test_push_sources.py" = ["E402"]

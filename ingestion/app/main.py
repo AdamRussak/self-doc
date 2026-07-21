@@ -103,7 +103,7 @@ try:
     _INITIAL_SOURCES: list[SourceRecord] = _load_initial_sources()
 except Exception as e:  # noqa: BLE001 - any DB/connectivity failure is fatal at boot
     print(f"FATAL: could not load sources from the database: {e}", file=sys.stderr)
-    raise SystemExit(1)
+    raise SystemExit(1) from e
 
 # --- Opt-in YAML -> DB import (NEVER automatic) -----------------------------------------
 # `sources.yaml` -> `doc_sources` import (sources_repo.import_from_yaml) is a
@@ -141,7 +141,7 @@ try:
     _maybe_import_sources_yaml_on_boot()
 except Exception as e:  # noqa: BLE001 - an explicitly opted-in import failing is fatal too
     print(f"FATAL: IMPORT_SOURCES_YAML_ON_BOOT import failed: {e}", file=sys.stderr)
-    raise SystemExit(1)
+    raise SystemExit(1) from e
 
 # --- Dynamic re-read with a last-known-good cache for test observability ----------------
 # Startup (above) is fail-fast: an unreachable database at boot aborts the
@@ -616,7 +616,7 @@ async def sync(req: SyncRequest | None = None, authorization: str | None = Heade
     try:
         all_sources = get_sources()
     except SourcesUnavailable as e:
-        raise HTTPException(status_code=503, detail=f"sources unavailable: {e}")
+        raise HTTPException(status_code=503, detail=f"sources unavailable: {e}") from e
 
     sources_by_name = {s.name: s for s in all_sources}
     sources_by_id = {s.id: s for s in all_sources}

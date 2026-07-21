@@ -22,9 +22,9 @@ from pathlib import Path
 
 import psycopg
 import pytest
-
 from app import sources_repo
 from app.config import SourceConfig, load_sources
+from app.embedder import EMBEDDING_DIM as _EMBEDDING_DIM
 from app.sources_repo import (
     SOURCE_COLUMNS,
     ImportResult,
@@ -34,7 +34,6 @@ from app.sources_repo import (
     _row_to_record,
     _select_due_records,
     cron_matches,
-    due_sources,
     parse_cron,
     validate_cron,
 )
@@ -619,7 +618,7 @@ def test_delete_source_cascades_to_pages_and_chunks(db_conn: psycopg.Connection)
             INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding)
             VALUES (%s, %s, %s, %s, %s::vector)
             """,
-            (page_id, "Intro", 0, "hello world", "[" + ",".join(["0.0"] * 384) + "]"),
+            (page_id, "Intro", 0, "hello world", "[" + ",".join(["0.0"] * _EMBEDDING_DIM) + "]"),
         )
         cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
         (pages_before,) = cur.fetchone()

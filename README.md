@@ -39,8 +39,11 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 
 ## Why self-docs
 
-- **Local-first embeddings.** FastEmbed (`BAAI/bge-small-en-v1.5`) runs
-  in-process; documentation never leaves your network.
+- **Local-first embeddings.** FastEmbed runs in-process on CPU (ONNX, no
+  GPU/torch); documentation never leaves your network. The model is selectable
+  from a registry (`config/models.yaml`) — `make configure` derives the vector
+  dimension and container memory limits from your choice. Default:
+  `mixedbread-ai/mxbai-embed-large-v1` (1024-dim).
 - **Hybrid retrieval.** Vector similarity + per-source-language Postgres
   full-text search over `pgvector`, so exact terms and semantic matches both
   surface.
@@ -72,7 +75,7 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 | Layer | Technology |
 |-------|------------|
 | Store | PostgreSQL 16 + pgvector 0.8.2 |
-| Embeddings | FastEmbed · `BAAI/bge-small-en-v1.5` |
+| Embeddings | FastEmbed · `mixedbread-ai/mxbai-embed-large-v1` (default, selectable — see `config/models.yaml`) |
 | MCP server | FastMCP 3.x (streamable HTTP) |
 | Ingestion | FastAPI crawler + chunker + scheduler |
 | Ingress | Traefik (production overlay) |
@@ -89,9 +92,18 @@ cron scheduler (`app.scheduler`) for automated re-crawling; see the
 
 ```bash
 cp .env.example .env        # fill in real values
+make configure              # optional — pick an embedding model (see below)
 make up                     # db + ingestion (:8080) + mcp-server (:8081)
 make sync                   # trigger the initial documentation sync
 ```
+
+`make configure` is optional: with no `.env` overrides both services already use
+the registry default. Run it to choose a different model —
+`make configure MODEL=BAAI/bge-base-en-v1.5` — and it resolves that model's
+vector dimension, query/passage prompts, and per-service memory limits into
+`.env`, then re-renders `db/init/01_schema.sql`. Switching models on an existing
+deployment requires a re-embed; see
+[Runbook → switch the embedding model](docs/runbook.md#switch-the-embedding-model).
 
 Point local MCP clients at `http://127.0.0.1:8081/mcp` (streamable HTTP). The
 server requires an `Authorization: Bearer <MCP_TOKEN>` header — see
@@ -152,6 +164,10 @@ make test
 
 # Run the retrieval-quality eval (requires a synced db)
 make eval
+
+# Lint and static type checks (also enforced in CI)
+make lint
+make typecheck
 ```
 
 Backup and restore are available via `make backup`, `make backup-prune`, and
@@ -160,4 +176,4 @@ Backup and restore are available via `make backup`, `make backup-prune`, and
 
 ## License
 
-Private — not published.
+Private — not published. All rights reserved; see [LICENSE](LICENSE).

@@ -55,7 +55,6 @@ import ipaddress
 import socket
 
 import pytest
-
 from app.urlscope import _resolve_host_addrs
 
 # Any public, non-private/non-link-local/non-loopback/non-reserved address

@@ -22,7 +22,6 @@ import asyncio
 from datetime import datetime
 
 import pytest
-
 from app import scheduler
 from app.sources_repo import SourceRecord
 

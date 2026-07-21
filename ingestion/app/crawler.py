@@ -30,9 +30,8 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 from . import llms_txt
 from .config import SourceConfig
 from .logging_config import get_logger
-from .urlscope import parse_sitemap
+from .urlscope import parse_sitemap, url_host_is_private
 from .urlscope import path_allowed as _path_allowed
-from .urlscope import url_host_is_private
 
 USER_AGENT = "self-docs-crawler/0.1"
 

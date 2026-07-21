@@ -1,6 +1,10 @@
--- GENERATED from db/init/01_schema.sql.template by scripts/configure_model.py.
--- Do not edit by hand — run `make configure MODEL=<name>` to change the vector
--- dimension. Rendered for embedding dimension 1024.
+-- TEMPLATE — do not edit db/init/01_schema.sql by hand.
+--
+-- scripts/configure_model.py renders this file into db/init/01_schema.sql,
+-- substituting __EMBEDDING_DIM__ with the selected model's vector dimension
+-- (see config/models.yaml). The committed 01_schema.sql is the rendering for
+-- the registry's default model; `make configure MODEL=<name>` re-renders it.
+-- A parity test (tests/test_model_registry.py) fails CI if the two drift.
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE doc_sources (
@@ -31,7 +35,7 @@ CREATE TABLE doc_chunks (
     heading_path  TEXT,                      -- "Guide > Routing > Dynamic Routes"
     chunk_index   INT NOT NULL,
     content       TEXT NOT NULL,             -- markdown
-    embedding     vector(1024) NOT NULL,
+    embedding     vector(__EMBEDDING_DIM__) NOT NULL,
     fts_config    regconfig NOT NULL DEFAULT 'english',
     fts           tsvector GENERATED ALWAYS AS (to_tsvector(fts_config, content)) STORED
 );

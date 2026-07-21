@@ -1,7 +1,6 @@
 import inspect
 
 import httpx
-
 from app.config import SourceConfig
 from app.crawler import RateLimiter, _is_private_ip_host, _validate_final_url, crawl, discover_sitemap_urls
 from app.logging_config import get_logger
@@ -916,8 +915,8 @@ def test_crawl_falls_back_to_bfs_on_sitemap_valueerror():
 
 def test_extract_links_suppresses_xml_warning(recwarn):
     """extract_links() should not emit XMLParsedAsHTMLWarning when processing XML content."""
-    from bs4 import XMLParsedAsHTMLWarning
     from app.crawler import extract_links
+    from bs4 import XMLParsedAsHTMLWarning
 
     xml_content = '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/page1</loc></url></urlset>'
     extract_links(xml_content, "https://example.com/sitemap.xml")

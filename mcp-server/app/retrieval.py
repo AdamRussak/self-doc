@@ -34,7 +34,18 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, fie
 
 logger = structlog.get_logger(__name__)
 
-EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# Model, and the per-model QUERY prompt, are env-driven (set by `make configure`
+# from config/models.yaml), defaulting to the registry default so a fresh
+# checkout / CI works unconfigured. FastEmbed applies no prefix for the models
+# we support, so the query instruction is prepended manually in `_embed_query`
+# — the asymmetric counterpart to ingestion's EMBEDDING_PASSAGE_PROMPT. The two
+# services MUST run the same model for the vectors to be comparable.
+# Fallbacks used when EMBEDDING_* env is unset. These MUST equal the registry
+# default row in config/models.yaml — the parity tests enforce it.
+DEFAULT_MODEL_NAME = "mixedbread-ai/mxbai-embed-large-v1"
+DEFAULT_QUERY_PROMPT = "Represent this sentence for searching relevant passages: "
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
+QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", DEFAULT_QUERY_PROMPT)
 RRF_K = 60
 ARM_CANDIDATE_LIMIT = 30
 
@@ -52,7 +63,7 @@ SEARCH_LATENCY_SECONDS = Histogram(
 # arm using Reciprocal Rank Fusion (score = sum over arms of 1/(k + rank)).
 # `%(source)s` is NULL when no source filter is requested; the `IS NULL OR`
 # guard makes the filter optional without a second query string.
-HYBRID_SEARCH_SQL = """
+HYBRID_SEARCH_SQL = f"""
 WITH vector_candidates AS (
     SELECT dc.id, dc.embedding <=> %(query_vec)s::vector AS distance
     FROM doc_chunks dc
@@ -60,7 +71,7 @@ WITH vector_candidates AS (
     JOIN doc_sources ds ON ds.id = dp.source_id
     WHERE %(source)s::text IS NULL OR ds.name = %(source)s
     ORDER BY dc.embedding <=> %(query_vec)s::vector
-    LIMIT {arm_limit}
+    LIMIT {ARM_CANDIDATE_LIMIT}
 ),
 vector_arm AS (
     SELECT id, row_number() OVER (ORDER BY distance) AS rnk
@@ -75,14 +86,14 @@ fts_candidates AS (
     WHERE dc.fts @@ websearch_to_tsquery(dc.fts_config, %(query_text)s)
       AND (%(source)s::text IS NULL OR ds.name = %(source)s)
     ORDER BY rank_score DESC
-    LIMIT {arm_limit}
+    LIMIT {ARM_CANDIDATE_LIMIT}
 ),
 fts_arm AS (
     SELECT id, row_number() OVER (ORDER BY rank_score DESC) AS rnk
     FROM fts_candidates
 ),
 fused AS (
-    SELECT id, SUM(1.0 / ({rrf_k} + rnk)) AS rrf_score
+    SELECT id, SUM(1.0 / ({RRF_K} + rnk)) AS rrf_score
     FROM (
         SELECT id, rnk FROM vector_arm
         UNION ALL
@@ -96,7 +107,7 @@ JOIN doc_chunks dc ON dc.id = fused.id
 JOIN doc_pages dp ON dp.id = dc.page_id
 ORDER BY fused.rrf_score DESC
 LIMIT %(limit)s;
-""".format(arm_limit=ARM_CANDIDATE_LIMIT, rrf_k=RRF_K)
+"""
 
 LIST_SOURCES_SQL = """
 SELECT
@@ -157,10 +168,12 @@ def _format_vector_literal(vec: Any) -> str:
 
 
 def _embed_query(query: str) -> str:
-    """Embed a search query with FastEmbed's `query_embed` (applies the BGE
-    `query:` prefix — asymmetric to `passage_embed` used at ingest time)."""
+    """Embed a search query, prepending EMBEDDING_QUERY_PROMPT (the per-model
+    query instruction — asymmetric to ingestion's EMBEDDING_PASSAGE_PROMPT).
+    FastEmbed applies no prefix for the supported models, so we prepend it and
+    use plain `embed()`."""
     model = get_embedding_model()
-    (vector,) = list(model.query_embed([query]))
+    (vector,) = list(model.embed([QUERY_PROMPT + query]))
     return _format_vector_literal(vector)
 
 
@@ -406,7 +419,7 @@ class ProposedSourceConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _sitemap_shares_base_url_host(self) -> "ProposedSourceConfig":
+    def _sitemap_shares_base_url_host(self) -> ProposedSourceConfig:
         # SSRF guard (security review H1): `sitemap` is fetched BEFORE any of
         # its `<loc>` entries are host-filtered, and a `<sitemapindex>` fans
         # out to its children equally unvalidated. Constraining the sitemap to
@@ -427,7 +440,7 @@ class ProposedSourceConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _hosts_must_not_be_private(self) -> "ProposedSourceConfig":
+    def _hosts_must_not_be_private(self) -> ProposedSourceConfig:
         # SSRF guard (security review H2): source URLs are untrusted input (an
         # MCP tool callable by an AI agent), so reject a host that IS or
         # RESOLVES TO private/loopback/link-local/reserved space at proposal
@@ -448,7 +461,7 @@ class ProposedSourceConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _base_url_passes_own_prefix_filters(self) -> "ProposedSourceConfig":
+    def _base_url_passes_own_prefix_filters(self) -> ProposedSourceConfig:
         # Same rationale as SourceConfig's validator of the same name: a
         # sitemap-less source whose base_url path is excluded by its own
         # prefixes would crawl 0 pages if ever approved. Reject at proposal

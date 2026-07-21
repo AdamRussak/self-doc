@@ -7,6 +7,19 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint (ruff)
+        run: make lint
+      - name: Type-check (mypy)
+        run: make typecheck
+
   test:
     runs-on: ubuntu-latest  # or: self-hosted
 
@@ -47,6 +60,16 @@ jobs:
             pg_isready -h 127.0.0.1 -p 5433 -U self_docs && break
             sleep 1
           done
+
+      - name: Configure embedding model (small/fast for CI)
+        run: |
+          # Use the small 384-dim model in CI so the suite doesn't download the
+          # 1.2GB production default (mxbai-large) on every run. This also
+          # exercises `make configure`: it writes EMBEDDING_* into .env (which
+          # the Makefile exports to the test venvs) and re-renders 01_schema.sql
+          # to vector(384) so the seeded test vectors match the column width.
+          python -m pip install --quiet pyyaml
+          make configure MODEL=BAAI/bge-small-en-v1.5
 
       - name: Init database schema
         run: |

@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 try:
     import httpx
@@ -113,7 +113,7 @@ def main() -> int:
         return 1
 
     try:
-        with open(args.file, "r", encoding="utf-8") as fp:
+        with open(args.file, encoding="utf-8") as fp:
             data = json.load(fp)
     except Exception as exc:
         print(f"FATAL: Failed to read/parse JSON file {args.file}: {exc}", file=sys.stderr)
@@ -186,7 +186,7 @@ def main() -> int:
                         # Trigger sync
                         print(f"  -> Triggering sync for {name!r}...")
                         sync_resp = client.post(
-                            f"/sync",
+                            "/sync",
                             json={"source": name},
                             headers={"Authorization": f"Bearer {sync_token}"},
                         )

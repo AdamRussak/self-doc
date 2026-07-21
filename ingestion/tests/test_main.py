@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,7 +54,7 @@ def _make_record(
         enabled=True,
         status=status,
         proposed_by=proposed_by,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
         last_synced=None,
         last_status=None,
         llms_txt="auto",
@@ -351,7 +351,6 @@ def test_sync_source_crash_marks_status_failed_on_fresh_connection(app_module, m
 
 
 def test_sync_second_call_returns_409_while_running(app_module, monkeypatch):
-    import asyncio
     import time
 
     # Make the sync worker slow so we can observe the "running" state.
@@ -462,6 +461,7 @@ def test_run_sync_blocking_updates_pages_processed(app_module, monkeypatch):
 
 def test_configure_logging_suppresses_third_party_loggers():
     import logging
+
     from app.logging_config import configure_logging
 
     configure_logging()
