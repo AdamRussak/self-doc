@@ -98,13 +98,30 @@ def test_invalid_name_pattern_raises(tmp_path):
         load_sources(p)
 
 
-def test_missing_max_pages_raises(tmp_path):
+def test_missing_max_pages_is_allowed_and_means_unlimited(tmp_path):
+    # max_pages is optional: omitting it is valid and means "no page limit".
     p = write_yaml(
         tmp_path,
         """
         sources:
           - name: no-max-pages
             base_url: https://example.com
+        """,
+    )
+    sources = load_sources(p)
+    assert len(sources) == 1
+    assert sources[0].max_pages is None
+
+
+def test_zero_or_negative_max_pages_still_raises(tmp_path):
+    # When provided, max_pages must be positive (gt=0).
+    p = write_yaml(
+        tmp_path,
+        """
+        sources:
+          - name: bad-max-pages
+            base_url: https://example.com
+            max_pages: 0
         """,
     )
     with pytest.raises(ConfigError):

@@ -85,6 +85,31 @@ def test_sitemap_discovery_bounded_by_max_pages():
     assert len(pages) == 1
 
 
+def test_sitemap_discovery_unlimited_when_max_pages_none():
+    # max_pages=None (omitted) => no page limit: all in-scope pages are crawled.
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        sitemap="https://example.com/sitemap.xml",
+        include_prefixes=["/docs/"],
+        rate_limit_rps=1000,
+    )
+    assert source.max_pages is None
+    handler = _handler_factory(
+        sitemap_body=SITEMAP_XML,
+        page_bodies={
+            "https://example.com/docs/a": PAGE_HTML,
+            "https://example.com/docs/b": PAGE_HTML,
+        },
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert {p["url"] for p in pages} == {
+        "https://example.com/docs/a",
+        "https://example.com/docs/b",
+    }
+
+
 def test_bfs_fallback_when_no_sitemap():
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)

@@ -68,7 +68,7 @@
         </td>
         <td>{% if s.include_prefixes %}{{ s.include_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
         <td>{% if s.exclude_prefixes %}{{ s.exclude_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
-        <td>{{ s.max_pages if s.max_pages is not none else "(none)" }}</td>
+        <td>{% if s.max_pages is not none %}{{ s.max_pages }}{% else %}<span class="muted">unlimited</span>{% endif %}</td>
         <td><span class="proposed-by">agent: {{ s.proposed_by or "unknown" }}</span></td>
         <td class="actions">
           <div class="btn-group">

@@ -15,6 +15,7 @@ transiently failing pages from being purged.
 from __future__ import annotations
 
 import ipaddress
+import sys
 import time
 import urllib.robotparser
 import warnings
@@ -397,7 +398,8 @@ def crawl(
     client: httpx.Client | None = None,
     conditional: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> Iterator[dict]:
-    """Discover and fetch up to `source.max_pages` pages for `source`.
+    """Discover and fetch up to `source.max_pages` pages for `source` (or ALL
+    in-scope pages when `source.max_pages` is None — no page limit).
 
     YIELDS `{"url": str, "html": str | None, "fetch_ok": bool}` dicts one at a
     time as pages are visited, rather than materializing the whole crawl in
@@ -462,6 +464,11 @@ def crawl(
         rp = load_robots(client, base_url)
         limiter = RateLimiter(source.rate_limit_rps)
 
+        # `max_pages` is optional: None means "no page limit". Internally we use
+        # a very large int so the existing cap comparisons/slicing need no
+        # special-casing — same-host + prefix scoping still bounds the crawl.
+        page_cap = source.max_pages if source.max_pages is not None else sys.maxsize
+
         pages_fetched = 0
         visited: set[str] = set()
 
@@ -525,7 +532,7 @@ def crawl(
                     sections = llms_txt.split_llms_full(llms_text, index_url)
                     llms_count = 0
                     for section in sections:
-                        if llms_count >= source.max_pages:
+                        if llms_count >= page_cap:
                             break
                         yield {
                             "url": section["url"],
@@ -560,7 +567,7 @@ def crawl(
                     continue
                 if u not in filtered:
                     filtered.append(u)
-            candidate_urls = filtered[: source.max_pages]
+            candidate_urls = filtered[:page_cap]
             log.info("llms_index_candidates", count=len(candidate_urls))
         elif source.sitemap and not _same_host(str(source.sitemap), base_url):
             # Defence in depth: SourceConfig already rejects an off-host
@@ -572,7 +579,7 @@ def crawl(
                 candidate_urls = discover_sitemap_urls(
                     client,
                     str(source.sitemap),
-                    source.max_pages,
+                    page_cap,
                     limiter,
                     log,
                     base_url,
@@ -672,7 +679,7 @@ def crawl(
 
         if candidate_urls is not None:
             for url in candidate_urls:
-                if pages_fetched >= source.max_pages:
+                if pages_fetched >= page_cap:
                     break
                 url = _strip_fragment(url)
                 if url in visited:
@@ -685,7 +692,7 @@ def crawl(
                     yield item
         else:
             queue = [base_url]
-            while queue and pages_fetched < source.max_pages:
+            while queue and pages_fetched < page_cap:
                 url = _strip_fragment(queue.pop(0))
                 if url in visited:
                     continue
