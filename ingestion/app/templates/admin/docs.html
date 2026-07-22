@@ -3,8 +3,11 @@
 {% block nav_docs %}active{% endblock %}
 {% block content %}
 <div class="card">
-  <h2>Knowledge Base Browser</h2>
-  <p class="hint">Inspect all ingested document pages and their pre-chunked markdown segments across active sources.</p>
+  <div class="card-header" style="margin-bottom: 0.5rem; border-bottom: 1px solid var(--color-border); padding-bottom: 0.75rem;">
+    <h2>Knowledge Base Browser</h2>
+    <span class="badge badge-primary">Chunk &amp; Vector Inspector</span>
+  </div>
+  <p class="hint" style="margin-bottom: 1.25rem;">Inspect all ingested document pages and their pre-chunked markdown segments across active sources.</p>
   
   <form method="get" action="/admin/docs" class="filter-toolbar">
     <div>
@@ -31,11 +34,11 @@
   <table class="table" style="font-family: var(--font-mono); font-size: 0.85rem;">
     <thead>
       <tr>
-        <th style="width: 5%;">id</th>
-        <th style="width: 15%;">source</th>
-        <th style="width: 45%;">url</th>
-        <th style="width: 15%;">fetched at</th>
-        <th style="width: 10%;">chunks</th>
+        <th style="width: 6%;">id</th>
+        <th style="width: 16%;">source</th>
+        <th style="width: 44%;">url</th>
+        <th style="width: 16%;">fetched at</th>
+        <th style="width: 8%;">chunks</th>
         <th style="width: 10%;">actions</th>
       </tr>
     </thead>
@@ -66,3 +69,4 @@
   </table>
 </div>
 {% endblock %}
+

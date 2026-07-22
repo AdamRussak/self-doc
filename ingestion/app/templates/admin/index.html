@@ -4,26 +4,37 @@
 {% block content %}
 {% if message %}<div class="message">{{ message }}</div>{% endif %}
 
-<div class="card" style="border-top: 2px solid var(--color-primary);">
-  <h2>Sync Controls</h2>
+<div class="card">
+  <div class="card-header" style="margin-bottom: 1rem; border-bottom: 1px solid var(--color-border); padding-bottom: 0.75rem;">
+    <h2>Sync Controls</h2>
+    <span class="badge badge-primary">Nexus Ingestion Engine</span>
+  </div>
+  
   {% include "admin/_sync_status_partial.html" %}
-  <div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: center;">
+
+  <div style="display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: center; background: rgba(4, 14, 31, 0.4); padding: 1rem 1.25rem; border-radius: var(--radius-sm); border: 1px solid var(--color-border);">
     <div>
       <form method="post" action="/admin/sync-all" style="margin: 0;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="btn btn-primary" {% if sync_status and sync_status.running %}disabled{% endif %}>&#8635; Run Full Sync (All Active Sources)</button>
+        <button type="submit" class="btn btn-primary" {% if sync_status and sync_status.running %}disabled{% endif %}>
+          <span class="htmx-indicator spinner"></span>
+          &#8635; Run Full Sync (All Active Sources)
+        </button>
       </form>
     </div>
     <div style="flex: 1; min-width: 320px;">
       <form method="post" action="/admin/sources/sync-target" style="display: flex; gap: 0.5rem; align-items: center; margin: 0;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <select name="source_id" required style="padding: 0.45rem 0.8rem; background: rgba(0,0,0,0.3); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); font-family: var(--font-mono); font-size: 0.85rem; flex: 1;">
+        <select name="source_id" required style="padding: 0.5rem 0.8rem; background: var(--color-surface-lowest); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); font-family: var(--font-mono); font-size: 0.85rem; flex: 1;">
           <option value="" disabled selected>-- Select single data source to sync --</option>
           {% for s in active %}
           <option value="{{ s.id }}">{{ s.name }} ({{ s.base_url }})</option>
           {% endfor %}
         </select>
-        <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>Sync Target</button>
+        <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>
+          <span class="htmx-indicator spinner"></span>
+          Sync Target
+        </button>
       </form>
     </div>
   </div>
@@ -40,23 +51,22 @@
   <table class="table">
     <thead>
       <tr>
-        <th>name</th>
-        <th>base_url</th>
-        <th class="col-sitemap">sitemap</th>
-        <th>include prefixes</th>
-        <th>exclude prefixes</th>
-        <th>max pages</th>
-        <th>proposed by</th>
-        <th>actions</th>
+        <th style="width: 14%;">name</th>
+        <th style="width: 26%;">base_url</th>
+        <th class="col-sitemap" style="width: 24%;">sitemap</th>
+        <th style="width: 10%;">include</th>
+        <th style="width: 8%;">max pages</th>
+        <th style="width: 10%;">proposed by</th>
+        <th style="width: 8%;">actions</th>
       </tr>
     </thead>
     <tbody>
       {% for s in pending %}
       {% set mismatch = sitemap_host_differs(s.sitemap, s.base_url) %}
       <tr>
-        <td>{{ s.name }}</td>
-        <td>{{ s.base_url }}</td>
-        <td class="col-sitemap{% if mismatch %} sitemap-mismatch{% endif %}">
+        <td><strong>{{ s.name }}</strong></td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem; word-break: break-all;">{{ s.base_url }}</td>
+        <td class="col-sitemap{% if mismatch %} sitemap-mismatch{% endif %}" style="font-family: var(--font-mono); font-size: 0.8rem; word-break: break-all;">
           {% if s.sitemap %}
             {{ s.sitemap }}
             {% if mismatch %}
@@ -66,9 +76,11 @@
             <span class="muted">(none &mdash; crawler falls back to BFS from base_url)</span>
           {% endif %}
         </td>
-        <td>{% if s.include_prefixes %}{{ s.include_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
-        <td>{% if s.exclude_prefixes %}{{ s.exclude_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}</td>
-        <td>{% if s.max_pages is not none %}{{ s.max_pages }}{% else %}<span class="muted">unlimited</span>{% endif %}</td>
+        <td style="font-size: 0.8rem;">
+          {% if s.include_prefixes %}{{ s.include_prefixes | join(", ") }}{% else %}<span class="muted">(none)</span>{% endif %}
+          {% if s.exclude_prefixes %}<br><span class="muted" style="font-size: 0.75rem;">excl: {{ s.exclude_prefixes | join(", ") }}</span>{% endif %}
+        </td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem;">{% if s.max_pages is not none %}{{ s.max_pages }}{% else %}<span class="muted">unlimited</span>{% endif %}</td>
         <td><span class="proposed-by">agent: {{ s.proposed_by or "unknown" }}</span></td>
         <td class="actions">
           <div class="btn-group">
@@ -91,19 +103,36 @@
 {% endif %}
 
 <div class="card">
-  <h2>Active sources</h2>
-  <p><a class="btn btn-primary" href="/admin/sources/new">+ add a source</a></p>
+  <div class="card-header">
+    <h2>Active sources</h2>
+    <a class="btn btn-primary" href="/admin/sources/new">+ Add Source</a>
+  </div>
+  
   <table class="table">
     <thead>
-      <tr><th>name</th><th>base_url</th><th>schedule</th><th>last synced</th><th>last status</th><th>actions</th></tr>
+      <tr>
+        <th style="width: 16%;">name</th>
+        <th style="width: 32%;">base_url</th>
+        <th style="width: 14%;">schedule</th>
+        <th style="width: 18%;">last synced</th>
+        <th style="width: 10%;">last status</th>
+        <th style="width: 10%;">actions</th>
+      </tr>
     </thead>
     <tbody>
       {% for s in active %}
       <tr>
-        <td><strong>{{ s.name }}</strong></td>
-        <td>{{ s.base_url }}</td>
-        <td>{{ s.schedule_cron or "(manual only)" }}{% if not s.enabled %} <span class="badge badge-warning">disabled</span>{% endif %}</td>
-        <td>{{ s.last_synced or "never" }}</td>
+        <td><strong style="color: var(--color-primary-tint); font-size: 0.9rem;">{{ s.name }}</strong></td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem; word-break: break-all;">
+          <a href="{{ s.base_url }}" target="_blank" rel="noopener" style="color: var(--color-text);">{{ s.base_url }}</a>
+        </td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem;">
+          {{ s.schedule_cron or "(manual only)" }}
+          {% if not s.enabled %}<br><span class="badge badge-warning">disabled</span>{% endif %}
+        </td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-muted);">
+          {{ s.last_synced or "never" }}
+        </td>
         <td>
           {% if sync_status and sync_status.running and (sync_status.source == s.name or sync_status.source_name == s.name) %}
             <span class="status-led status-led-syncing"></span>
@@ -124,7 +153,10 @@
             <a class="btn" href="/admin/sources/{{ s.id }}">edit</a>
             <form method="post" action="/admin/sources/{{ s.id }}/sync">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-              <button type="submit" class="btn">Sync now</button>
+              <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>
+                <span class="htmx-indicator spinner"></span>
+                Sync now
+              </button>
             </form>
             <form method="post" action="/admin/sources/{{ s.id }}/delete"
                   data-confirm-delete
@@ -137,7 +169,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted">no active sources yet.</td></tr>
+      <tr><td colspan="6" class="muted" style="text-align: center; padding: 2rem;">No active sources configured yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -145,15 +177,24 @@
 
 {% if rejected %}
 <div class="card">
-  <h2>Rejected</h2>
+  <div class="card-header">
+    <h2 style="color: var(--color-error);">Rejected Sources</h2>
+  </div>
   <table class="table">
-    <thead><tr><th>name</th><th>base_url</th><th>proposed by</th><th>actions</th></tr></thead>
+    <thead>
+      <tr>
+        <th style="width: 20%;">name</th>
+        <th style="width: 50%;">base_url</th>
+        <th style="width: 18%;">proposed by</th>
+        <th style="width: 12%;">actions</th>
+      </tr>
+    </thead>
     <tbody>
       {% for s in rejected %}
       <tr>
-        <td>{{ s.name }}</td>
-        <td>{{ s.base_url }}</td>
-        <td>{{ s.proposed_by or "-" }}</td>
+        <td><strong>{{ s.name }}</strong></td>
+        <td style="font-family: var(--font-mono); font-size: 0.8rem;">{{ s.base_url }}</td>
+        <td><span class="proposed-by">{{ s.proposed_by or "-" }}</span></td>
         <td class="actions">
           <div class="btn-group">
             <form method="post" action="/admin/sources/{{ s.id }}/delete"
@@ -172,4 +213,5 @@
 </div>
 {% endif %}
 {% endblock %}
+
 
