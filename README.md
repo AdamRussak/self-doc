@@ -28,12 +28,14 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 - [Why self-docs](#why-self-docs)
 - [Architecture](#architecture)
 - [Quickstart — Local Development](#quickstart--local-development)
+- [Go CLI & Progressive Disclosure Skill (`doc-cli`)](#go-cli--progressive-disclosure-skill-doc-cli)
 - [Quickstart — Production (Home-Lab + Traefik)](#quickstart--production-home-lab--traefik)
-- [MCP Tools](#mcp-tools)
+- [MCP Tools & REST Endpoints](#mcp-tools--rest-endpoints)
 - [Managing Sources](#managing-sources)
 - [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
+
 
 ---
 
@@ -65,11 +67,12 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
   Claude ──┼─ HTTP ──▶  │ Traefik │──▶│ FastMCP srv  │──┐
   Antigrav ┘  /mcp      └─────────┘   │ (search_docs,│  │ SQL
                                │      │  propose_    │  │
-                               │      │  doc_source) │  ▼
-  operator ── loopback ───────▶│      └──────────────┘ ┌────────┐
-  (/admin UI, 127.0.0.1:8080)  └─────▶│ Ingestion    │▶│ pg16 + │
-  internal scheduler ────────────────▶│ svc (FastAPI)│ │pgvector│
-  (opt-in, per-source cron)           └──────────────┘ └────────┘
+  doc-cli (Go CLI / Skill) ───▶│      │  doc_source) │  ▼
+  (/api/v1/search, /get)       │      └──────────────┘ ┌────────┐
+  operator ── loopback ───────▶│      │ Ingestion    │▶│ pg16 + │
+  (/admin UI, 127.0.0.1:8080)  └─────▶│ svc (FastAPI)│ │pgvector│
+  internal scheduler ────────────────▶└──────────────┘ └────────┘
+  (opt-in, per-source cron)
 ```
 
 | Layer | Technology |
@@ -77,8 +80,10 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 | Store | PostgreSQL 16 + pgvector 0.8.2 |
 | Embeddings | FastEmbed · `mixedbread-ai/mxbai-embed-large-v1` (default, selectable — see `config/models.yaml`) |
 | MCP server | FastMCP 3.x (streamable HTTP) |
-| Ingestion | FastAPI crawler + chunker + scheduler |
+| CLI & Skill | `doc-cli` Go binary + embedded progressive disclosure AI agent skill |
+| Ingestion & REST API | FastAPI crawler + chunker + scheduler + `/api/v1/*` progressive disclosure endpoints |
 | Ingress | Traefik (production overlay) |
+
 
 Source configuration (crawl targets, URL prefixes, schedule) lives in the
 `doc_sources` table — **not** a YAML file. Sources are managed through the
@@ -109,7 +114,46 @@ Point local MCP clients at `http://127.0.0.1:8081/mcp` (streamable HTTP). The
 server requires an `Authorization: Bearer <MCP_TOKEN>` header — see
 [Client Setup](docs/client-setup.md) for per-client configuration.
 
+## Go CLI & Progressive Disclosure Skill (`doc-cli`)
+
+`doc-cli` is a high-performance Go CLI and progressive disclosure skill that allows terminal AI agents (and human operators) to query self-docs efficiently over the REST API (`/api/v1/*`).
+
+```bash
+# Install binary (~/.local/bin/doc-cli) and register global AI skill (~/.gemini/config/skills/doc-cli/SKILL.md)
+make install
+```
+
+### Agent Progressive Disclosure Protocol (3-Step Workflow)
+
+<p align="center">
+  <img src="docs/assets/doc_cli_sequence_board.png" alt="doc-cli Progressive Disclosure Sequence Board Diagram" width="100%" />
+</p>
+
+1. **Search First (Token-Efficient Candidate Fetch)**:
+   ```bash
+   doc-cli search "fastapi dependency injection" --limit 3
+   ```
+   *Returns candidate chunk IDs, heading paths, relevance scores, and 1-line snippets.*
+
+2. **Inspect Candidate IDs**:
+   Agent evaluates the candidate IDs and heading paths returned.
+
+3. **Targeted Fetch by ID**:
+   ```bash
+   doc-cli get 42
+   ```
+   *Fetches exact markdown content for the specified chunk ID.*
+
+### Skill Diagnostics & Management
+
+```bash
+doc-cli skill status         # Check global/project skill installation and API health
+doc-cli skill install        # Install skill globally (~/.gemini/config/skills/doc-cli/SKILL.md)
+doc-cli skill install --project # Install skill locally (.agents/skills/doc-cli/SKILL.md)
+```
+
 ## Quickstart — Production (Home-Lab + Traefik)
+
 
 Deploy behind Traefik ingress on a home-lab server:
 
@@ -128,13 +172,24 @@ make sync                               # trigger the initial documentation sync
 > [MCP_TOKEN upgrade checklist](docs/runbook.md#deploy--upgrade--mcp_token-requirement-read-before-restarting-mcp-server)
 > in the runbook.
 
-## MCP Tools
+## MCP Tools & REST Endpoints
+
+### MCP Server Tools (Streamable HTTP)
 
 | Tool | Description |
 |------|-------------|
 | `search_docs(query, source?, limit?)` | Hybrid vector + full-text search over indexed docs |
 | `list_doc_sources()` | List indexed documentation sets with sync status |
 | `propose_doc_source(name, base_url, max_pages, ...)` | Propose a new source; lands as `pending` and stays uncrawlable until approved in the admin UI — never crawls itself |
+
+### Ingestion Service REST Endpoints (`/api/v1/*`)
+
+| Endpoint | Subcommand / Usage | Description |
+|----------|-------------------|-------------|
+| `GET /api/v1/search?q=<query>&limit=3` | `doc-cli search "<query>"` | Fast hybrid search returning candidate IDs, scores, and snippets (~50–150 tokens) |
+| `GET /api/v1/chunks/{id}` | `doc-cli get <id>` | Targeted retrieval returning full markdown content for a specific chunk |
+| `GET /api/v1/tree` | `doc-cli tree` | Hierarchy overview of indexed doc sources, page counts, and sync timestamps |
+
 
 ## Managing Sources
 

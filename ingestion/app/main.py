@@ -105,43 +105,9 @@ except Exception as e:  # noqa: BLE001 - any DB/connectivity failure is fatal at
     print(f"FATAL: could not load sources from the database: {e}", file=sys.stderr)
     raise SystemExit(1) from e
 
-# --- Opt-in YAML -> DB import (NEVER automatic) -----------------------------------------
-# `sources.yaml` -> `doc_sources` import (sources_repo.import_from_yaml) is a
-# one-way, EXPLICITLY opt-in seed/migration action — never automatic on
-# every boot. An automatic import would treat sources.yaml as authoritative
-# again and silently resurrect any source an admin had deliberately deleted
-# from doc_sources, since the yaml file has no record of that deletion. Set
-# IMPORT_SOURCES_YAML_ON_BOOT=1 to opt in (e.g. for a one-time migration
-# bootstrap); the default is to leave the database untouched.
-SOURCES_YAML = Path(
-    os.environ.get("SOURCES_YAML", str(Path(__file__).parent.parent / "config" / "sources.yaml"))
-)
-
-
-def _maybe_import_sources_yaml_on_boot() -> None:
-    """No-op unless `IMPORT_SOURCES_YAML_ON_BOOT=1` is set. Factored out of
-    the module-level try/except below so it's directly unit-testable without
-    a subprocess reimport."""
-    if os.environ.get("IMPORT_SOURCES_YAML_ON_BOOT") != "1":
-        return
-    conn = store.get_connection()
-    try:
-        result = sources_repo.import_from_yaml(conn, SOURCES_YAML)
-    finally:
-        conn.close()
-    logger.info(
-        "sources_yaml_imported_on_boot",
-        created=result.created,
-        updated=result.updated,
-        skipped=result.skipped,
-    )
-
-
-try:
-    _maybe_import_sources_yaml_on_boot()
-except Exception as e:  # noqa: BLE001 - an explicitly opted-in import failing is fatal too
-    print(f"FATAL: IMPORT_SOURCES_YAML_ON_BOOT import failed: {e}", file=sys.stderr)
-    raise SystemExit(1) from e
+# --- Database is sole source of truth for crawl config -----------------------------
+# doc_sources (the database) is the source of truth for crawl config (see sources_repo.py).
+# All source management occurs via Postgres and the admin API.
 
 # --- Dynamic re-read with a last-known-good cache for test observability ----------------
 # Startup (above) is fail-fast: an unreachable database at boot aborts the

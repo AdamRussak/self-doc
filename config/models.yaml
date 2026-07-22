@@ -22,14 +22,14 @@ default: mixedbread-ai/mxbai-embed-large-v1
 models:
   mixedbread-ai/mxbai-embed-large-v1:
     dim: 1024
-    mem_ingestion: "2g"
+    mem_ingestion: "3g"
     mem_mcp: "2g"
     query_prompt: "Represent this sentence for searching relevant passages: "
     passage_prompt: ""
 
   intfloat/multilingual-e5-large:
     dim: 1024
-    mem_ingestion: "2g"
+    mem_ingestion: "3g"
     mem_mcp: "2g"
     query_prompt: "query: "
     passage_prompt: "passage: "

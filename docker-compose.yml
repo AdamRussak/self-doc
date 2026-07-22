@@ -52,7 +52,6 @@ services:
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 2
-      SOURCES_YAML: /config/sources.yaml
       # Embedding model config — resolved by `make configure` into .env from
       # config/models.yaml. The defaults below mirror the registry default
       # (mixedbread-ai/mxbai-embed-large-v1) so `make up` works unconfigured.

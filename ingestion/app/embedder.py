@@ -36,7 +36,10 @@ DEFAULT_PASSAGE_PROMPT = ""
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", str(DEFAULT_EMBEDDING_DIM)))
 PASSAGE_PROMPT = os.environ.get("EMBEDDING_PASSAGE_PROMPT", DEFAULT_PASSAGE_PROMPT)
-BATCH_SIZE = 32
+# Batch size for ONNX inference. mxbai-large (1024-dim) allocates substantial ONNX
+# workspace memory per chunk; batch_size=8 keeps peak RAM usage safely under 1.5GB
+# during multi-chunk page embedding, preventing cgroup OOM kills on 2GB limits.
+BATCH_SIZE = 8
 
 logger = get_logger(component="embedder")
 

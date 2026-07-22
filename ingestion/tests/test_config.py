@@ -10,35 +10,14 @@ def write_yaml(tmp_path: Path, text: str) -> Path:
     p = tmp_path / "sources.yaml"
     p.write_text(text)
     return p
-
-
-def test_seed_sources_yaml_loads(tmp_path):
-    seed = Path(__file__).parent.parent / "config" / "sources.yaml"
-    sources = load_sources(seed)
-    names = {s.name for s in sources}
-    # Exact set equality is intentional: this file is bind-mounted and
-    # runtime-mutable, so an accidental deletion or typo in a source name
-    # must fail this test loudly. Adding a source is a deliberate two-file
-    # change (this assertion + sources.yaml), not friction to avoid.
-    assert names == {
-        "fastapi",
-        "nextjs",
-        "pgvector-readme",
-        "appwrite",
-        "traefik",
-        "docker-compose",
-        "structlog",
-        "pydantic",
-        "mcp",
-    }
-    # The per-source invariants below check config correctness (each source
-    # is well-formed), not the presence/absence of any particular source.
-    for s in sources:
-        assert s.max_pages > 0
-        assert s.rate_limit_rps > 0
-        assert s.language == "english"
-
-
+def test_load_sources_from_yaml(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        "sources:\n  - name: fastapi\n    base_url: https://fastapi.tiangolo.com/\n    max_pages: 10\n",
+    )
+    sources = load_sources(p)
+    assert len(sources) == 1
+    assert sources[0].name == "fastapi"
 def test_valid_minimal_source(tmp_path):
     p = write_yaml(
         tmp_path,

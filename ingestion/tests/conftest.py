@@ -78,6 +78,8 @@ _ALLOW_REAL_DNS_HOSTS = (
     "googleapis.com",
     "python.org",
     "pypi.org",
+    "amazonaws.com",
+    "cloudfront.net",
     "localhost",
 )
 

@@ -171,18 +171,6 @@ def test_sync_requires_bearer_auth(app_module):
     assert "running" in resp.json()
 
 
-def test_sources_yaml_constant_still_resolves_for_opt_in_import(app_module):
-    """`get_sources()`/`get_sources_by_name()` no longer read sources.yaml —
-    `doc_sources` is authoritative (see module docstring). `SOURCES_YAML`
-    survives only as the path used by the opt-in
-    `IMPORT_SOURCES_YAML_ON_BOOT` migration path
-    (`_maybe_import_sources_yaml_on_boot`); assert the constant still
-    resolves to a real file so that opt-in path isn't quietly broken by a
-    future refactor."""
-    assert "SOURCES_YAML" not in os.environ
-    assert app_module.SOURCES_YAML.exists()
-    assert app_module.SOURCES_YAML.name == "sources.yaml"
-
 
 def test_health_ok(app_module):
     client = TestClient(app_module.app)

@@ -76,6 +76,11 @@ jobs:
           python -m pip install --quiet pyyaml
           make configure MODEL=BAAI/bge-small-en-v1.5
 
+      - name: Pre-download embedding model weights for CI
+        run: |
+          python -m pip install --quiet fastembed
+          python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+
       - name: Init database schema
         run: |
           # Apply both init files, matching scripts/migrate.sh's production
