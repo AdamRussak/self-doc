@@ -372,6 +372,173 @@ def test_off_host_child_sitemap_is_never_fetched():
     assert not any("169.254.169.254" in u for u in requested)
 
 
+# --- llms.txt INDEX vs full-content routing -----------------------------
+
+LLMS_INDEX = """# Example Docs
+
+> Summary of the project.
+
+## Guides
+- [Quickstart](https://example.com/docs/quickstart): get started
+- [Configuration](https://example.com/docs/config)
+- [API](https://example.com/docs/api)
+"""
+
+LLMS_FULL = """# Quickstart
+
+Real documentation prose describing how to install and use the package across
+several sentences of genuine content that is clearly not a list of links.
+
+## Configuration
+
+More prose about configuration options, again long enough to read as content.
+"""
+
+
+def test_llms_index_is_crawled_as_html_not_ingested_as_content():
+    """Regression: a site serving `/llms.txt` (a link INDEX) but no
+    `/llms-full.txt` must have its linked pages FETCHED as HTML, not have the
+    index link-list ingested verbatim as content."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url.endswith("/llms-full.txt"):
+            return httpx.Response(404, text="not found")
+        if url.endswith("/llms.txt"):
+            return httpx.Response(200, text=LLMS_INDEX)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+
+    # Each linked doc page is yielded as an HTML item (html set, markdown absent),
+    # so downstream extraction runs on the real page — NOT the index link-list.
+    assert [p["url"] for p in pages] == [
+        "https://example.com/docs/quickstart",
+        "https://example.com/docs/config",
+        "https://example.com/docs/api",
+    ]
+    for p in pages:
+        assert p["fetch_ok"] is True
+        assert "html" in p and p["html"] == PAGE_HTML
+        assert "markdown" not in p
+    # The pages were actually fetched over HTTP.
+    assert "https://example.com/docs/quickstart" in requested
+
+
+def test_llms_index_links_filtered_by_include_prefixes():
+    """Index-derived URLs are scoped by include/exclude prefixes, like sitemap
+    discovery — an out-of-scope link is not crawled."""
+    index = (
+        "# Docs\n\n## S\n"
+        "- [in](https://example.com/docs/in)\n"
+        "- [out](https://example.com/blog/out)\n"
+        "- [also](https://example.com/docs/also)\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url.endswith("/llms-full.txt"):
+            return httpx.Response(404, text="nope")
+        if url.endswith("/llms.txt"):
+            return httpx.Response(200, text=index)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/docs/",
+        include_prefixes=["/docs/"],
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert [p["url"] for p in pages] == [
+        "https://example.com/docs/in",
+        "https://example.com/docs/also",
+    ]
+
+
+def test_llms_full_content_still_yields_markdown_sections():
+    """A real `/llms-full.txt` is still split into already-extracted markdown
+    sections (the fast path), not crawled page-by-page."""
+    fetched_pages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url.endswith("/llms-full.txt"):
+            return httpx.Response(200, text=LLMS_FULL)
+        fetched_pages.append(url)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="auto",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert pages, "expected llms-full sections"
+    for p in pages:
+        assert "markdown" in p and p["markdown"]
+        assert "html" not in p
+    # No individual doc pages were HTTP-fetched — the full file was the source.
+    assert fetched_pages == []
+
+
+def test_llms_only_with_index_crawls_links_not_bfs():
+    """`llms_txt="only"` + an index: crawl exactly the index's links, and do
+    NOT fall back to a BFS crawl of the site."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url.endswith("/llms-full.txt"):
+            return httpx.Response(404, text="nope")
+        if url.endswith("/llms.txt"):
+            return httpx.Response(200, text=LLMS_INDEX)
+        # A page whose HTML links elsewhere — BFS would follow these.
+        return httpx.Response(
+            200,
+            text='<html><body><a href="https://example.com/other/x">x</a>content</body></html>',
+        )
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="only",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    urls = [p["url"] for p in pages]
+    # Only the three index links, no BFS-discovered /other/x.
+    assert urls == [
+        "https://example.com/docs/quickstart",
+        "https://example.com/docs/config",
+        "https://example.com/docs/api",
+    ]
+
+
 def test_crawl_is_generator_and_preserves_fetch_ok_false_contract():
     """Both load-bearing invariants asserted together: crawl() stays a
     generator (memory bounding / per-page commit), and an attempted-but-

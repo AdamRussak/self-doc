@@ -417,12 +417,23 @@ def crawl(
     yielded instead of re-fetching/re-extracting.
 
     When `source.llms_txt` is `"auto"` or `"only"`, `crawl` first tries the
-    llmstxt.org convention (`llms-full.txt`/`llms.txt`) via `llms_txt`. If a
-    file is discovered, its sections are yielded as
-    `{"url", "markdown", "heading_path", "fetch_ok": True}` items (capped at
-    `source.max_pages`) and the generator returns — the sitemap/BFS HTML
-    crawl is skipped entirely. If no file is found: `"auto"` falls through to
-    the normal HTML crawl; `"only"` yields nothing. If `conditional` carries a
+    llmstxt.org convention (`llms-full.txt`/`llms.txt`) via `llms_txt`. The two
+    file types are handled differently:
+
+      - FULL CONTENT (`llms-full.txt`, or an `llms.txt` that is actually full
+        prose): split into sections yielded as
+        `{"url", "markdown", "heading_path", "fetch_ok": True}` items (capped at
+        `source.max_pages`); the generator then returns.
+      - INDEX (an `llms.txt` that is a list of links to the docs — detected via
+        `llms_txt.looks_like_index`): the linked page URLs are extracted and
+        crawled as normal HTML pages below (each yielded as an
+        `{"url", "html", "fetch_ok": True}` item), NOT ingested as content.
+        Ingesting the link list verbatim would make the corpus link-list
+        metadata instead of documentation.
+
+    If no file is found: `"auto"` falls through to the normal sitemap/BFS HTML
+    crawl; `"only"` yields nothing (but `"only"` DOES crawl an index's links,
+    since those are what llms.txt points at). If `conditional` carries a
     validator for the llms-index URL and it 304s, a single sentinel
     `{"kind": "llms_index_unchanged", "url", "not_modified": True,
     "fetch_ok": True}` is yielded and the generator returns.
@@ -453,6 +464,11 @@ def crawl(
 
         pages_fetched = 0
         visited: set[str] = set()
+
+        # When llms.txt discovery finds an INDEX (a list of links rather than
+        # full content), these are the page URLs it points at — crawled below
+        # via the normal HTML path instead of being ingested as content.
+        llms_index_urls: list[str] | None = None
 
         if source.llms_txt in ("auto", "only"):
             parsed_base = urlparse(base_url)
@@ -489,29 +505,64 @@ def crawl(
 
             if discovered is not None:
                 index_url, llms_text = discovered
-                limiter.wait()
-                sections = llms_txt.split_llms_full(llms_text, index_url)
-                llms_count = 0
-                for section in sections:
-                    if llms_count >= source.max_pages:
-                        break
-                    yield {
-                        "url": section["url"],
-                        "markdown": section["markdown"],
-                        "heading_path": section["heading_path"],
-                        "fetch_ok": True,
-                    }
-                    llms_count += 1
-                log.info("crawl_complete", pages_fetched=llms_count, mode="llms_txt")
-                return
-            if source.llms_txt == "only":
+                if llms_txt.looks_like_index(llms_text):
+                    # `/llms.txt` INDEX: a list of links to the real docs, NOT
+                    # content. Extract the linked page URLs and crawl each as a
+                    # normal HTML page below (so it runs through extract.extract
+                    # and yields real body text) — ingesting the index verbatim
+                    # is the "corpus is only link-list metadata" bug this fixes.
+                    parsed = llms_txt.parse_llms_index(llms_text, base_url)
+                    if parsed:
+                        llms_index_urls = parsed
+                        log.info("llms_index_discovered", url=index_url, links=len(parsed))
+                    else:
+                        log.info("llms_index_empty", url=index_url)
+                else:
+                    # `/llms-full.txt` (or an llms.txt that is actually full
+                    # content): split into per-section markdown and yield as
+                    # already-extracted content.
+                    limiter.wait()
+                    sections = llms_txt.split_llms_full(llms_text, index_url)
+                    llms_count = 0
+                    for section in sections:
+                        if llms_count >= source.max_pages:
+                            break
+                        yield {
+                            "url": section["url"],
+                            "markdown": section["markdown"],
+                            "heading_path": section["heading_path"],
+                            "fetch_ok": True,
+                        }
+                        llms_count += 1
+                    log.info("crawl_complete", pages_fetched=llms_count, mode="llms_txt")
+                    return
+
+            if llms_index_urls is None and source.llms_txt == "only":
+                # "only" means don't fall back to a full HTML BFS crawl. With no
+                # full-content file and no usable index, there is nothing to do.
                 log.info("crawl_complete", pages_fetched=0, mode="llms_txt")
                 return
-            # source.llms_txt == "auto" and nothing discovered: fall through
-            # to the normal sitemap/BFS HTML crawl below.
+            # Otherwise fall through to the HTML crawl below: seeded with the
+            # index's URLs when we have them (both "auto" and "only"), or — for
+            # "auto" with nothing discovered — the normal sitemap/BFS path.
 
         candidate_urls: list[str] | None = None
-        if source.sitemap and not _same_host(str(source.sitemap), base_url):
+        if llms_index_urls is not None:
+            # Crawl exactly the pages the llms.txt index lists — filtered to
+            # same-host + include/exclude prefixes and capped to max_pages,
+            # mirroring sitemap discovery — instead of a sitemap/BFS crawl. Each
+            # URL is still re-validated (host/scope/private/robots) in `_visit`.
+            filtered: list[str] = []
+            for u in llms_index_urls:
+                if not _same_host(u, base_url):
+                    continue
+                if not _allowed(urlparse(u).path, source.include_prefixes, source.exclude_prefixes):
+                    continue
+                if u not in filtered:
+                    filtered.append(u)
+            candidate_urls = filtered[: source.max_pages]
+            log.info("llms_index_candidates", count=len(candidate_urls))
+        elif source.sitemap and not _same_host(str(source.sitemap), base_url):
             # Defence in depth: SourceConfig already rejects an off-host
             # sitemap (H1). This catches a SourceConfig built via
             # `model_construct` or mutated after validation.

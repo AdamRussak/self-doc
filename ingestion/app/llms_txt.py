@@ -14,7 +14,7 @@ constructed here) so it is trivially unit-testable with a fake/mock client.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from .logging_config import get_logger
 
@@ -28,6 +28,12 @@ _FENCE_RE = re.compile(r"^```")
 _MD_LINK_RE = re.compile(r"^\[([^\]]*)\]\(([^)]+)\)$")
 _SOURCE_LINE_RE = re.compile(r"^Source:\s*(https?://\S+)", re.IGNORECASE)
 _SLUG_NONALNUM_RE = re.compile(r"[^a-z0-9]+")
+# An llms.txt INDEX lists documentation pages as markdown link bullets, e.g.
+#   - [Quickstart](https://x.io/docs/quickstart): get started fast
+# Match such a bullet and capture its URL. Unlike `_MD_LINK_RE` this is NOT
+# whole-line anchored: index bullets carry a leading `-`/`*` marker and an
+# optional trailing `: description`.
+_INDEX_LINK_ITEM_RE = re.compile(r"^\s*[-*]\s*\[[^\]]*\]\(([^)]+)\)")
 
 
 def discover(
@@ -90,6 +96,82 @@ def discover(
         return url, text
 
     return None
+
+
+def _content_lines(text: str) -> list[str]:
+    """Non-blank, non-heading lines outside fenced code blocks. Used to judge
+    whether a file is an index (mostly link bullets) or full prose/code."""
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence or not stripped or stripped.startswith("#"):
+            continue
+        out.append(stripped)
+    return out
+
+
+def looks_like_index(text: str) -> bool:
+    """True if `text` is an llms.txt INDEX (a list of links to the real docs)
+    rather than `/llms-full.txt` full content.
+
+    Per the llmstxt.org convention, `/llms.txt` is a curated index: an H1/H2
+    outline whose body is markdown link bullets (`- [Title](url): note`), while
+    `/llms-full.txt` is the concatenated documentation prose. This distinction
+    matters because an index must be CRAWLED (fetch each linked page), never
+    ingested verbatim — otherwise the corpus becomes a list of links with no
+    actual documentation content.
+
+    Heuristic: an index is dominated by link bullets. If at least half of the
+    content lines (excluding headings/blank/code) are markdown link bullets AND
+    there are several of them, it is an index. A full-content file has prose and
+    code between its headings, so its link-bullet ratio is low.
+    """
+    content = _content_lines(text)
+    if not content:
+        return False
+    link_bullets = sum(1 for line in content if _INDEX_LINK_ITEM_RE.match(line))
+    # Require a real list (>=3 bullets) that is the majority of the content, so
+    # a full-content page that merely happens to contain a couple of bullet
+    # links is not misclassified as an index.
+    return link_bullets >= 3 and link_bullets / len(content) >= 0.5
+
+
+def parse_llms_index(text: str, base_url: str) -> list[str]:
+    """Extract the documentation page URLs an llms.txt index links to.
+
+    Returns absolute, order-preserving, de-duplicated URLs (relative links are
+    resolved against `base_url`). Fragment-only or non-http(s) targets are
+    dropped. Host/scope/private-address filtering is deliberately left to the
+    crawler's per-URL `_visit` guards, mirroring how sitemap discovery hands
+    raw candidate URLs to the same gate.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _FENCE_RE.match(stripped):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = _INDEX_LINK_ITEM_RE.match(line)
+        if not m:
+            continue
+        target = m.group(1).strip()
+        if not target or target.startswith("#"):
+            continue
+        absolute = urljoin(base_url, target)
+        if not absolute.lower().startswith(("http://", "https://")):
+            continue
+        if absolute not in seen:
+            seen.add(absolute)
+            urls.append(absolute)
+    return urls
 
 
 def _slugify(title: str) -> str:
