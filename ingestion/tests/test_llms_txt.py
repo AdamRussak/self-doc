@@ -27,52 +27,23 @@ def test_discover_returns_none_on_404():
     assert discover(client, "https://example.com/") is None
 
 
-def test_discover_returns_none_when_over_max_bytes():
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        if url == "https://example.com/llms-full.txt":
-            return httpx.Response(200, text="x" * 100)
-        return httpx.Response(404)
-
-    client = make_client(handler)
-    assert discover(client, "https://example.com/", max_bytes=10) is None
-
-
-def test_discover_aborts_download_once_over_cap():
-    """The oversized body must be abandoned mid-stream, not fully downloaded and
-    then discarded — otherwise a 24MB llms-full.txt costs a 24MB transfer just
-    to be rejected."""
-    consumed = {"chunks": 0}
-
-    def body_gen():
-        for _ in range(1000):  # up to 1000 * 1KB = 1MB if fully read
-            consumed["chunks"] += 1
-            yield b"x" * 1024
+def test_discover_has_no_size_limit():
+    """There is no size cap: a large llms-full.txt is fetched in full (real
+    files are legitimately large, e.g. anthropic's ~24MB)."""
+    big = "# Full\n" + ("word " * 500_000)  # ~2.5MB
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url.endswith("/llms-full.txt"):
-            return httpx.Response(200, content=body_gen())
+            return httpx.Response(200, text=big)
         return httpx.Response(404)
 
     client = make_client(handler)
-    result = discover(client, "https://example.com/", max_bytes=5_000)  # 5KB cap
-    assert result is None
-    # Stopped shortly after crossing 5KB (~6 chunks), not the whole 1000.
-    assert consumed["chunks"] < 20
-
-
-def test_discover_accepts_body_at_the_cap_boundary():
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        if url.endswith("/llms-full.txt"):
-            return httpx.Response(200, text="# T\n" + "y" * 96)  # exactly 100 bytes
-        return httpx.Response(404)
-
-    client = make_client(handler)
-    result = discover(client, "https://example.com/", max_bytes=100)
+    result = discover(client, "https://example.com/")
     assert result is not None
-    assert result[0].endswith("/llms-full.txt")
+    url, text = result
+    assert url.endswith("/llms-full.txt")
+    assert len(text) == len(big)  # whole body returned, nothing truncated
 
 
 def test_discover_prefers_llms_full_over_llms_txt():

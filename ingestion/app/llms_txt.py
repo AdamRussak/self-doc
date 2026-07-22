@@ -41,22 +41,18 @@ def discover(
     base_url: str,
     *,
     prefer_full: bool = True,
-    max_bytes: int = 10_000_000,
 ) -> tuple[str, str] | None:
     """Try to fetch `/llms-full.txt` then `/llms.txt` (or the reverse order
     when `prefer_full=False`) at `base_url`'s origin.
 
-    Returns `(fetched_url, text)` for the first response that is status 200,
-    has a non-empty body, and is within `max_bytes`. Returns `None` if
-    neither candidate qualifies.
+    Returns `(fetched_url, text)` for the first response that is status 200
+    with a non-empty body. There is NO size limit — the full file is fetched
+    however large it is (llms-full.txt files are legitimately large). Returns
+    `None` if neither candidate qualifies.
 
-    The body is streamed and the download is ABORTED as soon as it exceeds
-    `max_bytes`, so an oversized file (e.g. a 24MB `/llms-full.txt`) is not
-    fully downloaded only to be discarded.
-
-    NEVER raises: any httpx error, oversize body, empty body, or non-200
-    status is treated as "skip this candidate" (and, if both candidates are
-    exhausted, "skip this source" — return None) rather than propagating.
+    NEVER raises: any httpx error, empty body, or non-200 status is treated as
+    "skip this candidate" (and, if both candidates are exhausted, "skip this
+    source" — return None) rather than propagating.
     """
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -68,7 +64,7 @@ def discover(
     log = logger.bind(base_url=base_url)
 
     for url in candidates:
-        text = _fetch_capped(client, url, max_bytes, log)
+        text = _fetch_body(client, url, log)
         if text is None:
             continue
         log.info("llms_txt_discovered", url=url, size=len(text))
@@ -77,43 +73,18 @@ def discover(
     return None
 
 
-def _fetch_capped(client, url: str, max_bytes: int, log) -> str | None:
-    """GET `url`, streaming the body and aborting the download once it exceeds
-    `max_bytes`. Returns the decoded text, or None to skip this candidate
-    (non-200, empty, oversize, or any error — discovery is best-effort and
-    never raises).
-
-    Streaming (rather than `client.get(...).content`) is what makes the
-    `max_bytes` guard cheap: a huge `/llms-full.txt` is stopped mid-transfer
-    instead of being pulled into memory in full and then thrown away.
-    """
-    chunks: list[bytes] = []
-    encoding = "utf-8"
+def _fetch_body(client, url: str, log) -> str | None:
+    """GET `url` and return its decoded text, or None to skip this candidate
+    (non-200, empty, or any error — discovery is best-effort and never raises)."""
     try:
-        with client.stream("GET", url, headers={"User-Agent": USER_AGENT}, timeout=15) as resp:
-            if resp.status_code != 200:
-                log.info("llms_txt_non_200", url=url, status=resp.status_code)
-                return None
-            total = 0
-            for chunk in resp.iter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    log.info("llms_txt_too_large", url=url, size_at_least=total, max_bytes=max_bytes)
-                    return None
-                chunks.append(chunk)
-            encoding = resp.encoding or "utf-8"
+        resp = client.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
     except Exception as e:  # noqa: BLE001 - discovery is best-effort, never raises
         log.info("llms_txt_fetch_failed", url=url, error=str(e))
         return None
-
-    body = b"".join(chunks)
-    if not body:
-        log.info("llms_txt_empty", url=url)
+    if resp.status_code != 200:
+        log.info("llms_txt_non_200", url=url, status=resp.status_code)
         return None
-    try:
-        text = body.decode(encoding, errors="replace")
-    except LookupError:
-        text = body.decode("utf-8", errors="replace")
+    text = resp.text
     if not text.strip():
         log.info("llms_txt_empty", url=url)
         return None
