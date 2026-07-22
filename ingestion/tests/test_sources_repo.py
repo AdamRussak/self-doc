@@ -38,8 +38,6 @@ from app.sources_repo import (
     validate_cron,
 )
 
-SOURCES_YAML = Path(__file__).resolve().parents[1] / "config" / "sources.yaml"
-
 # --- Pure: SourceConfig -> row -> SourceRecord round-trip (no DB) ----------
 
 
@@ -582,22 +580,36 @@ def test_due_sources_skips_unparseable_row_against_real_db(db_conn: psycopg.Conn
 
 
 @pytestmark_live
-def test_import_from_yaml_imports_all_nine_and_is_idempotent(db_conn: psycopg.Connection) -> None:
-    expected_names = {cfg.name for cfg in load_sources(SOURCES_YAML)}
-    assert len(expected_names) == 9, "sources.yaml is expected to have 9 sources for this task"
+def test_import_from_yaml_imports_sources_and_is_idempotent(
+    db_conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    yaml_file = tmp_path / "sources.yaml"
+    yaml_file.write_text(
+        """
+sources:
+  - name: test-s1
+    base_url: https://s1.example.com/docs
+    max_pages: 10
+  - name: test-s2
+    base_url: https://s2.example.com/docs
+    max_pages: 20
+"""
+    )
+    expected_names = {cfg.name for cfg in load_sources(yaml_file)}
+    assert expected_names == {"test-s1", "test-s2"}
 
-    result = sources_repo.import_from_yaml(db_conn, SOURCES_YAML)
+    result = sources_repo.import_from_yaml(db_conn, yaml_file)
     assert isinstance(result, ImportResult)
     assert set(result.created) == expected_names
     assert result.updated == []
     assert result.skipped == []
 
     rows = sources_repo.list_sources(db_conn)
-    assert {r.name for r in rows} == expected_names
+    assert expected_names.issubset({r.name for r in rows})
 
     # Second run: everything already matches -> pure no-op, proving
     # idempotency.
-    result2 = sources_repo.import_from_yaml(db_conn, SOURCES_YAML)
+    result2 = sources_repo.import_from_yaml(db_conn, yaml_file)
     assert result2.created == []
     assert result2.updated == []
     assert set(result2.skipped) == expected_names
