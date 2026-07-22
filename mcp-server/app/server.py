@@ -88,7 +88,7 @@ def list_doc_sources() -> str:
 def propose_doc_source(
     name: str,
     base_url: str,
-    max_pages: int,
+    max_pages: int | None = None,
     sitemap: str | None = None,
     include_prefixes: list[str] | None = None,
     exclude_prefixes: list[str] | None = None,
@@ -100,9 +100,11 @@ def propose_doc_source(
     and approve in the admin UI before anything is ever crawled. Do not tell
     the user their docs are "being indexed" — tell them the proposal is
     queued for human approval. `name` must match ^[a-z0-9-]+$ and be unique;
-    `base_url`/`sitemap` must be valid http(s) URLs; `max_pages` and
-    `rate_limit_rps` must be positive. Rejected (with a clear reason) on
-    invalid input or a name that is already taken, pending or not."""
+    `base_url`/`sitemap` must be valid http(s) URLs; `rate_limit_rps` must be
+    positive. `max_pages` is OPTIONAL — omit it (or pass null) to crawl all
+    in-scope pages with no page limit; if given it must be positive. Rejected
+    (with a clear reason) on invalid input or a name that is already taken,
+    pending or not."""
     token = get_access_token()
     if token is None:
         # Should not happen in practice: every /mcp request is already

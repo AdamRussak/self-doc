@@ -8,7 +8,7 @@ Schema (per IMPLEMENTATION_PLAN.md §2 `sources.yaml` schema):
         sitemap: https://fastapi.tiangolo.com/sitemap.xml   # optional
         include_prefixes: ["/tutorial/", "/reference/"]      # optional allowlist
         exclude_prefixes: ["/blog/", "/release-notes/"]      # optional denylist (wins)
-        max_pages: 500              # required
+        max_pages: 500              # optional — omit for no page limit (crawl all in-scope pages)
         language: english           # optional, default english
         rate_limit_rps: 1.0         # optional, default 1.0
 
@@ -99,7 +99,7 @@ class SourceConfig(BaseModel):
     sitemap: HttpUrl | None = None
     include_prefixes: list[str] = Field(default_factory=list)
     exclude_prefixes: list[str] = Field(default_factory=list)
-    max_pages: int = Field(gt=0)
+    max_pages: int | None = Field(default=None, gt=0)
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"

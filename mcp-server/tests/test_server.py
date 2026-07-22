@@ -320,6 +320,24 @@ def test_propose_source_valid_inserts_exactly_one_pending_row(monkeypatch):
     assert params["name"] == "my-new-source"
 
 
+def test_propose_source_accepts_optional_max_pages_none(monkeypatch):
+    # max_pages is optional (None => no page limit): a proposal without it is
+    # valid and writes NULL for max_pages.
+    calls = []
+
+    def on_execute(sql, params):
+        calls.append((sql, params))
+        return {"id": 7}
+
+    _install_fake_pool(monkeypatch, on_execute)
+
+    source_id = retrieval.propose_source(**_valid_kwargs(max_pages=None))
+    assert source_id == 7
+    assert len(calls) == 1
+    _, params = calls[0]
+    assert params["max_pages"] is None
+
+
 def test_propose_source_invalid_config_inserts_nothing(monkeypatch):
     calls = []
     _install_fake_pool(monkeypatch, lambda sql, params: calls.append((sql, params)))

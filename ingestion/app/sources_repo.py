@@ -189,7 +189,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         sitemap=sitemap,
         include_prefixes=list(include_prefixes) if include_prefixes is not None else [],
         exclude_prefixes=list(exclude_prefixes) if exclude_prefixes is not None else [],
-        max_pages=max_pages if (max_pages is not None and max_pages > 0) else 100,
+        max_pages=max_pages,  # None means "no page limit" (optional)
         language=language or "english",
         rate_limit_rps=rate_limit_rps if (rate_limit_rps is not None and rate_limit_rps > 0) else 1.0,
         llms_txt=llms_txt if llms_txt else "auto",

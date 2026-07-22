@@ -35,8 +35,8 @@
       <label for="exclude_prefixes">exclude_prefixes (one per line, optional &mdash; always wins over include)</label>
       <textarea id="exclude_prefixes" name="exclude_prefixes" rows="3">{{ values.exclude_prefixes or '' }}</textarea>
 
-      <label for="max_pages">max_pages</label>
-      <input type="number" id="max_pages" name="max_pages" min="1" required value="{{ values.max_pages or '' }}">
+      <label for="max_pages">max_pages <span class="muted">(optional — leave blank for no limit)</span></label>
+      <input type="number" id="max_pages" name="max_pages" min="1" placeholder="no limit" value="{{ values.max_pages or '' }}">
 
       <label for="language">language</label>
       <select id="language" name="language">

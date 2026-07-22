@@ -197,11 +197,10 @@ def test_cfg_matches_record_true_when_llms_txt_also_matches() -> None:
 # --- SourceConfig rejects invalid input on both create and update paths ----
 
 
-def test_invalid_config_rejected_missing_max_pages() -> None:
-    with pytest.raises(Exception):
-        SourceConfig.model_validate(
-            {"name": "bad", "base_url": "https://example.com/"}
-        )  # max_pages is required (gt=0, no default)
+def test_missing_max_pages_is_accepted_and_none() -> None:
+    # max_pages is optional (None => no page limit).
+    cfg = SourceConfig.model_validate({"name": "ok", "base_url": "https://example.com/"})
+    assert cfg.max_pages is None
 
 
 def test_invalid_config_rejected_bad_name_pattern() -> None:
