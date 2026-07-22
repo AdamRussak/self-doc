@@ -25,13 +25,11 @@
 -- fresh-volume schema looks like" and "what the live db was migrated to" —
 -- exactly the bug class this file exists to avoid.
 --
--- max_pages is intentionally left NULLABLE here: the pydantic SourceConfig
--- model (ingestion/app/config.py) is what enforces `max_pages` is required
--- and > 0 on every write path (sync/propose). Enforcing NOT NULL at the SQL
--- layer would break the 9 existing rows that predate this column with no
--- backfill value to give them. This split (permissive schema + strict
--- application-layer validation) is deliberate — do not "fix" it by adding a
--- NOT NULL constraint here.
+-- max_pages is NULLABLE and NULL is meaningful: it means "no page limit"
+-- (crawl all in-scope pages). The pydantic SourceConfig model
+-- (ingestion/app/config.py) makes `max_pages` OPTIONAL and, when provided,
+-- enforces it is > 0 on every write path (sync/propose). Do not add a
+-- NOT NULL constraint here — a NULL is a valid, intentional "unlimited".
 
 ALTER TABLE doc_sources
     ADD COLUMN IF NOT EXISTS sitemap            TEXT,

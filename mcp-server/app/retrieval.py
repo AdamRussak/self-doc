@@ -397,7 +397,7 @@ class ProposedSourceConfig(BaseModel):
     sitemap: HttpUrl | None = None
     include_prefixes: list[str] = Field(default_factory=list)
     exclude_prefixes: list[str] = Field(default_factory=list)
-    max_pages: int = Field(gt=0)
+    max_pages: int | None = Field(default=None, gt=0)
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"
@@ -507,7 +507,7 @@ def propose_source(
     *,
     name: str,
     base_url: str,
-    max_pages: int,
+    max_pages: int | None = None,
     sitemap: str | None = None,
     include_prefixes: list[str] | None = None,
     exclude_prefixes: list[str] | None = None,
