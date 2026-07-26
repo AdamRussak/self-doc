@@ -51,11 +51,13 @@ from . import admin, metrics, scheduler, security, sources_repo, store
 from .logging_config import get_logger
 from .metrics import (
     CHUNKS_INDEXED,
+    PAGES_FAILED,
     PAGES_FETCHED,
     PAGES_NOT_MODIFIED,
     PAGES_SKIPPED,
     PAGES_SOFT_FAILED,
     SYNC_DURATION,
+    SYNC_LAST_STATUS,
     SYNC_LAST_SUCCESS,
 )
 from .sources_repo import SourceRecord

@@ -1086,11 +1086,13 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
 
 ## Alerting — Prometheus rules (`ops/alerts/ingestion.yml`)
 
-Five alerting rules over the seven `/metrics` series from
+Five alerting rules over the `/metrics` series from
 `ingestion/app/metrics.py` (`pages_fetched_total`,
 `pages_skipped_unchanged_total`, `pages_not_modified_total`,
-`pages_soft_failed_total`, `chunks_indexed_total`, `sync_duration_seconds`,
-`sync_last_success_timestamp`), all labelled `source`. Load them into
+`pages_soft_failed_total`, `pages_failed_total`, `chunks_indexed_total`,
+`sync_duration_seconds`, `sync_last_success_timestamp`, and
+`sync_last_status` — the last one labelled `source` + `status`, the rest
+labelled `source` only). Load them into
 Prometheus via the usual `rule_files:` entry in `prometheus.yml` (not wired
 into this repo's compose files yet — add
 `ops/alerts/ingestion.yml` to your Prometheus instance's `rule_files:` to
@@ -1127,22 +1129,25 @@ still catching "hasn't synced in 2+ days."
 
 ### Alert: SourceSyncDegraded
 
-Fires when a source's total successfully-processed page volume (fetched +
-hash-skipped + 304-not-modified) drops by more than half, run-over-run, on
-**two consecutive runs** (`for: 15m`). This is a **proxy**, not a literal
-"status == partial" check: `ingestion/app/metrics.py` does not export a
-`pages_failed_total` counter today, so Prometheus has no direct visibility
-into hard-failure counts or `last_status`. A sustained volume collapse is the
-closest available stand-in for repeated `partial` reports. See the rule
-file's own comment for the full rationale, and treat "add a
-`pages_failed_total` counter" as a follow-up if this proxy proves noisy or
-insufficiently sensitive in practice.
+Fires when `sync_last_status{status="partial"} == 1` for a source (`for:
+15m`) — a **direct** read of `classify_sync`'s verdict for that source's most
+recently completed sync, not a proxy: `ingestion/app/metrics.py`'s
+`record_sync_outcome` sets `sync_last_status{source, status}` to 1 for the
+current status and removes the other two status label values for that
+source, so at most one status series is active per source at any time (see
+`metrics.py`'s module docstring for why a labelled gauge, and how the
+classic "stale series" pitfall is avoided). `partial` means at least one of:
+a hard pipeline failure (`pages_failed > 0`), an early-aborted crawl, a
+refused purge-ratio guard, or a soft-failure ratio above
+`SOFT_FAIL_PARTIAL_RATIO` — see `classify_sync` in `ingestion/app/store.py`
+for the exact rule order.
 
 **Triage:**
 1. `curl -sS http://localhost:8080/status | jq '."<name>"'` — check the real
    `last_status` and `pages_failed` for the last couple of runs.
 2. `docker compose logs ingestion | grep '"source": "<name>"' | grep -E '"event": "(page_index_failed|sync_source_crashed)"'` —
-   hard failures show up here even though they're invisible to Prometheus.
+   find which specific condition (`classify_sync`'s four `partial` branches)
+   applied to this run.
 3. Also rule out `SourceIndexedNothing`/sitemap issues (above) — a source
    trending toward zero pages will also trip this alert on its way down.
 

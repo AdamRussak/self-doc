@@ -313,6 +313,105 @@ def test_admin_driven_sync_should_record_prometheus_metrics(monkeypatch):
     assert _sample_value(main_module.SYNC_LAST_SUCCESS, record.name) is not None
 
 
+def _status_sample_value(source_name: str, status: str):
+    """Like `_sample_value`, but for a metric labelled `(source, status)` --
+    finds the sample matching BOTH labels, distinguishing "series absent"
+    (None) from "series present with value 0"."""
+    from app.metrics import SYNC_LAST_STATUS
+
+    for family in SYNC_LAST_STATUS.collect():
+        for sample in family.samples:
+            if sample.labels.get("source") == source_name and sample.labels.get("status") == status:
+                return sample.value
+    return None
+
+
+def test_admin_driven_sync_records_pages_failed_and_last_status(monkeypatch):
+    """`PAGES_FAILED` (`pages_failed_total`) must move on a sync with hard
+    failures, and `SYNC_LAST_STATUS` must expose the outcome's status
+    directly (`sync_last_status{source, status="partial"} == 1`) so an
+    alert rule can assert "this source reported partial" without a proxy."""
+    from app import main as main_module
+
+    record = _make_record(name="metrics-status-test-src")
+    canned_outcome = SourceOutcome(
+        name=record.name,
+        pages_fetched=5,
+        pages_skipped=0,
+        pages_not_modified=0,
+        pages_soft_failed=0,
+        pages_failed=3,
+        pages_removed=0,
+        chunks_indexed=5,
+        status="partial",
+    )
+
+    def fake_sync_source(cfg, conn, progress_cb=None):
+        return canned_outcome
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+
+    admin._bg_sync_all([record], conn_factory=lambda: object())
+
+    assert _sample_value(main_module.PAGES_FAILED, record.name) == 3
+    assert _status_sample_value(record.name, "partial") == 1
+    assert _status_sample_value(record.name, "ok") is None
+    assert _status_sample_value(record.name, "failed") is None
+    # "partial" still moves the last-success timestamp -- unchanged contract.
+    assert _sample_value(main_module.SYNC_LAST_SUCCESS, record.name) is not None
+
+
+def test_sync_last_status_clears_stale_series_on_transition(monkeypatch):
+    """Regression test for the classic status-labelled-gauge pitfall: a
+    source that reports 'partial' and then, on its NEXT sync, reports 'ok'
+    must not still match `sync_last_status{status="partial"} == 1` -- the
+    stale 'partial' series from the previous run must be cleared, or the
+    source would look permanently degraded to any rule filtering on it."""
+    record = _make_record(name="metrics-status-transition-src")
+
+    partial_outcome = SourceOutcome(
+        name=record.name,
+        pages_fetched=5,
+        pages_skipped=0,
+        pages_not_modified=0,
+        pages_soft_failed=0,
+        pages_failed=2,
+        pages_removed=0,
+        chunks_indexed=5,
+        status="partial",
+    )
+    ok_outcome = SourceOutcome(
+        name=record.name,
+        pages_fetched=6,
+        pages_skipped=0,
+        pages_not_modified=0,
+        pages_soft_failed=0,
+        pages_failed=0,
+        pages_removed=0,
+        chunks_indexed=6,
+        status="ok",
+    )
+
+    def fake_sync_source_partial(cfg, conn, progress_cb=None):
+        return partial_outcome
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source_partial)
+    admin._bg_sync_all([record], conn_factory=lambda: object())
+    assert _status_sample_value(record.name, "partial") == 1
+
+    def fake_sync_source_ok(cfg, conn, progress_cb=None):
+        return ok_outcome
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source_ok)
+    admin._bg_sync_all([record], conn_factory=lambda: object())
+
+    assert _status_sample_value(record.name, "ok") == 1
+    # The stale "partial" series from the previous run must be gone, not
+    # merely zeroed -- both would satisfy "== 1" is False, but only removal
+    # guarantees no lingering series confuses `absent()`-style rules either.
+    assert _status_sample_value(record.name, "partial") is None
+
+
 def test_admin_driven_sync_exposes_pages_fetched_total_on_metrics_endpoint(monkeypatch):
     """End-to-end check of the same fix at the `/metrics` exposition layer
     (not just the in-process Counter object): a sync driven entirely through

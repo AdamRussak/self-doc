@@ -1,15 +1,17 @@
 # Prometheus alerting rules for the `ingestion` service.
 #
-# Source of these seven metrics: `ingestion/app/metrics.py` /
-# `record_sync_outcome`, called once per *completed* sync (any status —
-# ok, partial, or failed) via `store.sync_source_with_metrics`, the single
-# choke point every sync entrypoint (main.py's `POST /sync`, admin.py's
-# manual-sync routes, the scheduler) routes through:
+# Source of these metrics: `ingestion/app/metrics.py` / `record_sync_outcome`,
+# called once per *completed* sync (any status — ok, partial, or failed) via
+# `store.sync_source_with_metrics`, the single choke point every sync
+# entrypoint (main.py's `POST /sync`, admin.py's manual-sync routes, the
+# scheduler) routes through:
 #
 #   pages_fetched_total{source}            (Counter)
 #   pages_skipped_unchanged_total{source}  (Counter)
 #   pages_not_modified_total{source}       (Counter)
 #   pages_soft_failed_total{source}        (Counter)
+#   pages_failed_total{source}             (Counter — hard pipeline failures;
+#                                            drives status=partial/failed)
 #   chunks_indexed_total{source}           (Counter)
 #   sync_duration_seconds{source}          (Histogram — _count increases once
 #                                            per completed sync regardless of
@@ -19,18 +21,22 @@
 #   sync_last_success_timestamp{source}    (Gauge — set to now() on status
 #                                            "ok" AND "partial"; left UNTOUCHED
 #                                            on "failed")
+#   sync_last_status{source, status}       (Gauge — 1 for the status
+#                                            ("ok"/"partial"/"failed") of the
+#                                            source's most recently completed
+#                                            sync; the other two status label
+#                                            values for that source are
+#                                            removed by `record_sync_outcome`,
+#                                            so exactly one series per source
+#                                            reads 1 at any given time — see
+#                                            `metrics.py`'s module docstring)
 #
-# KNOWN METRICS GAP (read before editing SourceSyncDegraded): there is no
-# `pages_failed_total` (hard-failure) counter exported today — see
-# `ingestion/app/store.py`'s `SourceOutcome.pages_failed` / `classify_sync`.
-# Hard failures are invisible to every one of the seven series above (a
-# hard-failed page increments neither `pages_fetched_total` nor any other
-# counter here). This file cannot literally query "status == partial"
-# because that label does not exist in Prometheus; `SourceSyncDegraded`
-# below uses the closest available proxy and says so in its own comment.
-# Do not edit `ingestion/app/metrics.py` to "fix" this from this task — it
-# is out of scope for T4 (metric names/labels are owned elsewhere); flag it
-# as a follow-up instead.
+# T24 CLOSED THE PRIOR METRICS GAP: `SourceSyncDegraded` used to have no
+# direct way to assert "this source reported partial" and relied on a
+# run-over-run page-volume-collapse proxy instead (see git history for that
+# version). `sync_last_status` now makes the direct check possible —
+# `sync_last_status{status="partial"} == 1` — and `SourceSyncDegraded` below
+# uses it instead of the proxy.
 #
 # Cadence assumption used throughout: syncs run ~daily and take ~3.5h
 # end-to-end for the full source set (see docs/runbook.md "Expected sync
@@ -85,45 +91,35 @@ groups:
       # ----------------------------------------------------------------
       # SourceSyncDegraded
       #
-      # PROXY ALERT — see the file-level "KNOWN METRICS GAP" comment
-      # above. In lieu of a direct `pages_failed_total`/status signal,
-      # this treats a source whose total successfully-accounted-for page
-      # volume (fetched + hash-skipped + 304-not-modified — deliberately
-      # excluding pages_soft_failed_total, since soft failures are
-      # expected site noise and must NOT degrade status per
-      # docs/runbook.md's "Page Classification & Source Status Semantics")
-      # collapses to under half its own volume from the run before, on
-      # two consecutive runs, as the observable stand-in for "reporting
-      # partial repeatedly." A single bad run is noise (a flaky upstream
-      # page, a transient DB blip); the same source shrinking twice in a
-      # row is a trend worth paging on.
+      # DIRECT SIGNAL (no longer a proxy — see T24 in the file-level
+      # comment above): `sync_last_status{source, status="partial"} == 1`
+      # is the literal, current-state assertion "this source's most
+      # recently completed sync reported status=partial" -- `classify_sync`
+      # sets `partial` for a purge-guard refusal, an early-aborted crawl,
+      # any hard pipeline failure (`pages_failed > 0`), or a soft-failure
+      # ratio above `SOFT_FAIL_PARTIAL_RATIO` (see `app/store.py`'s
+      # `classify_sync` docstring for the exact rule order). No run-over-run
+      # volume comparison or offset windowing is needed: the gauge already
+      # IS "the current status," and `record_sync_outcome` guarantees at
+      # most one status series per source is active at a time (stale
+      # values from a prior status are removed — see `metrics.py`).
       #
-      # `offset 30h` / `offset 60h` step back exactly one and two run
-      # windows (see the file header for the 30h "one completed run"
-      # rationale).
+      # `for: 15m` still applies so a single evaluation right at the
+      # instant a gauge flips (mid-scrape-interval jitter) doesn't page
+      # before the next scrape confirms it's holding.
       - alert: SourceSyncDegraded
-        expr: |-
-          (
-            (increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]))
-            <
-            0.5 * (increase(pages_fetched_total[30h] offset 30h) + increase(pages_skipped_unchanged_total[30h] offset 30h) + increase(pages_not_modified_total[30h] offset 30h))
-          )
-          and
-          (
-            (increase(pages_fetched_total[30h] offset 30h) + increase(pages_skipped_unchanged_total[30h] offset 30h) + increase(pages_not_modified_total[30h] offset 30h))
-            <
-            0.5 * (increase(pages_fetched_total[30h] offset 60h) + increase(pages_skipped_unchanged_total[30h] offset 60h) + increase(pages_not_modified_total[30h] offset 60h))
-          )
+        expr: sync_last_status{status="partial"} == 1
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: 'Source "{{ $labels.source }}" indexed less than half its usual page volume on two consecutive runs.'
+          summary: 'Source "{{ $labels.source }}" reported status=partial on its last completed sync.'
           description: >-
-            {{ $labels.source }}: successfully-processed page volume dropped by
-            >50% run-over-run, twice in a row. Proxy signal for a repeatedly
-            "partial" source — see the runbook section for how to confirm the
-            actual status via `GET /status`.
+            {{ $labels.source }}: the most recently completed sync reported
+            status "partial" (a hard pipeline failure, an aborted crawl, a
+            refused purge, or an elevated soft-failure ratio — see
+            `classify_sync` in app/store.py). Check `GET /status` for this
+            source to see which condition applied.
           runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
 
       # ----------------------------------------------------------------

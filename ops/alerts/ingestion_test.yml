@@ -1,16 +1,17 @@
 # promtool unit tests for ops/alerts/ingestion.yml.
 #
-# Scope: exercises the two rules that don't depend on wall-clock `time()`
-# (NoSyncMetricsAtAll, SourceIndexedNothing) plus SoftFailRatioHigh, using a
-# 30m sample interval so the 30h windows fit in 60 steps. SourceSyncStale and
-# SourceSyncDegraded are NOT covered here: SourceSyncStale's `time() -
-# sync_last_success_timestamp` depends on promtool's internal test clock
-# epoch in a way that's brittle to hand-encode reliably in this format, and
-# SourceSyncDegraded's two-consecutive-run offset comparison needs >60h of
-# synthetic history per case, which was judged not worth the added file
-# complexity for a unit test whose main value is smoke-testing PromQL syntax
-# and threshold arithmetic (already covered directly by `promtool check
-# rules`, which parses and validates every rule's PromQL).
+# Scope: exercises the rules that don't depend on wall-clock `time()`
+# (NoSyncMetricsAtAll, SourceIndexedNothing, SourceSyncDegraded) plus
+# SoftFailRatioHigh, using a 30m sample interval so the 30h windows fit in 60
+# steps. SourceSyncStale is NOT covered here: its `time() -
+# sync_last_success_timestamp` expression depends on promtool's internal test
+# clock epoch in a way that's brittle to hand-encode reliably in this format
+# (already covered directly by `promtool check rules`, which parses and
+# validates every rule's PromQL).
+#
+# SourceSyncDegraded (T24): now a direct instant-vector check
+# (`sync_last_status{status="partial"} == 1`), no offset/window arithmetic
+# needed, so it's covered here like any other non-time()-dependent rule.
 rule_files:
   - ingestion.yml
 
@@ -65,6 +66,78 @@ tests:
                 == 0. This is the "reports ok but indexed nothing" failure mode —
                 check the source's sitemap/include_prefixes.
               runbook: 'docs/runbook.md#alert-sourceindexednothing'
+
+  # --- SourceSyncDegraded: sync_last_status reports "partial" -------------
+  - interval: 30m
+    input_series:
+      # A source whose most recently completed sync reported "partial" —
+      # only the "partial" status series is present (the current
+      # `record_sync_outcome` behavior: the other two status label values
+      # for this source are removed, not left at 0).
+      - series: 'sync_last_status{source="traefik", status="partial"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SourceSyncDegraded
+        exp_alerts:
+          - exp_labels:
+              source: traefik
+              status: partial
+              severity: warning
+            exp_annotations:
+              summary: 'Source "traefik" reported status=partial on its last completed sync.'
+              description: >-
+                traefik: the most recently completed sync reported status
+                "partial" (a hard pipeline failure, an aborted crawl, a
+                refused purge, or an elevated soft-failure ratio — see
+                `classify_sync` in app/store.py). Check `GET /status` for this
+                source to see which condition applied.
+              runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
+
+  # --- SourceSyncDegraded: does NOT fire for status="ok" -------------------
+  - interval: 30m
+    input_series:
+      - series: 'sync_last_status{source="fastapi", status="ok"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SourceSyncDegraded
+        exp_alerts: []
+
+  # --- SourceSyncDegraded: stale-series regression guard -------------------
+  # A source that reported "partial" for its first 30 samples and then
+  # transitions to "ok" (its "partial" series is REMOVED, not zeroed, from
+  # sample 31 onward — matching record_sync_outcome's `.remove(...)` call)
+  # must stop matching this alert once the "ok" series takes over. Modeled
+  # here as two disjoint series over the same window, since PromQL unit
+  # tests can't literally delete a label combination mid-series; an absent
+  # sample from a given timestamp onward is the correct proxy for "removed".
+  - interval: 30m
+    input_series:
+      - series: 'sync_last_status{source="docker-compose", status="partial"}'
+        values: '1x30 _x30'
+      - series: 'sync_last_status{source="docker-compose", status="ok"}'
+        values: '_x30 1x30'
+    alert_rule_test:
+      - eval_time: 14h30m
+        alertname: SourceSyncDegraded
+        exp_alerts:
+          - exp_labels:
+              source: docker-compose
+              status: partial
+              severity: warning
+            exp_annotations:
+              summary: 'Source "docker-compose" reported status=partial on its last completed sync.'
+              description: >-
+                docker-compose: the most recently completed sync reported status
+                "partial" (a hard pipeline failure, an aborted crawl, a
+                refused purge, or an elevated soft-failure ratio — see
+                `classify_sync` in app/store.py). Check `GET /status` for this
+                source to see which condition applied.
+              runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
+      - eval_time: 29h30m
+        alertname: SourceSyncDegraded
+        exp_alerts: []
 
   # --- SoftFailRatioHigh: 117/280 soft-failed (41.8%), the traefik case --
   - interval: 30m
