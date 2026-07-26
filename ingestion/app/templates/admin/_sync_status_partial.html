@@ -6,8 +6,14 @@
       <strong style="color: var(--color-primary-tint); font-size: 1.05rem; font-weight: 600;">Active Sync in Progress</strong>
       <span class="badge badge-primary">{{ sync_status.get('source', '') or "Active Source" }}</span>
     </div>
-    <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-muted); display: flex; align-items: center; gap: 0.5rem;">
-      <div class="spinner"></div> Processing pipeline...
+    <div style="display: flex; align-items: center; gap: 0.75rem;">
+      <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-muted); display: flex; align-items: center; gap: 0.5rem;">
+        <div class="spinner"></div> Processing pipeline...
+      </div>
+      <form method="post" action="/admin/sync/stop" hx-post="/admin/sync/stop" style="margin: 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; background: var(--color-error); border-color: var(--color-error); color: white;">Stop Sync</button>
+      </form>
     </div>
   </div>
   <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; background: rgba(4, 14, 31, 0.6); padding: 0.85rem 1.1rem; border-radius: var(--radius-sm); border: 1px solid rgba(37, 99, 235, 0.25); margin-bottom: 0.75rem; font-family: var(--font-mono);">

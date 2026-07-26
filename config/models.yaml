@@ -17,7 +17,7 @@
 # that side. bge/mxbai want an instruction on the QUERY only; e5 wants a prefix
 # on BOTH sides.
 
-default: mixedbread-ai/mxbai-embed-large-v1
+default: BAAI/bge-small-en-v1.5
 
 models:
   mixedbread-ai/mxbai-embed-large-v1:

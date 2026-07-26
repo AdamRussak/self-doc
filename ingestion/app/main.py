@@ -276,6 +276,31 @@ class SyncRequest(BaseModel):
     source: int | str | None = None
 
 
+class PurgeRequest(BaseModel):
+    source: int | str
+
+
+def _resolve_single_source(
+    source_ref: int | str,
+    sources_by_name: dict[str, SourceRecord],
+    sources_by_id: dict[int, SourceRecord],
+) -> SourceRecord:
+    record = (
+        sources_by_id.get(source_ref)
+        if isinstance(source_ref, int)
+        else sources_by_name.get(source_ref)
+    )
+    if record is None:
+        if isinstance(source_ref, str):
+            try:
+                record = sources_by_id.get(int(source_ref))
+            except ValueError:
+                pass
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"source {source_ref!r} not found")
+    return record
+
+
 def _check_auth(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -354,6 +379,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             yield page
 
     store.crawler.crawl = tracking_crawl
+    admin._sync_cancel_event.clear()
     admin._sync_status["running"] = True
     admin._sync_status["started_at"] = time.time()
     admin._sync_status["completed_at"] = None
@@ -365,8 +391,25 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
     admin._sync_status["message"] = f"Background sync running ({len(names)} sources)..."
     try:
         for i, name in enumerate(names):
-            source = sources_by_name[name]
             log = logger.bind(source=name)
+            if admin._sync_cancel_event.is_set():
+                log.info("sync_skipped_due_to_cancellation")
+                outcome = store.SourceOutcome(name=name, status="failed", error="Aborted by user")
+                _state["results"][name] = {
+                    "pages_fetched": 0,
+                    "pages_skipped": 0,
+                    "pages_not_modified": 0,
+                    "pages_failed": 0,
+                    "pages_soft_failed": 0,
+                    "pages_removed": 0,
+                    "chunks_indexed": 0,
+                    "last_status": "failed",
+                    "last_synced": time.time(),
+                    "error": "Aborted by user",
+                }
+                continue
+
+            source = sources_by_name[name]
             start = time.monotonic()
             _state["current"] = {
                 "source": name,
@@ -385,12 +428,12 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                 try:
                     cfg = admin._record_to_config(source)
                     try:
-                        outcome = store.sync_source(cfg, conn, progress_cb=admin._on_sync_progress)
-                    except TypeError as e:
-                        if "progress_cb" in str(e):
+                        outcome = store.sync_source(cfg, conn, progress_cb=admin._on_sync_progress, cancel_event=admin._sync_cancel_event)
+                    except TypeError:
+                        try:
+                            outcome = store.sync_source(cfg, conn, cancel_event=admin._sync_cancel_event)
+                        except TypeError:
                             outcome = store.sync_source(cfg, conn)
-                        else:
-                            raise
                 except Exception as e:  # noqa: BLE001 - source-level safety net
                     log.error("sync_source_crashed", error=str(e))
                     outcome = store.SourceOutcome(name=name, status="failed", error=str(e))
@@ -606,6 +649,100 @@ async def sync(req: SyncRequest | None = None, authorization: str | None = Heade
     logger.info("sync_started", sources=names)
     asyncio.create_task(_sync_task(names, sources_by_name))
     return {"status": "started", "sources": names}
+
+
+@app.post("/purge")
+async def purge(req: PurgeRequest, authorization: str | None = Header(default=None)):
+    _check_auth(authorization)
+
+    if is_sync_locked():
+        raise HTTPException(status_code=409, detail="sync already running")
+
+    try:
+        all_sources = get_sources()
+    except SourcesUnavailable as e:
+        raise HTTPException(status_code=503, detail=f"sources unavailable: {e}") from e
+
+    sources_by_name = {s.name: s for s in all_sources}
+    sources_by_id = {s.id: s for s in all_sources}
+
+    record = _resolve_single_source(req.source, sources_by_name, sources_by_id)
+
+    if not try_acquire_sync_lock():
+        raise HTTPException(status_code=409, detail="sync already running")
+
+    try:
+        conn = store.get_connection()
+        try:
+            count = store.purge_source(conn, record.id)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to purge source: {e}") from e
+    finally:
+        release_sync_lock()
+
+    logger.info("source_purged", source=record.name, pages_deleted=count)
+    return {"purged_pages": count, "source": record.name}
+
+
+@app.post("/refresh")
+async def refresh(req: PurgeRequest, authorization: str | None = Header(default=None)):
+    _check_auth(authorization)
+
+    if is_sync_locked():
+        raise HTTPException(status_code=409, detail="sync already running")
+
+    try:
+        all_sources = get_sources()
+    except SourcesUnavailable as e:
+        raise HTTPException(status_code=503, detail=f"sources unavailable: {e}") from e
+
+    sources_by_name = {s.name: s for s in all_sources}
+    sources_by_id = {s.id: s for s in all_sources}
+
+    record = _resolve_single_source(req.source, sources_by_name, sources_by_id)
+
+    if record.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail=f"source {record.name!r} has status={record.status!r} (not 'active') and cannot be synced"
+        )
+
+    if not try_acquire_sync_lock():
+        raise HTTPException(status_code=409, detail="sync already running")
+
+    try:
+        conn = store.get_connection()
+        try:
+            count = store.purge_source(conn, record.id)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        release_sync_lock()
+        raise HTTPException(status_code=500, detail=f"failed to purge source: {e}") from e
+
+    _state["running"] = True
+    _state["current"] = {
+        "source": record.name,
+        "pages_processed": 0,
+        "start_time": time.monotonic(),
+        "position": "1 of 1",
+    }
+    logger.info("refresh_sync_started", source=record.name)
+    asyncio.create_task(_sync_task([record.name], sources_by_name))
+
+    return {"purged_pages": count, "sync": "started", "source": record.name}
+
+
+@app.post("/stop")
+async def stop(authorization: str | None = Header(default=None)):
+    _check_auth(authorization)
+    admin._sync_cancel_event.set()
+    logger.info("api_stop_triggered")
+    return {"sync": "stopping"}
 
 
 @app.get("/status")

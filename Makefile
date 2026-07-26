@@ -3,7 +3,7 @@ export
 
 PREFIX ?= $(HOME)/.local
 
-.PHONY: up down up-prod down-prod sync test build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore
+.PHONY: up down up-prod down-prod sync test build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
 
 # Select the embedding model from config/models.yaml. Resolves the model's
 # vector dimension and per-service memory limits, writes them into .env, and
@@ -64,6 +64,28 @@ down-prod:
 # Reads SYNC_TOKEN from .env automatically via -include above.
 sync:
 	curl -sS -X POST http://localhost:8080/sync \
+		-H "Authorization: Bearer $(SYNC_TOKEN)" \
+		-H "Content-Type: application/json"
+
+# Purge a specific source by id/name. Usage: make purge SOURCE=1 or make purge SOURCE=python-sdk
+purge:
+	@if [ -z "$(SOURCE)" ]; then echo "Usage: make purge SOURCE=<id_or_name>"; exit 1; fi
+	curl -sS -X POST http://localhost:8080/purge \
+		-H "Authorization: Bearer $(SYNC_TOKEN)" \
+		-H "Content-Type: application/json" \
+		-d '{"source": "$(SOURCE)"}'
+
+# Refresh a specific source by id/name. Usage: make refresh SOURCE=1 or make refresh SOURCE=python-sdk
+refresh:
+	@if [ -z "$(SOURCE)" ]; then echo "Usage: make refresh SOURCE=<id_or_name>"; exit 1; fi
+	curl -sS -X POST http://localhost:8080/refresh \
+		-H "Authorization: Bearer $(SYNC_TOKEN)" \
+		-H "Content-Type: application/json" \
+		-d '{"source": "$(SOURCE)"}'
+
+# Stop the running sync. Usage: make stop
+stop:
+	curl -sS -X POST http://localhost:8080/stop \
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
 		-H "Content-Type: application/json"
 

@@ -15,6 +15,7 @@ transiently failing pages from being purged.
 from __future__ import annotations
 
 import ipaddress
+import os
 import sys
 import time
 import urllib.robotparser
@@ -25,6 +26,7 @@ from xml.etree import ElementTree
 
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -39,6 +41,7 @@ USER_AGENT = "self-docs-crawler/0.1"
 # Redirect chains are bounded: an unbounded chain could be abused to exhaust
 # resources or bounce the crawler indefinitely (security review L1).
 MAX_REDIRECTS = 5
+SITEMAP_TIMEOUT = int(os.environ.get("SITEMAP_TIMEOUT", "30"))
 
 logger = get_logger(component="crawler")
 
@@ -237,7 +240,7 @@ def _discover_sitemap_urls_recursive(
     seen_sitemaps.add(sitemap_url)
 
     limiter.wait()
-    resp = client.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+    resp = client.get(sitemap_url, headers={"User-Agent": USER_AGENT}, timeout=SITEMAP_TIMEOUT)
     resp.raise_for_status()
     urls, child_sitemaps = parse_sitemap(resp.content)
 
@@ -390,7 +393,37 @@ def _llms_index_conditional_check(
             if text.strip():
                 return ("fetched", url, text)
         return None
-    return None
+class TransientHTTPError(Exception):
+    """Raised when an HTTP response status is 429, 502, or 503 to trigger a tenacity retry."""
+
+    def __init__(self, response: httpx.Response):
+        self.response = response
+        super().__init__(f"Transient HTTP status {response.status_code}")
+
+
+def _fetch_page_with_retry(client: httpx.Client, target_url: str, headers: dict, log) -> httpx.Response:
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(min=1, max=30),
+        retry=retry_if_exception_type((httpx.HTTPError, TransientHTTPError)),
+    )
+    def _do_get():
+        resp = client.get(target_url, headers=headers, timeout=15, follow_redirects=False)
+        if resp.status_code in (429, 502, 503):
+            log.info("page_fetch_retrying", url=target_url, status_code=resp.status_code)
+            retry_after = resp.headers.get("retry-after")
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                    if delay > 0:
+                        time.sleep(delay)
+                except ValueError:
+                    pass
+            raise TransientHTTPError(resp)
+        return resp
+
+    return _do_get()
 
 
 def crawl(
@@ -508,7 +541,13 @@ def crawl(
 
             if discovered is not None and not _looks_like_llms_txt(discovered[1]):
                 log.info("llms_txt_content_sanity_check_failed", url=discovered[0])
-                discovered = None
+                if discovered[0].endswith("/llms-full.txt"):
+                    discovered = llms_txt.discover(client, base_url, prefer_full=False)
+                    if discovered is not None and not _looks_like_llms_txt(discovered[1]):
+                        log.info("llms_txt_content_sanity_check_failed", url=discovered[0])
+                        discovered = None
+                else:
+                    discovered = None
 
             if discovered is not None:
                 index_url, llms_text = discovered
@@ -621,13 +660,8 @@ def crawl(
                     if cond_last_modified is not None:
                         req_headers["If-Modified-Since"] = cond_last_modified
                 try:
-                    resp = client.get(
-                        current_url,
-                        headers=req_headers,
-                        timeout=15,
-                        follow_redirects=False,
-                    )
-                except httpx.HTTPError as e:
+                    resp = _fetch_page_with_retry(client, current_url, req_headers, log)
+                except (httpx.HTTPError, TransientHTTPError) as e:
                     log.info("page_fetch_failed", url=url, error=str(e))
                     return {"url": url, "html": None, "fetch_ok": False}
                 if _hop == 0 and resp.status_code == 304:

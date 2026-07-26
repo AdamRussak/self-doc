@@ -10,14 +10,26 @@
   <script>
     document.addEventListener("submit", function (event) {
       var form = event.target;
-      if (!(form instanceof HTMLFormElement) || !form.hasAttribute("data-confirm-delete")) {
+      if (!(form instanceof HTMLFormElement)) {
         return;
       }
       var name = form.getAttribute("data-source-name") || "this source";
-      var extra = form.getAttribute("data-confirm-extra") || "";
-      var message = "Delete source " + name + "? " + extra;
-      if (!window.confirm(message.trim())) {
-        event.preventDefault();
+      if (form.hasAttribute("data-confirm-delete")) {
+        var extra = form.getAttribute("data-confirm-extra") || "";
+        var message = "Delete source " + name + "? " + extra;
+        if (!window.confirm(message.trim())) {
+          event.preventDefault();
+        }
+      } else if (form.hasAttribute("data-confirm-purge")) {
+        var message = "Purge data for source " + name + "? This will delete all its pages and chunks, but keep the source configuration.";
+        if (!window.confirm(message)) {
+          event.preventDefault();
+        }
+      } else if (form.hasAttribute("data-confirm-refresh")) {
+        var message = "Purge data and sync source " + name + "? This will delete all its pages and chunks, then start a fresh sync.";
+        if (!window.confirm(message)) {
+          event.preventDefault();
+        }
       }
     });
   </script>
@@ -605,6 +617,15 @@
     .btn-danger:hover {
       background: var(--color-error);
       color: #fff;
+    }
+    .btn-warning {
+      border-color: rgba(255, 184, 0, 0.4);
+      color: var(--color-warning);
+      background: rgba(255, 184, 0, 0.08);
+    }
+    .btn-warning:hover {
+      background: var(--color-warning);
+      color: #000;
     }
 
     /* HTMX Spinner Indicator */

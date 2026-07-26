@@ -158,6 +158,22 @@
                 Sync now
               </button>
             </form>
+            <form method="post" action="/admin/sources/{{ s.id }}/refresh"
+                  data-confirm-refresh
+                  data-source-name="{{ s.name }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>
+                Refresh
+              </button>
+            </form>
+            <form method="post" action="/admin/sources/{{ s.id }}/purge"
+                  data-confirm-purge
+                  data-source-name="{{ s.name }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-warning" {% if sync_status and sync_status.running %}disabled{% endif %}>
+                Purge
+              </button>
+            </form>
             <form method="post" action="/admin/sources/{{ s.id }}/delete"
                   data-confirm-delete
                   data-source-name="{{ s.name }}"

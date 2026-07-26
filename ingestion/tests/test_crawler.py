@@ -1,4 +1,5 @@
 import inspect
+import time
 
 import httpx
 from app.config import SourceConfig
@@ -1353,3 +1354,96 @@ def test_crawl_refuses_unresolvable_host_fail_closed(monkeypatch):
         assert requested == []
     finally:
         _resolve_host_addrs.cache_clear()
+
+
+def test_transient_503_retried_and_succeeds_on_second_attempt():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(503, text="Service Unavailable")
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+    assert attempts == 2
+    assert len(pages) == 1
+    assert pages[0]["fetch_ok"] is True
+    assert pages[0]["html"] == PAGE_HTML
+
+
+def test_transient_429_with_retry_after_header_respected():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(429, headers={"Retry-After": "0.15"}, text="Too Many Requests")
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    t0 = time.monotonic()
+    pages = list(crawl(source, client=client))
+    elapsed = time.monotonic() - t0
+
+    assert attempts == 2
+    assert elapsed >= 0.1
+    assert len(pages) == 1
+    assert pages[0]["fetch_ok"] is True
+
+
+def test_permanent_failure_after_retry_exhaustion_yields_fetch_ok_false():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://example.com/":
+            attempts += 1
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://example.com/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    pages = list(crawl(source, client=client))
+
+    assert attempts == 3
+    assert len(pages) == 1
+    assert pages[0]["fetch_ok"] is False
+    assert pages[0]["html"] is None
+

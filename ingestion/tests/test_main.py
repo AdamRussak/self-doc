@@ -944,3 +944,87 @@ def test_lifespan_starts_and_stops_scheduler_promptly_when_enabled(app_module, m
     asyncio_mod.run(_run())
     elapsed = time_mod.monotonic() - start
     assert elapsed < 2.0
+
+
+def test_api_purge_source_endpoint(app_module, monkeypatch):
+    import app.sources_repo as sources_repo
+    import app.store as store
+
+    record = _make_record(77, "to-purge")
+    monkeypatch.setattr(sources_repo, "list_sources", lambda conn: [record])
+
+    purged_id = []
+    def fake_purge(conn_arg, source_id):
+        purged_id.append(source_id)
+        return 5
+
+    monkeypatch.setattr(store, "purge_source", fake_purge)
+
+    class FakeConn:
+        def commit(self):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+
+    with TestClient(app_module.app) as client:
+        resp = client.post("/purge", json={"source": 77})
+        assert resp.status_code == 401
+
+        resp = client.post("/purge", json={"source": 77}, headers={"Authorization": "Bearer test-token-123"})
+        assert resp.status_code == 200
+        assert resp.json() == {"purged_pages": 5, "source": "to-purge"}
+        assert purged_id == [77]
+
+        resp = client.post("/purge", json={"source": "to-purge"}, headers={"Authorization": "Bearer test-token-123"})
+        assert resp.status_code == 200
+        assert resp.json() == {"purged_pages": 5, "source": "to-purge"}
+        assert purged_id == [77, 77]
+
+
+def test_api_refresh_source_endpoint(app_module, monkeypatch):
+    import app.sources_repo as sources_repo
+    import app.store as store
+
+    record = _make_record(88, "to-refresh")
+    monkeypatch.setattr(sources_repo, "list_sources", lambda conn: [record])
+
+    purged_id = []
+    def fake_purge(conn_arg, source_id):
+        purged_id.append(source_id)
+        return 12
+
+    monkeypatch.setattr(store, "purge_source", fake_purge)
+
+    sync_called = []
+    async def fake_sync_task(names, sources_by_name):
+        sync_called.extend(names)
+
+    monkeypatch.setattr(app_module, "_sync_task", fake_sync_task)
+
+    class FakeConn:
+        def commit(self):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+
+    with TestClient(app_module.app) as client:
+        resp = client.post("/refresh", json={"source": "to-refresh"}, headers={"Authorization": "Bearer test-token-123"})
+        assert resp.status_code == 200
+        assert resp.json() == {"purged_pages": 12, "sync": "started", "source": "to-refresh"}
+        assert purged_id == [88]
+        time_mod = __import__("time")
+        time_mod.sleep(0.05)
+        assert sync_called == ["to-refresh"]
+
+
+def test_api_stop_endpoint(app_module):
+    app_module.admin._sync_cancel_event.clear()
+    with TestClient(app_module.app) as client:
+        resp = client.post("/stop", headers={"Authorization": "Bearer test-token-123"})
+        assert resp.status_code == 200
+        assert resp.json() == {"sync": "stopping"}
+        assert app_module.admin._sync_cancel_event.is_set()

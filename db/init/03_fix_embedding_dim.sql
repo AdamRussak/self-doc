@@ -1,66 +1,71 @@
--- Idempotent migration script to align vector column dimensions to 1024
--- and update canonical URLs and include_prefixes for redirected/failed doc sources.
+-- Idempotent migration script to update canonical URLs, sitemaps,
+-- and include_prefixes for doc sources that failed initial ingestion.
 
--- 1. Check current dimension of doc_chunks.embedding and update if needed
-DO $$
-DECLARE
-    current_dim int;
-BEGIN
-    SELECT atttypmod INTO current_dim
-    FROM pg_attribute
-    WHERE attrelid = 'doc_chunks'::regclass AND attname = 'embedding';
-
-    -- If dimension is 384, truncate chunks/pages so they can be cleanly re-embedded with 1024-dim vectors
-    IF current_dim IS NOT NULL AND current_dim = 384 THEN
-        TRUNCATE TABLE doc_chunks CASCADE;
-        TRUNCATE TABLE doc_pages CASCADE;
-        ALTER TABLE doc_chunks ALTER COLUMN embedding TYPE vector(1024);
-        RAISE NOTICE 'Updated doc_chunks.embedding column from vector(384) to vector(1024)';
-    END IF;
-END;
-$$;
-
--- 2. Update canonical URLs and include_prefixes for doc_sources
+-- 1. anthropic-api: Update to canonical platform URL & sitemap
 UPDATE doc_sources 
 SET base_url = 'https://platform.claude.com/docs/en/home',
-    sitemap = 'https://platform.claude.com/sitemap.xml'
+    sitemap = 'https://platform.claude.com/sitemap.xml',
+    include_prefixes = ARRAY['/docs/en/']
 WHERE name = 'anthropic-api';
 
-UPDATE doc_sources 
-SET base_url = 'https://developers.openai.com/api/docs',
-    sitemap = 'https://developers.openai.com/sitemap.xml'
-WHERE name = 'openai-api';
+-- 2. cloudflare-developers: Fix sitemap redirect target
+UPDATE doc_sources
+SET sitemap = 'https://developers.cloudflare.com/sitemap-index.xml'
+WHERE name = 'cloudflare-developers';
 
-UPDATE doc_sources 
+-- 3. elevenlabs-api: Fix include_prefixes to match site structure
+UPDATE doc_sources
+SET include_prefixes = ARRAY['/docs/api-reference/', '/docs/guides/', '/docs/overview']
+WHERE name = 'elevenlabs-api';
+
+-- 4. gemini-api: Fix base_url and include_prefixes for Gemini API docs
+UPDATE doc_sources
 SET base_url = 'https://ai.google.dev/gemini-api/docs',
     sitemap = 'https://ai.google.dev/sitemap.xml',
     include_prefixes = ARRAY['/gemini-api/docs']
 WHERE name = 'gemini-api';
 
-UPDATE doc_sources 
+-- 5. google-pagespeed-api: Switch to BFS (small docs set)
+UPDATE doc_sources
+SET base_url = 'https://developers.google.com/speed/docs/insights/v5/about',
+    sitemap = NULL,
+    include_prefixes = ARRAY['/speed/docs/insights/']
+WHERE name = 'google-pagespeed-api';
+
+-- 6. google-maps-platform: Drop broken sitemap
+UPDATE doc_sources
 SET sitemap = NULL,
     include_prefixes = ARRAY['/maps/documentation/']
 WHERE name = 'google-maps-platform';
 
-UPDATE doc_sources 
-SET base_url = 'https://www.wikidata.org/wiki/Wikidata:REST_API',
+-- 7. openai-api: Migrate to new developer docs domain
+UPDATE doc_sources
+SET base_url = 'https://developers.openai.com/docs/overview',
+    sitemap = 'https://developers.openai.com/sitemap.xml',
+    include_prefixes = ARRAY['/docs/', '/api/']
+WHERE name = 'openai-api';
+
+-- 8. pgvector-readme: Disable llms.txt, use BFS
+UPDATE doc_sources
+SET llms_txt = 'off',
     sitemap = NULL,
-    include_prefixes = ARRAY['/wiki/Wikidata:REST_API']
-WHERE name = 'wikidata-api';
+    max_pages = 3,
+    include_prefixes = ARRAY['/pgvector/pgvector']
+WHERE name = 'pgvector-readme';
 
-UPDATE doc_sources 
-SET base_url = 'https://developers.google.com/search/docs',
-    sitemap = 'https://developers.google.com/sitemap.xml'
-WHERE name = 'google-search-console-api';
-
-UPDATE doc_sources 
-SET rate_limit_rps = 0.2
+-- 9. unsplash-api: Fix base_url, drop sitemap, disable llms
+UPDATE doc_sources
+SET base_url = 'https://unsplash.com/documentation',
+    sitemap = NULL,
+    include_prefixes = ARRAY['/documentation'],
+    rate_limit_rps = 0.5,
+    llms_txt = 'off'
 WHERE name = 'unsplash-api';
 
-UPDATE doc_sources 
-SET base_url = 'https://elevenlabs.io/docs/overview/intro'
-WHERE name = 'elevenlabs-api';
-
-UPDATE doc_sources 
-SET base_url = 'https://developers.google.com/speed/docs/insights/v5/about'
-WHERE name = 'google-pagespeed-api';
+-- 10. wikidata-api: Fix to actual documentation page
+UPDATE doc_sources
+SET base_url = 'https://www.wikidata.org/wiki/Wikidata:REST_API',
+    sitemap = NULL,
+    include_prefixes = ARRAY['/wiki/Wikidata:REST_API', '/wiki/Wikidata:Data_access'],
+    llms_txt = 'off'
+WHERE name = 'wikidata-api';

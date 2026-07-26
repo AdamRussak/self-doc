@@ -283,6 +283,8 @@ def _default_release_lock() -> None:
 try_acquire_sync_lock: Callable[[], bool] = _default_try_acquire_lock
 release_sync_lock: Callable[[], None] = _default_release_lock
 
+_sync_cancel_event = threading.Event()
+
 _sync_status: dict[str, Any] = {
     "running": False,
     "source": "",
@@ -330,6 +332,7 @@ run_sync_task: Callable[..., None] = _default_run_sync_task
 
 def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_id: int) -> None:
     """Worker for background single-source sync."""
+    _sync_cancel_event.clear()
     _sync_status["running"] = True
     _sync_status["source"] = cfg.name
     _sync_status["started_at"] = time.time()
@@ -345,11 +348,23 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
     try:
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
             conn = conn_factory()
-            outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress)
+            try:
+                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
+            except TypeError:
+                try:
+                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
+                except TypeError:
+                    outcome = store.sync_source(cfg, conn)
         else:
             conn = store.get_connection()
             try:
-                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress)
+                try:
+                    outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
+                except TypeError:
+                    try:
+                        outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
+                    except TypeError:
+                        outcome = store.sync_source(cfg, conn)
             finally:
                 conn.close()
         logger.info("admin_manual_sync_complete", source_id=source_id, name=cfg.name, status=outcome.status)
@@ -392,6 +407,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
 
 def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -> None:
     """Worker for background full sync across all active sources."""
+    _sync_cancel_event.clear()
     _sync_status["running"] = True
     _sync_status["source"] = "All Active Sources"
     _sync_status["started_at"] = time.time()
@@ -409,11 +425,14 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
             conn = conn_factory()
             results = {}
             for rec in sources:
+                if _sync_cancel_event.is_set():
+                    results[rec.name] = store.SourceOutcome(name=rec.name, status="failed", error="Aborted by user")
+                    continue
                 cfg = _record_to_config(rec)
-                results[cfg.name] = store.sync_source(cfg, conn, progress_cb=_on_sync_progress)
+                results[cfg.name] = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         else:
             cfgs = [_record_to_config(rec) for rec in sources]
-            results = store.sync_all(cfgs, progress_cb=_on_sync_progress)
+            results = store.sync_all(cfgs, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         logger.info("admin_full_sync_complete", count=len(sources))
     except Exception as exc:
         exc_message = str(exc)
@@ -858,6 +877,7 @@ def sync_source_submit(
 
     cfg = _record_to_config(record)
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
+        _sync_cancel_event.clear()
         _sync_status["running"] = True
         _sync_status["source"] = cfg.name
         _sync_status["started_at"] = time.time()
@@ -869,7 +889,13 @@ def sync_source_submit(
         _sync_status["last_url"] = ""
         outcome = None
         try:
-            outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress)
+            try:
+                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
+            except TypeError:
+                try:
+                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
+                except TypeError:
+                    outcome = store.sync_source(cfg, conn)
         finally:
             try:
                 _sync_status["running"] = False
@@ -900,6 +926,166 @@ def sync_source_submit(
     run_sync_task(_bg_sync_single, cfg, lambda: conn, source_id)
     return RedirectResponse(
         url=f"/admin?msg=sync_started+{record.name}",
+        status_code=303,
+        headers={"HX-Trigger": "syncStatusUpdated"},
+    )
+
+
+@router.post("/sources/{source_id}/purge", response_class=HTMLResponse)
+def purge_source_submit(
+    source_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    record = sources_repo.get_source(conn, source_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="source not found")
+
+    acquired = try_acquire_sync_lock()
+    if not acquired:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Sync or Purge already running",
+                "message": "another sync/purge is already in progress; try again shortly.",
+            },
+            status_code=409,
+        )
+
+    try:
+        count = store.purge_source(conn, source_id)
+        if hasattr(conn, "commit"):
+            conn.commit()
+    except Exception as e:
+        logger.error("admin_manual_purge_failed", source_id=source_id, name=record.name, error=str(e))
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Purge failed",
+                "message": f"failed to purge source: {e}",
+            },
+            status_code=500,
+        )
+    finally:
+        release_sync_lock()
+
+    logger.info("admin_manual_purge_complete", source_id=source_id, name=record.name, pages_deleted=count)
+    return RedirectResponse(
+        url=f"/admin?msg=purged+{record.name}",
+        status_code=303,
+        headers={"HX-Trigger": "syncStatusUpdated"},
+    )
+
+
+@router.post("/sources/{source_id}/refresh", response_class=HTMLResponse)
+def refresh_source_submit(
+    source_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    record = sources_repo.get_source(conn, source_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    if record.status != "active":
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Cannot refresh",
+                "message": f"source {record.name!r} is {record.status}, not active — approve it first.",
+            },
+            status_code=409,
+        )
+
+    acquired = try_acquire_sync_lock()
+    if not acquired:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Sync or Purge already running",
+                "message": "another sync/purge is already in progress; try again shortly.",
+            },
+            status_code=409,
+        )
+
+    try:
+        count = store.purge_source(conn, source_id)
+        if hasattr(conn, "commit"):
+            conn.commit()
+    except Exception as e:
+        release_sync_lock()
+        logger.error("admin_manual_refresh_purge_failed", source_id=source_id, name=record.name, error=str(e))
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Refresh failed",
+                "message": f"failed to purge source during refresh: {e}",
+            },
+            status_code=500,
+        )
+
+    cfg = _record_to_config(record)
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
+        _sync_cancel_event.clear()
+        _sync_status["running"] = True
+        _sync_status["source"] = cfg.name
+        _sync_status["started_at"] = time.time()
+        _sync_status["completed_at"] = None
+        _sync_status["pages_fetched"] = 0
+        _sync_status["chunks_indexed"] = 0
+        _sync_status["pages_skipped"] = 0
+        _sync_status["pages_failed"] = 0
+        _sync_status["last_url"] = ""
+        outcome = None
+        try:
+            try:
+                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
+            except TypeError:
+                try:
+                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
+                except TypeError:
+                    outcome = store.sync_source(cfg, conn)
+        finally:
+            try:
+                _sync_status["running"] = False
+                _sync_status["source"] = ""
+                _sync_status["started_at"] = None
+                _sync_status["completed_at"] = time.time()
+                if outcome is not None:
+                    status_str = _safe_str(outcome, "status") or "ok"
+                    _sync_status["last_completed_summary"] = {
+                        "source": cfg.name,
+                        "status": status_str,
+                        "pages_fetched": _safe_int(outcome, "pages_fetched"),
+                        "chunks_indexed": _safe_int(outcome, "chunks_indexed"),
+                        "pages_skipped": _safe_int(outcome, "pages_skipped"),
+                        "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
+                        "error": _safe_str(outcome, "error"),
+                        "finished_at": time.time(),
+                    }
+            finally:
+                release_sync_lock()
+        logger.info("admin_manual_refresh_complete", source_id=source_id, name=record.name, status=outcome.status)
+        return RedirectResponse(
+            url=f"/admin?msg=refreshed+{record.name}:+{outcome.status}",
+            status_code=303,
+            headers={"HX-Trigger": "syncStatusUpdated"},
+        )
+
+    run_sync_task(_bg_sync_single, cfg, lambda: conn, source_id)
+    return RedirectResponse(
+        url=f"/admin?msg=refresh_started+{record.name}",
         status_code=303,
         headers={"HX-Trigger": "syncStatusUpdated"},
     )
@@ -1015,6 +1201,17 @@ def clear_sync_status_view(request: Request, _auth=Depends(require_csrf)):
             "sync_status": _sync_status,
             "csrf_token": _expected_csrf_token(),
         },
+    )
+
+
+@router.post("/sync/stop", response_class=HTMLResponse)
+def stop_sync_submit(request: Request, _auth=Depends(require_csrf)):
+    _sync_cancel_event.set()
+    logger.info("admin_manual_stop_triggered")
+    return RedirectResponse(
+        url="/admin?msg=stop_triggered",
+        status_code=303,
+        headers={"HX-Trigger": "syncStatusUpdated"},
     )
 
 

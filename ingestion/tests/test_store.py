@@ -13,6 +13,7 @@ full pipeline down to actual `vector` column writes.
 from __future__ import annotations
 
 import os
+import threading
 
 import psycopg
 import pytest
@@ -1212,5 +1213,179 @@ def test_recovery_crash_resume_incremental(conn, second_conn, monkeypatch):
         "https://example.com/p3",
         "https://example.com/p4",
     }
+
+
+def test_purge_source_removes_data_and_resets_metadata(conn, second_conn, monkeypatch):
+    source = make_source()
+    existing_urls = [f"https://example.com/page-{i}" for i in range(3)]
+    _seed_pages(conn, monkeypatch, source, existing_urls)
+
+    source_id = store.ensure_source(conn, source)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE doc_sources
+            SET last_synced = NOW(), last_status = 'ok', llms_etag = 'etag-val', llms_last_modified = 'mod-val'
+            WHERE id = %s
+            """,
+            (source_id,),
+        )
+    conn.commit()
+
+    count = store.purge_source(conn, source_id)
+    assert count == 3
+
+    with second_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM doc_pages WHERE source_id = %s", (source_id,))
+        assert cur.fetchone()[0] == 0
+
+        cur.execute(
+            "SELECT last_synced, last_status, llms_etag, llms_last_modified FROM doc_sources WHERE id = %s",
+            (source_id,),
+        )
+        last_synced, last_status, llms_etag, llms_last_modified = cur.fetchone()
+        assert last_synced is None
+        assert last_status is None
+        assert llms_etag is None
+        assert llms_last_modified is None
+
+
+def test_sync_source_aborted_by_cancellation(conn, monkeypatch):
+    source = make_source()
+    cancel_event = threading.Event()
+
+    def crawl_with_cancel(source, client=None):
+        yield {"url": "https://example.com/p1", "html": PAGE_MD}
+        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+
+    def fake_extract(url, html):
+        from app.extract import ExtractionResult
+        return ExtractionResult(url=url, markdown=html, status="ok")
+
+    def progress_cb(outcome, url):
+        if url == "https://example.com/p1":
+            cancel_event.set()
+
+    monkeypatch.setattr(store.crawler, "crawl", crawl_with_cancel)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    outcome = store.sync_source(source, conn, progress_cb=progress_cb, cancel_event=cancel_event)
+    assert outcome.status == "failed"
+    assert outcome.error == "Aborted by user"
+    assert outcome.pages_fetched == 1
+
+
+def test_sync_all_aborted_by_cancellation(conn, monkeypatch):
+    source1 = make_source(name="s1")
+    source2 = make_source(name="s2")
+    store.ensure_source(conn, source1)
+    store.ensure_source(conn, source2)
+    conn.commit()
+
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    results = store.sync_all([source1, source2], cancel_event=cancel_event)
+    assert source1.name in results
+    assert results[source1.name].status == "failed"
+    assert results[source1.name].error == "Aborted by user"
+
+
+def test_all_pages_304_not_modified_reports_status_ok(conn, monkeypatch):
+    source = make_source()
+    _fake_crawl_items(
+        monkeypatch,
+        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+    )
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "ok"
+    assert outcome.pages_not_modified == 1
+    assert outcome.pages_failed == 0
+    assert outcome.pages_fetched == 0
+
+
+def test_all_pages_304_not_modified_does_not_purge_existing_pages(conn, second_conn, monkeypatch):
+    source = make_source()
+    _use_fast_chunk_and_embed(monkeypatch)
+    _seed_pages(conn, monkeypatch, source, ["https://example.com/p1", "https://example.com/p2"])
+    _fake_crawl_items(
+        monkeypatch,
+        [
+            {"url": "https://example.com/p1", "not_modified": True, "fetch_ok": True},
+            {"url": "https://example.com/p2", "not_modified": True, "fetch_ok": True},
+        ],
+    )
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "ok"
+    assert outcome.pages_removed == 0
+    assert outcome.pages_not_modified == 2
+    assert _existing_urls(second_conn, source.name) == {"https://example.com/p1", "https://example.com/p2"}
+
+
+def test_mixed_304_and_fetched_pages_reports_status_ok(conn, monkeypatch):
+    source = make_source()
+    _use_fast_chunk_and_embed(monkeypatch)
+    _fake_crawl_items(
+        monkeypatch,
+        [
+            {"url": "https://example.com/p1", "not_modified": True, "fetch_ok": True},
+            {"url": "https://example.com/p2", "html": PAGE_MD, "fetch_ok": True},
+        ],
+    )
+
+    def fake_extract(url, html):
+        from app.extract import ExtractionResult
+        return ExtractionResult(url=url, markdown=html, status="ok")
+
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "ok"
+    assert outcome.pages_not_modified == 1
+    assert outcome.pages_fetched == 1
+
+
+def test_zero_pages_seen_and_zero_304_still_reports_failed(conn, monkeypatch):
+    source = make_source()
+    _fake_crawl_items(monkeypatch, [])
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "failed"
+    assert outcome.pages_not_modified == 0
+    assert outcome.pages_fetched == 0
+    assert outcome.pages_skipped == 0
+
+
+def test_pages_not_modified_appears_in_sync_complete_log(conn, monkeypatch):
+    source = make_source()
+
+    class _RecordingLog:
+        def __init__(self):
+            self.events = []
+
+        def info(self, event, **kwargs):
+            self.events.append((event, kwargs))
+
+        def bind(self, **kwargs):
+            return self
+
+        def error(self, event, **kwargs):
+            self.events.append((event, kwargs))
+
+    log_stub = _RecordingLog()
+    monkeypatch.setattr(store, "logger", log_stub)
+
+    _fake_crawl_items(
+        monkeypatch,
+        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+    )
+    outcome = store.sync_source(source, conn)
+    assert outcome.status == "ok"
+
+    complete_events = [kw for evt, kw in log_stub.events if evt == "source_sync_complete"]
+    assert len(complete_events) == 1
+    assert "pages_not_modified" in complete_events[0]
+    assert complete_events[0]["pages_not_modified"] == 1
+
 
 

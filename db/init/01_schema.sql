@@ -1,6 +1,6 @@
 -- GENERATED from db/init/01_schema.sql.template by scripts/configure_model.py.
 -- Do not edit by hand — run `make configure MODEL=<name>` to change the vector
--- dimension. Rendered for embedding dimension 1024.
+-- dimension. Rendered for embedding dimension 384.
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE doc_sources (
@@ -31,7 +31,7 @@ CREATE TABLE doc_chunks (
     heading_path  TEXT,                      -- "Guide > Routing > Dynamic Routes"
     chunk_index   INT NOT NULL,
     content       TEXT NOT NULL,             -- markdown
-    embedding     vector(1024) NOT NULL,
+    embedding     vector(384) NOT NULL,
     fts_config    regconfig NOT NULL DEFAULT 'english',
     fts           tsvector GENERATED ALWAYS AS (to_tsvector(fts_config, content)) STORED
 );

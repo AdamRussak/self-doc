@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -434,6 +435,7 @@ def sync_source(
     source: SourceConfig,
     conn: psycopg.Connection,
     progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> SourceOutcome:
     """Run one full sync of `source` against `conn`. Never raises for
     per-page failures (recorded in the outcome); only a source-level failure
@@ -503,6 +505,13 @@ def sync_source(
         # exception it raises happens here, at whichever `next()` triggers
         # it — including the very first one).
         while True:
+            if cancel_event and cancel_event.is_set():
+                log.info("sync_aborted_by_user")
+                outcome.status = "failed"
+                outcome.error = "Aborted by user"
+                crawl_aborted_early = True
+                break
+
             try:
                 page = next(page_iter)
             except StopIteration:
@@ -653,23 +662,38 @@ def sync_source(
             successful_seen_count=len(seen_urls - fetch_failed_urls),
         )
 
-    pages_seen = outcome.pages_fetched + outcome.pages_skipped + outcome.pages_failed + outcome.pages_soft_failed
-    succeeded_any = outcome.pages_fetched > 0 or outcome.pages_skipped > 0 or outcome.pages_soft_failed > 0
-    if pages_seen == 0:
-        # A crawl that fetched/skipped/failed nothing indexed nothing — never
-        # report "ok" for an empty crawl (defeats partial/failed alerting).
+    if cancel_event and cancel_event.is_set():
         outcome.status = "failed"
-    elif outcome.pages_failed == 0:
-        outcome.status = "ok"
-    elif succeeded_any:
-        outcome.status = "partial"
+        outcome.error = "Aborted by user"
     else:
-        outcome.status = "failed"
+        pages_seen = (
+            outcome.pages_fetched
+            + outcome.pages_skipped
+            + outcome.pages_failed
+            + outcome.pages_soft_failed
+            + outcome.pages_not_modified
+        )
+        succeeded_any = (
+            outcome.pages_fetched > 0
+            or outcome.pages_skipped > 0
+            or outcome.pages_soft_failed > 0
+            or outcome.pages_not_modified > 0
+        )
+        if pages_seen == 0:
+            # A crawl that fetched/skipped/failed nothing indexed nothing — never
+            # report "ok" for an empty crawl (defeats partial/failed alerting).
+            outcome.status = "failed"
+        elif outcome.pages_failed == 0:
+            outcome.status = "ok"
+        elif succeeded_any:
+            outcome.status = "partial"
+        else:
+            outcome.status = "failed"
 
-    if crawl_aborted_early and outcome.status == "ok":
-        # The crawl itself didn't finish even though every page it did yield
-        # succeeded — never report a fully-clean "ok" for an incomplete crawl.
-        outcome.status = "partial"
+        if crawl_aborted_early and outcome.status == "ok":
+            # The crawl itself didn't finish even though every page it did yield
+            # succeeded — never report a fully-clean "ok" for an incomplete crawl.
+            outcome.status = "partial"
 
     _update_source_status(conn, source.name, outcome.status)
     log.info(
@@ -677,6 +701,7 @@ def sync_source(
         status=outcome.status,
         pages_fetched=outcome.pages_fetched,
         pages_skipped=outcome.pages_skipped,
+        pages_not_modified=outcome.pages_not_modified,
         pages_failed=outcome.pages_failed,
         pages_soft_failed=outcome.pages_soft_failed,
         pages_removed=outcome.pages_removed,
@@ -688,13 +713,17 @@ def sync_source(
 def sync_all(
     sources: list[SourceConfig],
     progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, SourceOutcome]:
     """Sync each of `sources` in turn, each with its own connection."""
     results: dict[str, SourceOutcome] = {}
     for source in sources:
+        if cancel_event and cancel_event.is_set():
+            results[source.name] = SourceOutcome(name=source.name, status="failed", error="Aborted by user")
+            continue
         conn = get_connection()
         try:
-            results[source.name] = sync_source(source, conn, progress_cb=progress_cb)
+            results[source.name] = sync_source(source, conn, progress_cb=progress_cb, cancel_event=cancel_event)
         finally:
             conn.close()
     return results
@@ -951,6 +980,32 @@ def search_chunks(
             }
         )
     return results
+
+
+def purge_source(conn: psycopg.Connection, source_id: int) -> int:
+    """Delete all doc_pages (cascading to doc_chunks) for source_id,
+    reset last_synced/last_status/llms validators to NULL.
+    Returns the number of pages deleted.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM doc_pages WHERE source_id = %s", (source_id,))
+        (count,) = cur.fetchone()
+
+        cur.execute("DELETE FROM doc_pages WHERE source_id = %s", (source_id,))
+
+        cur.execute(
+            """
+            UPDATE doc_sources
+            SET last_synced = NULL,
+                last_status = NULL,
+                llms_etag = NULL,
+                llms_last_modified = NULL
+            WHERE id = %s
+            """,
+            (source_id,),
+        )
+    return count
+
 
 
 

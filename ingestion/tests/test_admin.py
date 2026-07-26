@@ -856,3 +856,53 @@ def test_sync_status_widget_and_clear(client, csrf_token):
     assert resp.status_code == 200
     assert "last_completed_summary" not in admin._sync_status
     assert 'style="display: none;"' in resp.text
+
+
+def test_admin_purge_source_submit(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _make_record(id=10, name="widget", status="active")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+
+    purged_id = []
+    def fake_purge(conn, source_id):
+        purged_id.append(source_id)
+        return 42
+
+    monkeypatch.setattr(admin.store, "purge_source", fake_purge)
+
+    resp = client.post("/admin/sources/10/purge", data={"csrf_token": csrf_token}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert "purged+widget" in resp.headers["location"]
+    assert purged_id == [10]
+
+
+def test_admin_refresh_source_submit(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _make_record(id=11, name="widget-refresh", status="active")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+
+    purged_id = []
+    def fake_purge(conn, source_id):
+        purged_id.append(source_id)
+        return 42
+
+    monkeypatch.setattr(admin.store, "purge_source", fake_purge)
+
+    outcome = SourceOutcome(name="widget-refresh", status="ok", pages_fetched=5, chunks_indexed=20)
+    sync_mock = MagicMock(return_value=outcome)
+    monkeypatch.setattr(admin.store, "sync_source", sync_mock)
+
+    resp = client.post("/admin/sources/11/refresh", data={"csrf_token": csrf_token}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert "refreshed+widget-refresh:+ok" in resp.headers["location"]
+    assert purged_id == [11]
+    sync_mock.assert_called_once()
+
+
+def test_admin_stop_sync_submit(client, csrf_token):
+    _login(client)
+    admin._sync_cancel_event.clear()
+    resp = client.post("/admin/sync/stop", data={"csrf_token": csrf_token}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert "stop_triggered" in resp.headers["location"]
+    assert admin._sync_cancel_event.is_set()

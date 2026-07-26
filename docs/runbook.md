@@ -82,6 +82,35 @@ when:
 
 ---
 
+## Pre-built Container Images (GHCR)
+
+Pre-built, multi-architecture container images (`linux/amd64` and `linux/arm64`) for both services are automatically published to GitHub Container Registry (GHCR) via CI (`.github/workflows/release.yml`) on every release tag (`v*.*.*`) and update to `main`.
+
+**Package URLs (`<owner>` must be lowercase):**
+- `ghcr.io/<owner>/self-docs-ingestion:latest` (or specific tag like `:v1.0.0` / `:main`)
+- `ghcr.io/<owner>/self-docs-mcp-server:latest`
+
+**Consuming via Docker Compose:**
+If you prefer pulling pre-built images instead of building locally (`docker compose build`), override `build:` in your compose configuration or add `image:` references:
+
+```yaml
+services:
+  ingestion:
+    image: ghcr.io/<owner>/self-docs-ingestion:latest
+  mcp-server:
+    image: ghcr.io/<owner>/self-docs-mcp-server:latest
+```
+
+*Note: The pre-built GHCR images come pre-baked with the default embedding model (`mixedbread-ai/mxbai-embed-large-v1`). If you switch to a custom model via `make configure MODEL=...`, you must build from source so the new ONNX model weights are downloaded during container build.*
+
+**Authentication (if pulling from private registry):**
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
+```
+A GitHub Personal Access Token (PAT) with `read:packages` scope is required when pulling private GHCR packages.
+
+---
+
 ## Deploy / Upgrade — MCP_TOKEN requirement (read before restarting mcp-server)
 
 This applies to any deploy/upgrade that brings the `mcp-server` image up to a
