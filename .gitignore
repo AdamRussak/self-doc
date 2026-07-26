@@ -20,3 +20,6 @@ __pycache__/
 .DS_Store
 CLAUDE.md
 doc-cli
+
+# Agent worktrees created by Claude Code orchestration
+.claude/worktrees/
