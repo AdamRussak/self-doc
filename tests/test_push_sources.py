@@ -46,14 +46,43 @@ def test_validate_source_item_invalid_url():
     assert any("'base_url' must be a valid http(s) URL" in err for err in errors)
 
 
-def test_validate_source_item_missing_max_pages():
+def test_validate_source_item_max_pages_optional():
+    """max_pages may be omitted entirely (server applies its own default)."""
     item = {"name": "fastapi", "base_url": "https://example.com/"}
     errors = push_sources.validate_source_item(item, 0)
-    assert any("'max_pages' is required and must be a positive integer" in err for err in errors)
+    assert errors == []
 
+    # ...but when supplied, it must still be a positive integer.
     item["max_pages"] = 0
     errors = push_sources.validate_source_item(item, 0)
-    assert any("'max_pages' is required and must be a positive integer" in err for err in errors)
+    assert any("'max_pages', when provided, must be a positive integer" in err for err in errors)
+
+    item["max_pages"] = -5
+    errors = push_sources.validate_source_item(item, 0)
+    assert any("'max_pages', when provided, must be a positive integer" in err for err in errors)
+
+    item["max_pages"] = "500"
+    errors = push_sources.validate_source_item(item, 0)
+    assert any("'max_pages', when provided, must be a positive integer" in err for err in errors)
+
+
+def test_validate_source_item_name_optional():
+    """name may be omitted entirely (server derives one from base_url)."""
+    item = {"base_url": "https://example.com/"}
+    errors = push_sources.validate_source_item(item, 0)
+    assert errors == []
+
+    # ...but when supplied, it must still match the naming convention.
+    item["name"] = "Invalid Name!"
+    errors = push_sources.validate_source_item(item, 0)
+    assert any("'name' must be a non-empty string matching ^[a-z0-9-]+$" in err for err in errors)
+
+
+def test_validate_source_item_url_only():
+    """The URL-only contract: an item with only base_url is fully valid."""
+    item = {"base_url": "https://example.com/"}
+    errors = push_sources.validate_source_item(item, 0)
+    assert errors == []
 
 
 def test_validate_source_item_off_host_sitemap():
@@ -106,16 +135,27 @@ def test_prepare_form_data_defaults():
     assert form["llms_txt"] == "auto"
 
 
+def test_prepare_form_data_url_only():
+    """When name/max_pages are omitted, prepare_form_data sends blank strings
+    (the same 'unset' convention already used for sitemap etc.) rather than
+    KeyError-ing or sending the literal string 'None'."""
+    item = {"base_url": "https://minimal.dev/"}
+    form = push_sources.prepare_form_data(item, "csrf-token")
+    assert form["name"] == ""
+    assert form["base_url"] == "https://minimal.dev/"
+    assert form["max_pages"] == ""
+
+
 def test_main_preflight_error(tmp_path, monkeypatch, capsys):
     json_file = tmp_path / "sources.json"
-    json_file.write_text(json.dumps([{"name": "bad_name", "base_url": "https://example.com"}]), encoding="utf-8")
+    json_file.write_text(json.dumps([{"name": "Bad Name!", "base_url": "https://example.com"}]), encoding="utf-8")
 
     monkeypatch.setattr(sys, "argv", ["push_sources.py", "--file", str(json_file), "--token", "secret"])
     exit_code = push_sources.main()
     assert exit_code == 1
     err = capsys.readouterr().err
     assert "Pre-flight validation failed" in err
-    assert "'max_pages' is required" in err
+    assert "'name' must be a non-empty string matching ^[a-z0-9-]+$" in err
 
 
 def test_main_auth_failure(tmp_path, monkeypatch):

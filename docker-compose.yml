@@ -75,6 +75,15 @@ services:
           # Sized per embedding model by `make configure` (config/models.yaml);
           # default fits the 1024-dim mxbai-large ONNX weights + headroom.
           memory: ${INGESTION_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Long grace period: the container loads an ONNX embedding model at boot
+      # (see "loading_embedding_model" log line) before /health can respond;
+      # a shorter start_period would flap the container mid-startup.
+      start_period: 120s
     # No Traefik exposure — reachable inside the compose network.
 
   mcp-server:

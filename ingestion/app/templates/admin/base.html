@@ -517,6 +517,60 @@
       text-transform: uppercase; letter-spacing: 0.06em;
       color: var(--color-text-muted); margin-bottom: 1rem;
     }
+    .form-group {
+      margin-bottom: 1.5rem;
+    }
+
+    /* Progressive-disclosure advanced settings (native <details>/<summary>) */
+    .form-advanced {
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-md);
+      margin-bottom: 1.5rem;
+      background: var(--color-surface-lowest);
+    }
+    .form-advanced-toggle {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.85rem 1rem;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.875rem;
+      color: var(--color-text);
+      list-style: none;
+      user-select: none;
+    }
+    .form-advanced-toggle::-webkit-details-marker {
+      display: none;
+    }
+    .form-advanced-marker {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+      border: 1px solid var(--color-border-hover);
+      border-radius: var(--radius-sm);
+      color: var(--color-text-muted);
+      font-size: 0.8rem;
+      line-height: 1;
+    }
+    .form-advanced-marker::before {
+      content: '+';
+    }
+    .form-advanced[open] .form-advanced-marker::before {
+      content: '\2212';
+    }
+    .form-advanced-body {
+      padding: 0 1.25rem 1.25rem;
+      border-top: 1px solid var(--color-border);
+    }
+    .form-advanced-body .form-section:last-child {
+      border-bottom: none;
+      margin-bottom: 0;
+      padding-bottom: 0;
+    }
     label {
       display: block;
       margin-top: 1.25rem;

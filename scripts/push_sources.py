@@ -43,17 +43,21 @@ def validate_source_item(item: dict[str, Any], index: int) -> list[str]:
     if not isinstance(item, dict):
         return [f"Item #{index + 1} is not a JSON object (dict)."]
 
+    # `name` is optional: base_url is the sole required field. When supplied,
+    # `name` must still match the naming convention enforced server-side.
     name = item.get("name")
-    if not name or not isinstance(name, str) or not NAME_PATTERN.match(name):
+    if name is not None and (not isinstance(name, str) or not name.strip() or not NAME_PATTERN.match(name)):
         errors.append(f"Item #{index + 1}: 'name' must be a non-empty string matching ^[a-z0-9-]+$, got {name!r}.")
 
     base_url = item.get("base_url")
     if not base_url or not isinstance(base_url, str) or not (base_url.startswith("http://") or base_url.startswith("https://")):
         errors.append(f"Item #{index + 1} ({name or 'unknown'}): 'base_url' must be a valid http(s) URL, got {base_url!r}.")
 
+    # `max_pages` is optional: the server applies its own default when unset.
+    # When supplied, it must still be a positive integer.
     max_pages = item.get("max_pages")
-    if max_pages is None or not isinstance(max_pages, int) or max_pages <= 0:
-        errors.append(f"Item #{index + 1} ({name or 'unknown'}): 'max_pages' is required and must be a positive integer, got {max_pages!r}.")
+    if max_pages is not None and (not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages <= 0):
+        errors.append(f"Item #{index + 1} ({name or 'unknown'}): 'max_pages', when provided, must be a positive integer, got {max_pages!r}.")
 
     sitemap = item.get("sitemap")
     if sitemap and isinstance(sitemap, str) and base_url and isinstance(base_url, str):
@@ -79,13 +83,16 @@ def prepare_form_data(item: dict[str, Any], csrf_token: str) -> dict[str, str]:
             return "\n".join(str(p) for p in val if p is not None)
         return str(val)
 
+    # `name` and `max_pages` are optional: send blank strings (the same
+    # "unset" convention already used for `sitemap` etc.) so the admin
+    # endpoint derives/defaults them rather than receiving a stray "None".
     return {
-        "name": str(item["name"]).strip(),
+        "name": str(item.get("name") or "").strip(),
         "base_url": str(item["base_url"]).strip(),
         "sitemap": str(item.get("sitemap") or "").strip(),
         "include_prefixes": join_prefixes(item.get("include_prefixes")),
         "exclude_prefixes": join_prefixes(item.get("exclude_prefixes")),
-        "max_pages": str(item["max_pages"]),
+        "max_pages": str(item["max_pages"]) if item.get("max_pages") is not None else "",
         "language": str(item.get("language") or "english").strip().lower(),
         "rate_limit_rps": str(item.get("rate_limit_rps") if item.get("rate_limit_rps") is not None else "1.0"),
         "llms_txt": str(item.get("llms_txt") or "auto").strip().lower(),
@@ -172,7 +179,9 @@ def main() -> int:
                 skipped_count += 1
                 continue
 
-            name = item["name"].strip()
+            # `name` may be omitted (derived server-side from `base_url`); fall
+            # back to `base_url` for display/logging purposes only.
+            name = str(item.get("name") or item["base_url"]).strip()
             form_payload = prepare_form_data(item, csrf_token)
 
             print(f"[{i+1}/{len(data)}] Pushing source {name!r}...")
