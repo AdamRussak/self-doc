@@ -1,10 +1,52 @@
-# Test-only overlay: publishes the db port on loopback so host-run test
-# suites (`make test`) can reach Postgres directly at 127.0.0.1:5433. NEVER
-# applied to a production `docker compose up` — only combined explicitly via
-# `-f docker-compose.yml -f docker-compose.test.yml` (see Makefile `test`
-# target). Security review finding M1: db must not be reachable from outside
-# the compose network in production.
+# Test-only overlay: brings up a SEPARATE, disposable `db-test` service with
+# its own named volume, so DB-backed tests (`make test`) never touch the
+# production `db` service/volume/data. This is intentionally a distinct
+# service, not a republished port on the production `db` — a shared
+# container+volume on 127.0.0.1:5433 previously let host-run test suites (which
+# exercise purge/delete code paths) run directly against the live index. See
+# docs/runbook.md, "Isolated test database (db-test)".
+#
+# NEVER applied to a production `docker compose up` — only combined explicitly
+# via `-f docker-compose.yml -f docker-compose.test.yml` (see Makefile `test`
+# target). The production `db` service is NOT modified here and stays
+# unpublished (no host port), per security review finding M1: db must not be
+# reachable from outside the compose network in production.
 services:
-  db:
+  db-test:
+    image: pgvector/pgvector:0.8.2-pg16 # pinned — same image as the production `db` service, do NOT float to :pg16
+    container_name: self-docs-db-test
+    restart: "no"
+    environment:
+      TZ: ${TZ:-Asia/Jerusalem}
+      # Fixed, non-production credentials — matches the test suites'
+      # os.environ.setdefault(...) fallbacks (POSTGRES_USER=self_docs,
+      # POSTGRES_PASSWORD=testpass123, POSTGRES_DB=self_docs) so `make test`
+      # works unconfigured. This is a disposable local test database; these
+      # credentials are never used against a real deployment.
+      POSTGRES_USER: self_docs
+      POSTGRES_PASSWORD: testpass123
+      POSTGRES_DB: self_docs
+    volumes:
+      # Own volume — never the production `pgdata` volume — so purge/delete
+      # test paths can never touch real rows, and so `make test-db-reset` can
+      # freely drop this volume without any risk to production data.
+      - pgdata_test:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
     ports:
+      # Loopback-only, matching the rest of this project's binding policy.
       - "127.0.0.1:5433:5432"
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U self_docs -d self_docs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  pgdata_test:

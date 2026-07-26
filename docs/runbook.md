@@ -738,6 +738,75 @@ recover the point-in-time index.
 
 ---
 
+## Isolated test database (db-test)
+
+`make test` never runs against the production `db` service/volume. DB-backed
+tests (ingestion's `test_store.py`/`test_sources_repo.py`/etc,
+mcp-server's `test_retrieval_integration.py`, and the cross-package
+`tests/test_e2e.py`) need a live Postgres, and they exercise purge/delete code
+paths — running them against the real index would risk deleting real rows
+mid-suite.
+
+**The fix: a wholly separate `db-test` service**, defined in
+`docker-compose.test.yml`:
+- Its own container (`self-docs-db-test`), its own named volume
+  (`pgdata_test`) — never the production `pgdata` volume.
+- `db/init/` is bind-mounted the same way as production, so the schema
+  (including the `vector(N)` dimension rendered by `make configure`) always
+  matches what the tests expect.
+- Published on `127.0.0.1:5433` — the same host/port the test suites'
+  `os.environ.setdefault("POSTGRES_PORT", "5433")` fallbacks already expect,
+  so no test code needed to change.
+- Fixed, non-production credentials (`self_docs` / `testpass123` /
+  `self_docs`), matching those same test-suite fallbacks. These credentials
+  are never used for a real deployment and are not secrets.
+
+The production `db` service in `docker-compose.yml` publishes **no host
+port** — it is reachable only inside the compose network
+(`self-docs-internal`), by container DNS (`db:5432`), matching security
+review finding M1. `docker-compose.test.yml` does not touch or extend the
+`db` service at all; `db-test` is a fully independent service definition.
+
+`make test` brings `db-test` up automatically (`test-db-up` target, waited
+until its healthcheck reports `healthy`) before running any suite, and pins
+`EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` for every
+test invocation — matching the deployed default in `config/models.yaml` and
+the `vector(384)` column in `db/init/01_schema.sql`. Without this, DB-backed
+tests fail on `expected 384 dimensions, not 1024` because
+`ingestion/app/embedder.py`'s hardcoded fallback constants
+(`DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`) still default to the 1024-dim
+`mxbai` model — a known, deliberately-untouched mismatch (see
+`test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
+and its ingestion-side twin in `tests/test_model_registry.py`, both
+intentionally left red). Do not "fix" this by editing
+`mcp-server/app/retrieval.py` or `config/models.yaml` — the Makefile
+env-pinning is the correct workaround, not those fallback constants.
+
+**Useful targets:**
+
+```bash
+make test-db-up      # start db-test (own container+volume), wait for healthy
+make test-db-down     # stop the db-test container, keep its data
+make test-db-reset    # stop db-test AND delete pgdata_test — next test-db-up
+                      # re-applies db/init/ from scratch on an empty volume
+```
+
+`db-test` is fully disposable: `make test-db-reset` (or manually `docker
+compose -f docker-compose.yml -f docker-compose.test.yml down -v db-test`)
+wipes it completely with zero risk to the production `pgdata` volume, since
+they are entirely separate named volumes.
+
+**A concurrent process holding `127.0.0.1:5433` on the host** (e.g. a stale
+container from an old, since-removed shape of `docker-compose.test.yml` that
+republished the production `db` service's port instead of using a separate
+`db-test` service) will make `docker compose up -d db-test` fail with "port
+is already allocated". Find and stop whatever is bound to that port
+(`docker ps` / `lsof -iTCP:5433 -sTCP:LISTEN`) — it should never be the
+production `db` container once every deployment/worktree is running the
+current compose files, since `db` no longer publishes a port at all.
+
+---
+
 ## Expected sync durations
 
 Driven by each source's `max_pages` and `rate_limit_rps` (`doc_sources`

@@ -3,7 +3,7 @@ export
 
 PREFIX ?= $(HOME)/.local
 
-.PHONY: up down up-prod down-prod sync test build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
+.PHONY: up down up-prod down-prod sync test test-db-up test-db-down test-db-reset build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
 
 # Select the embedding model from config/models.yaml. Resolves the model's
 # vector dimension and per-service memory limits, writes them into .env, and
@@ -89,9 +89,42 @@ stop:
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
 		-H "Content-Type: application/json"
 
+# Bring up the isolated `db-test` service (own container, own `pgdata_test`
+# volume, schema applied from db/init/) on 127.0.0.1:5433. NEVER the
+# production `db` service/volume — see docker-compose.test.yml and
+# docs/runbook.md, "Isolated test database (db-test)".
+test-db-up:
+	docker compose -f docker-compose.yml -f docker-compose.test.yml up -d db-test
+	@echo "Waiting for db-test to become healthy..."
+	@for i in $$(seq 1 30); do \
+		status=$$(docker inspect -f '{{.State.Health.Status}}' self-docs-db-test 2>/dev/null || echo starting); \
+		if [ "$$status" = "healthy" ]; then echo "db-test is healthy"; exit 0; fi; \
+		sleep 1; \
+	done; \
+	echo "db-test did not become healthy in time" >&2; \
+	docker compose -f docker-compose.yml -f docker-compose.test.yml logs db-test; \
+	exit 1
+
+# Tear down the db-test container (keeps the pgdata_test volume — use
+# test-db-reset to wipe data too).
+test-db-down:
+	docker compose -f docker-compose.yml -f docker-compose.test.yml stop db-test
+
+# Disposable test database: stop db-test and delete its volume, so the next
+# `make test-db-up` re-applies db/init/ from scratch on an empty volume.
+# Usage: make test-db-reset
+test-db-reset:
+	docker compose -f docker-compose.yml -f docker-compose.test.yml down -v db-test
+	@echo "db-test container and pgdata_test volume removed. Run 'make test' or 'make test-db-up' to recreate."
+
 # Runs the full suite for BOTH packages (ingestion, mcp-server), doc-cli Go suite, plus the
 # cross-package e2e test, as the single `make test` entrypoint from repo root.
-test:
+# Brings up the isolated db-test service first (never the production `db`),
+# and pins EMBEDDING_DIM/EMBEDDING_MODEL_NAME to the deployed default
+# (BAAI/bge-small-en-v1.5, dim 384 — matching db/init/01_schema.sql's
+# vector(384)) so DB-backed tests don't fail on the stale 1024-dim mxbai
+# fallback constants baked into the app code.
+test: test-db-up
 	@echo "=== doc-cli Go test suite ==="
 	cd cli && go test -v ./...
 	@echo "=== ensuring ingestion/.venv ==="
@@ -107,12 +140,14 @@ test:
 	@ingestion/.venv/bin/pip install -q pytest-cov
 	@mcp-server/.venv/bin/pip install -q pytest-cov
 	@echo "=== ingestion test suite ==="
-	cd ingestion && ../ingestion/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
+	cd ingestion && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
 	@echo "=== mcp-server test suite ==="
-	cd mcp-server && ../mcp-server/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
+	cd mcp-server && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../mcp-server/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
 	@echo "=== e2e (cross-package) test suite ==="
-	cd tests && ../ingestion/.venv/bin/python -m pytest -q
-	@echo "make test: all suites green (DB-dependent tests skip cleanly if 'docker compose up -d db' wasn't run first)."
+	cd tests && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/python -m pytest -q
+	@echo "make test: all suites green. DB-backed tests ran against the isolated"
+	@echo "db-test service on 127.0.0.1:5433 (own container, own pgdata_test volume) —"
+	@echo "the production db/pgdata volume was never touched."
 
 
 # Run retrieval quality evaluation against a synced database.

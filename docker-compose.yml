@@ -23,12 +23,14 @@ services:
       resources:
         limits:
           memory: 512M
-    # No host port published here in the base file: db must be reachable only
-    # inside the compose network in production (mcp-server/ingestion reach
-    # `db:5432` over the compose network by container DNS regardless). The
-    # host-published loopback mapping needed for `make test` to reach the db
-    # directly from 127.0.0.1:5433 lives in docker-compose.test.yml, an
-    # explicit opt-in overlay — see Makefile's `test` target.
+    # No host port published here in the base file, and never should be: this
+    # `db` service is the production volume (`pgdata`) and must be reachable
+    # only inside the compose network. DB-backed tests do NOT use this
+    # service at all — `make test` brings up a wholly separate `db-test`
+    # service (own container, own `pgdata_test` volume) defined in
+    # docker-compose.test.yml, an explicit opt-in overlay, published on
+    # 127.0.0.1:5433. See docs/runbook.md, "Isolated test database
+    # (db-test)".
 
   ingestion:
     build:
