@@ -159,6 +159,7 @@ def discover_sitemap_urls(
     base_url: str,
     include_prefixes: list[str],
     exclude_prefixes: list[str],
+    truncation_info_out: dict | None = None,
 ) -> list[str]:
     """Discover page URLs from a sitemap.xml, recursing into child sitemaps
     when the root is a `<sitemapindex>` (e.g. appwrite.io/sitemap.xml, whose
@@ -192,6 +193,24 @@ def discover_sitemap_urls(
     watching a sync can tell that `max_pages`, not upstream, decided the
     corpus size (traefik currently sits at 397 pages against `max_pages:
     400`; this fires for real the moment upstream crosses 400).
+
+    URLs at each level are sorted before the cap is applied (see the sort in
+    `_discover_sitemap_urls_recursive`), so that repeated runs over an
+    unchanged sitemap select the SAME slice deterministically. Sitemap
+    enumeration order is not guaranteed stable by the sitemaps.org spec (nor,
+    in practice, by real upstream generators), so capping on arrival order
+    means each run can index a different arbitrary subset of an
+    over-the-cap sitemap — paying full embedding cost every run just to
+    reshuffle which pages are "in" this time, and churning `doc_pages` rows
+    (delete N / (re-)fetch N) for no net change in coverage.
+
+    `truncation_info_out`, if given, is populated (in place) with
+    `{"truncated_at_cap": bool, "unprocessed_child_sitemaps": int}` after
+    the recursion completes — the first-class, programmatically-checkable
+    counterpart to the `sitemap_truncated_at_cap` log line above. Callers
+    (namely `crawl`) use this to decide whether the corpus was fully
+    enumerated at all, which `store.sync_source` needs to know before it is
+    safe to treat "absent from this crawl" as "removed upstream".
     """
     truncation = {"truncated": False, "extra_seen_in_scope": 0, "unprocessed_child_sitemaps": 0}
     collected = _discover_sitemap_urls_recursive(
@@ -215,6 +234,9 @@ def discover_sitemap_urls(
             extra_seen_in_scope=truncation["extra_seen_in_scope"],
             unprocessed_child_sitemaps=truncation["unprocessed_child_sitemaps"],
         )
+    if truncation_info_out is not None:
+        truncation_info_out["truncated_at_cap"] = truncation["truncated"]
+        truncation_info_out["unprocessed_child_sitemaps"] = truncation["unprocessed_child_sitemaps"]
     return collected
 
 
@@ -252,6 +274,17 @@ def _discover_sitemap_urls_recursive(
             continue
         if u not in filtered:
             filtered.append(u)
+
+    # Sort deterministically BEFORE the cap is applied: sitemap enumeration
+    # order is not guaranteed stable (real upstream generators routinely
+    # reorder entries between runs), so capping on arrival order means each
+    # run indexes an arbitrary different slice of an over-the-cap sitemap —
+    # full embedding cost paid every run, and every run's "new" slice looks
+    # like the previous run's slice going missing (delete N / fetch N
+    # churn) even though the corpus didn't actually change. A plain
+    # lexicographic sort on the URL string is enough to make repeated runs
+    # over an unchanged sitemap select the identical `max_pages` slice.
+    filtered.sort()
 
     if len(filtered) > max_pages:
         # Overflow computed cheaply from data already fetched — no extra
@@ -451,6 +484,18 @@ def crawl(
     304, the item `{"url": url, "not_modified": True, "fetch_ok": True}` is
     yielded instead of re-fetching/re-extracting.
 
+    When sitemap-based discovery hit `source.max_pages` before it could
+    enumerate every in-scope URL (see `discover_sitemap_urls`), a final
+    sentinel item `{"kind": "crawl_summary", "truncated_at_cap": True,
+    "unprocessed_child_sitemaps": int, "fetch_ok": True}` is yielded after
+    every page item, right before the generator ends. This is the
+    first-class (non-log-only) signal `store.sync_source` needs: `seen_urls`
+    from a truncated crawl is a real but INCOMPLETE enumeration, so absence
+    from it must not be treated as evidence of upstream removal (unlike a
+    crawl that ran to completion, where absence legitimately means "gone").
+    No sentinel is yielded when discovery was not truncated, or when
+    discovery didn't go through the sitemap path at all (BFS / llms-index).
+
     When `source.llms_txt` is `"auto"` or `"only"`, `crawl` first tries the
     llmstxt.org convention (`llms-full.txt`/`llms.txt`) via `llms_txt`. The two
     file types are handled differently:
@@ -593,6 +638,12 @@ def crawl(
             # "auto" with nothing discovered — the normal sitemap/BFS path.
 
         candidate_urls: list[str] | None = None
+        # Populated by `discover_sitemap_urls` (sitemap path only — the
+        # llms-index and BFS paths have no notion of a truncated enumeration
+        # the way sitemap discovery does) so a first-class, non-log signal
+        # of "the corpus was not fully enumerated" can be surfaced to
+        # `store.sync_source` via the `crawl_summary` sentinel yielded below.
+        sitemap_truncation: dict = {"truncated_at_cap": False, "unprocessed_child_sitemaps": 0}
         if llms_index_urls is not None:
             # Crawl exactly the pages the llms.txt index lists — filtered to
             # same-host + include/exclude prefixes and capped to max_pages,
@@ -624,6 +675,7 @@ def crawl(
                     base_url,
                     source.include_prefixes,
                     source.exclude_prefixes,
+                    truncation_info_out=sitemap_truncation,
                 )
                 log.info("sitemap_discovered", count=len(candidate_urls))
             except (httpx.HTTPError, ElementTree.ParseError, ValueError) as e:
@@ -741,6 +793,23 @@ def crawl(
                     for link in extract_links(item["html"], url):
                         if link not in visited and _same_host(link, base_url):
                             queue.append(link)
+
+        if sitemap_truncation["truncated_at_cap"]:
+            # First-class (non-log) truncation signal, yielded as the last
+            # item of the crawl: `store.sync_source` reads this to decide
+            # whether `seen_urls` is a trustworthy, COMPLETE enumeration of
+            # the source before it is safe to purge any `doc_pages` row
+            # absent from it. A `sitemap_truncated_at_cap`/log-only signal
+            # (still emitted separately, see `discover_sitemap_urls`) is not
+            # enough — an operator has to be watching logs; this makes the
+            # information part of the return contract every caller already
+            # consumes.
+            yield {
+                "kind": "crawl_summary",
+                "truncated_at_cap": True,
+                "unprocessed_child_sitemaps": sitemap_truncation["unprocessed_child_sitemaps"],
+                "fetch_ok": True,
+            }
 
         log.info("crawl_complete", pages_fetched=pages_fetched)
     finally:

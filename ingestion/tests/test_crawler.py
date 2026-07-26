@@ -83,7 +83,18 @@ def test_sitemap_discovery_bounded_by_max_pages():
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
-    assert len(pages) == 1
+    # A truncated sitemap discovery now also yields a first-class
+    # `crawl_summary` sentinel after the page items (see
+    # `test_crawl_yields_crawl_summary_sentinel_when_sitemap_truncated`), so
+    # page items are counted separately from it here.
+    page_items = [p for p in pages if "url" in p]
+    assert len(page_items) == 1
+    assert pages[-1] == {
+        "kind": "crawl_summary",
+        "truncated_at_cap": True,
+        "unprocessed_child_sitemaps": 0,
+        "fetch_ok": True,
+    }
 
 
 def test_sitemap_discovery_unlimited_when_max_pages_none():
@@ -1458,4 +1469,256 @@ def test_permanent_failure_after_retry_exhaustion_yields_fetch_ok_false():
     assert len(pages) == 1
     assert pages[0]["fetch_ok"] is False
     assert pages[0]["html"] is None
+
+
+# --- T5: sitemap-cap index churn regression tests ---------------------------
+#
+# Real production incident: three sources (`gemini-api`, cap 500/221 extra
+# in-scope; `google-search-console-api`, cap 100/26 extra in-scope, 34
+# unprocessed child sitemaps; `puppeteer`, cap 250/373 extra in-scope) hit
+# `sitemap_truncated_at_cap`. Sitemap enumeration order is not guaranteed
+# stable, so each run's `max_pages`-capped slice was an arbitrary subset of
+# the in-scope corpus -- `gemini-api` and `google-search-console-api` each
+# fetched exactly as many pages as they deleted, every run, paying full
+# embedding cost to arrive at the same page COUNT with different page
+# CONTENTS each time.
+
+
+def test_discover_sitemap_urls_deterministic_across_shuffled_arrival_order():
+    """The core determinism fix: two `discover_sitemap_urls` calls over the
+    SAME set of in-scope URLs, but with the sitemap listing them in a
+    DIFFERENT order (simulating upstream reshuffling entries between two
+    real runs over an otherwise-unchanged corpus), must select the
+    IDENTICAL `max_pages` slice. Before the fix, capping on arrival order
+    meant the returned slice depended entirely on the order the sitemap
+    happened to list them in that particular run."""
+    urls = [f"https://docs-fixture.dev/docs/{i:03d}" for i in range(40)]
+    shuffled = urls[::-1][:20] + urls[::-1][20:]  # a different, non-sorted order
+    assert shuffled != urls
+
+    def make_sitemap_xml(url_list):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + "".join(f"<url><loc>{u}</loc></url>" for u in url_list)
+            + "</urlset>"
+        )
+
+    def handler_factory(url_list):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == "https://docs-fixture.dev/sitemap.xml":
+                return httpx.Response(200, text=make_sitemap_xml(url_list))
+            return httpx.Response(404)
+
+        return handler
+
+    result_1 = discover_sitemap_urls(
+        make_client(handler_factory(urls)),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=10,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+    )
+    result_2 = discover_sitemap_urls(
+        make_client(handler_factory(shuffled)),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=10,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+    )
+    assert len(result_1) == 10
+    assert result_1 == result_2
+    # And it's actually sorted, not coincidentally equal.
+    assert result_1 == sorted(result_1)
+
+
+def test_discover_sitemap_urls_truncation_info_out_reports_cap_truncation():
+    """`truncation_info_out`, when given, is populated with the first-class
+    (non-log) `truncated_at_cap` / `unprocessed_child_sitemaps` signal that
+    `crawl()` surfaces onward to `store.sync_source` via the
+    `crawl_summary` sentinel."""
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(10))
+        + "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://docs-fixture.dev/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(404)
+
+    truncation_info: dict = {}
+    discover_sitemap_urls(
+        make_client(handler),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=3,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+        truncation_info_out=truncation_info,
+    )
+    assert truncation_info == {"truncated_at_cap": True, "unprocessed_child_sitemaps": 0}
+
+
+def test_discover_sitemap_urls_truncation_info_out_reports_no_truncation_under_cap():
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(3))
+        + "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://docs-fixture.dev/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(404)
+
+    truncation_info: dict = {}
+    discover_sitemap_urls(
+        make_client(handler),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=10,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+        truncation_info_out=truncation_info,
+    )
+    assert truncation_info == {"truncated_at_cap": False, "unprocessed_child_sitemaps": 0}
+
+
+def test_crawl_yields_crawl_summary_sentinel_when_sitemap_truncated():
+    """`crawl()` itself (not just `discover_sitemap_urls`) must surface the
+    truncation as a first-class item in its own yield stream -- the contract
+    `store.sync_source` actually consumes -- as the LAST item, after every
+    page."""
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(5))
+        + "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://docs-fixture.dev/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
+        max_pages=2,
+        rate_limit_rps=1000,
+    )
+    pages = list(crawl(source, client=make_client(handler)))
+    assert len(pages) == 3  # 2 fetched pages + the summary sentinel
+    assert [p["url"] for p in pages if "url" in p] == [
+        "https://docs-fixture.dev/docs/0",
+        "https://docs-fixture.dev/docs/1",
+    ]
+    assert pages[-1] == {
+        "kind": "crawl_summary",
+        "truncated_at_cap": True,
+        "unprocessed_child_sitemaps": 0,
+        "fetch_ok": True,
+    }
+
+
+def test_crawl_does_not_yield_crawl_summary_sentinel_when_not_truncated():
+    """No truncation, no sentinel -- keeps the common (untruncated) case's
+    yield stream unchanged."""
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(2))
+        + "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://docs-fixture.dev/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
+        max_pages=10,
+        rate_limit_rps=1000,
+    )
+    pages = list(crawl(source, client=make_client(handler)))
+    assert len(pages) == 2
+    assert all(p.get("kind") != "crawl_summary" for p in pages)
+
+
+def test_crawl_google_search_console_shaped_truncation_reports_unprocessed_children():
+    """google-search-console-api-shaped fixture: a sitemap index whose
+    children are, in aggregate, far larger than `max_pages`, so most child
+    sitemaps are never even fetched. The `crawl_summary` sentinel must
+    report the actual `unprocessed_child_sitemaps` count."""
+    index_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + "".join(f"<sitemap><loc>https://docs-fixture.dev/sitemaps/child-{i}.xml</loc></sitemap>" for i in range(40))
+        + "</sitemapindex>"
+    )
+    # Each child sitemap contributes 10 URLs; with max_pages=100 exactly the
+    # first ~10 (sorted) children are consumed and the other ~30 are never
+    # fetched at all -- shaped after the real google-search-console-api
+    # incident (34 of 40 child sitemaps unprocessed).
+    child_urls = {
+        f"https://docs-fixture.dev/sitemaps/child-{i}.xml": [
+            f"https://docs-fixture.dev/docs/{i}/{j}" for j in range(10)
+        ]
+        for i in range(40)
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://docs-fixture.dev/sitemap.xml":
+            return httpx.Response(200, text=index_xml)
+        if url in child_urls:
+            urls_xml = "".join(f"<url><loc>{u}</loc></url>" for u in child_urls[url])
+            return httpx.Response(
+                200,
+                text=(
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + urls_xml + "</urlset>"
+                ),
+            )
+        return httpx.Response(200, text=PAGE_HTML)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
+        max_pages=100,
+        rate_limit_rps=1000,
+    )
+    pages = list(crawl(source, client=make_client(handler)))
+    summary = [p for p in pages if p.get("kind") == "crawl_summary"]
+    assert len(summary) == 1
+    assert summary[0]["truncated_at_cap"] is True
+    # 100 pages / 10 per child = 10 children consumed, 30 unprocessed.
+    assert summary[0]["unprocessed_child_sitemaps"] == 30
 

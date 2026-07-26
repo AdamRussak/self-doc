@@ -106,6 +106,31 @@ def test_crawl_aborted_early_is_partial_even_when_every_page_seen_succeeded():
     assert classify_sync(outcome, crawl_aborted_early=True, purge_guard_refused=False) == "partial"
 
 
+# --- Rule 4b: crawl_truncated (T5 -- sitemap max_pages truncation).
+def test_crawl_truncated_is_partial_even_when_every_page_seen_succeeded():
+    # gemini-api/google-search-console-api shaped: every page the (capped)
+    # crawl reached was fetched successfully, but the enumeration itself was
+    # provably incomplete -- this must still demote to "partial".
+    outcome = _outcome(pages_fetched=500)
+    assert (
+        classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False, crawl_truncated=True)
+        == "partial"
+    )
+
+
+def test_crawl_truncated_defaults_to_false_and_does_not_affect_otherwise_clean_sync():
+    outcome = _outcome(pages_fetched=5)
+    assert classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False) == "ok"
+
+
+def test_crawl_truncated_outranked_by_cancellation():
+    outcome = _outcome(pages_fetched=10, error="Aborted by user")
+    assert (
+        classify_sync(outcome, crawl_aborted_early=False, purge_guard_refused=False, crawl_truncated=True)
+        == "failed"
+    )
+
+
 # --- Rule 5: hard failures.
 def test_any_hard_failure_is_partial_when_something_else_succeeded():
     outcome = _outcome(pages_fetched=1, pages_failed=1)

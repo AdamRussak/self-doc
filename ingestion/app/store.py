@@ -22,6 +22,21 @@ task description):
     pages failed but at least one succeeded/was unchanged), or `failed`
     (source-level failure, e.g. the crawl itself raised — dead sitemap host,
     etc.).
+  - When `crawler.crawl` reports its sitemap discovery was truncated at
+    `max_pages` (a `crawl_summary` sentinel item with `truncated_at_cap:
+    True` — see `crawler.crawl`'s docstring), `seen_urls` is a real but
+    INCOMPLETE enumeration of the source. Deleting the "missing" pages is
+    therefore unsafe: absence from an incomplete enumeration is not evidence
+    of upstream removal, only of not having been sampled this run. This
+    sync's `_delete_missing_pages` step is skipped entirely (same treatment
+    as `crawl_aborted_early`) and the sync classifies as `partial` via
+    `classify_sync`'s `crawl_truncated` parameter. Fixes the 2026 sync-drift
+    incident where two sources (`gemini-api`, `google-search-console-api`)
+    fetched exactly as many pages as they deleted on every run, because
+    sitemap enumeration order is not stable and each run sampled a different
+    arbitrary slice under the cap. (`crawler.discover_sitemap_urls` now also
+    sorts URLs before applying the cap so repeated runs over an unchanged
+    sitemap select the identical slice, independent of this guard.)
 """
 
 from __future__ import annotations
@@ -169,11 +184,12 @@ def classify_sync(
     *,
     crawl_aborted_early: bool = False,
     purge_guard_refused: bool = False,
+    crawl_truncated: bool = False,
 ) -> str:
     """Classify one sync attempt's final `outcome` into `ok` / `partial` /
     `failed`, as an explicit, directly-testable function of the outcome's
-    counters plus the two out-of-band signals the counters alone can't
-    convey (`crawl_aborted_early`, `purge_guard_refused`).
+    counters plus the out-of-band signals the counters alone can't convey
+    (`crawl_aborted_early`, `purge_guard_refused`, `crawl_truncated`).
 
     Rules, evaluated IN ORDER (first match wins):
 
@@ -190,6 +206,20 @@ def classify_sync(
       partial - `crawl_aborted_early` (the crawl broke off mid-stream; every
                 page it did reach may have succeeded, but the corpus is
                 incomplete)
+      partial - `crawl_truncated` (sitemap discovery hit `max_pages` before
+                fully enumerating the in-scope corpus — see
+                `crawler.discover_sitemap_urls`/`crawler.crawl`'s
+                `crawl_summary` sentinel. Kept as ITS OWN parameter rather
+                than folded into `crawl_aborted_early`: an abort is a
+                mid-stream break with pages after the break point never
+                visited at all, whereas a truncation is a crawl that ran to
+                a clean, deliberate stop with every yielded page fully
+                processed — same downstream consequence (an incomplete
+                enumeration that must not license `_delete_missing_pages`),
+                but a different cause an operator debugging a "partial"
+                status needs to be able to tell apart, and a future caller
+                may legitimately want to abort without having discovery
+                truncated, or vice versa)
       partial - `pages_failed > 0` (at least one HARD pipeline failure)
       partial - soft-failure ratio exceeds `SOFT_FAIL_PARTIAL_RATIO`:
                 `pages_soft_failed / pages_seen > SOFT_FAIL_PARTIAL_RATIO`,
@@ -209,6 +239,9 @@ def classify_sync(
         return "partial"
 
     if crawl_aborted_early:
+        return "partial"
+
+    if crawl_truncated:
         return "partial"
 
     if outcome.pages_failed > 0:
@@ -591,6 +624,8 @@ def sync_source(
     fetch_failed_urls: set[str] = set()
     crawl_aborted_early = False
     llms_unchanged = False
+    crawl_truncated = False
+    unprocessed_child_sitemaps = 0
 
     try:
         # `crawl()` is a generator: pages are pulled and committed one at a
@@ -626,6 +661,20 @@ def sync_source(
                 llms_unchanged = True
                 log.info("llms_index_unchanged", url=page.get("url"))
                 break
+
+            if page.get("kind") == "crawl_summary":
+                # First-class (non-log) truncation signal from
+                # `crawler.crawl` — see its docstring. Yielded as the last
+                # item, so record it and keep iterating (the next `next()`
+                # call raises StopIteration, ending the loop normally).
+                crawl_truncated = bool(page.get("truncated_at_cap"))
+                unprocessed_child_sitemaps = page.get("unprocessed_child_sitemaps", 0)
+                log.info(
+                    "crawl_truncated_received",
+                    truncated_at_cap=crawl_truncated,
+                    unprocessed_child_sitemaps=unprocessed_child_sitemaps,
+                )
+                continue
 
             url = page["url"]
             seen_urls.add(url)
@@ -731,8 +780,9 @@ def sync_source(
         return outcome
 
     # `seen_urls` is only a trustworthy, COMPLETE enumeration of the source
-    # when the crawl actually reached `StopIteration`. Two distinct unsafe
-    # cases both funnel through here and must both be refused:
+    # when the crawl actually reached `StopIteration` having enumerated the
+    # full in-scope corpus. Three distinct unsafe cases all funnel through
+    # here and must all be refused:
     #   1. `crawl_aborted_early` — the crawl broke off mid-stream; pages
     #      after the break point were never (re)visited, so purging
     #      "missing" pages would delete everything the crawl hadn't reached
@@ -743,14 +793,35 @@ def sync_source(
     #      `crawl_aborted_early` is False here, but `seen_urls` is just as
     #      untrustworthy: it says nothing about which pages still exist
     #      upstream, only that the crawler saw none of them this run.
-    # Either way, `_delete_missing_pages` also refuses an empty `seen_urls`
-    # on its own (defense in depth) — this check exists to log the *reason*
-    # for skipping in a way that's specific to sync_source's two cases.
+    #   3. `crawl_truncated` — sitemap discovery hit `max_pages` (or ran out
+    #      of budget before processing every child sitemap) before it could
+    #      enumerate the full in-scope corpus. Unlike case 1, every page the
+    #      crawl DID yield was fully processed — but `seen_urls` is still
+    #      only an arbitrary SLICE of what exists upstream, not the whole
+    #      corpus, so a page's absence proves nothing about whether it was
+    #      removed. This is the 2026 sync-drift incident: two sources
+    #      (`gemini-api`, `google-search-console-api`) fetched exactly as
+    #      many pages as they deleted, every run, because a different
+    #      arbitrary slice was sampled and the previous run's slice read as
+    #      "missing".
+    # `_delete_missing_pages` also refuses an empty `seen_urls` on its own
+    # (defense in depth) — this check exists to log the *reason* for
+    # skipping in a way that's specific to sync_source's cases.
     purge_guard_refused_flag: list[bool] = []
-    if crawl_aborted_early or not seen_urls:
+    if crawl_aborted_early or crawl_truncated or not seen_urls:
         outcome.pages_removed = 0
-        reason = "crawl_aborted_early" if crawl_aborted_early else "completed_with_zero_pages_seen"
-        log.info("stale_page_purge_skipped", reason=reason, pages_seen=len(seen_urls))
+        if crawl_aborted_early:
+            reason = "crawl_aborted_early"
+        elif crawl_truncated:
+            reason = "crawl_truncated"
+        else:
+            reason = "completed_with_zero_pages_seen"
+        log.info(
+            "stale_page_purge_skipped",
+            reason=reason,
+            pages_seen=len(seen_urls),
+            unprocessed_child_sitemaps=unprocessed_child_sitemaps,
+        )
     else:
         outcome.pages_removed = _delete_missing_pages(
             conn,
@@ -770,6 +841,7 @@ def sync_source(
             outcome,
             crawl_aborted_early=crawl_aborted_early,
             purge_guard_refused=purge_guard_refused,
+            crawl_truncated=crawl_truncated,
         )
 
     _update_source_status(conn, source.name, outcome.status)
@@ -783,6 +855,7 @@ def sync_source(
         pages_soft_failed=outcome.pages_soft_failed,
         pages_removed=outcome.pages_removed,
         chunks_indexed=outcome.chunks_indexed,
+        crawl_truncated=crawl_truncated,
     )
     return outcome
 

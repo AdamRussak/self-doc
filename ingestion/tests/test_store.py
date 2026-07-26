@@ -1444,3 +1444,153 @@ def test_page_unchanged_skip_is_not_logged_at_info(conn, monkeypatch):
     assert level != "info"
 
 
+# --- T5: sitemap-cap index churn regression tests ---------------------------
+#
+# Real incident: `gemini-api` (cap 500, 221 extra in-scope) and
+# `google-search-console-api` (cap 100, 26 extra in-scope, 34 unprocessed
+# child sitemaps) each fetched exactly as many pages as they deleted, every
+# run, because sitemap enumeration order is not stable and each run's
+# `max_pages`-capped slice was an arbitrary subset of the in-scope corpus.
+# `crawler.crawl` now yields a `crawl_summary` sentinel
+# (`{"kind": "crawl_summary", "truncated_at_cap": bool,
+# "unprocessed_child_sitemaps": int, "fetch_ok": True}`) as its last item
+# when sitemap discovery was truncated; these tests exercise
+# `store.sync_source`'s handling of that sentinel end to end against a live
+# database.
+
+
+def _fake_crawl_with_summary(
+    monkeypatch,
+    pages_by_url: dict[str, str],
+    *,
+    truncated_at_cap: bool,
+    unprocessed_child_sitemaps: int = 0,
+):
+    """Like `_fake_crawl_extract`, but `crawler.crawl` is a GENERATOR (as in
+    production) that also yields the `crawl_summary` sentinel when
+    `truncated_at_cap` is True -- exactly the contract `crawl()` now
+    implements for a sitemap discovery capped by `max_pages`."""
+
+    def fake_crawl(source, client=None, conditional=None):
+        for url, html in pages_by_url.items():
+            yield {"url": url, "html": html, "fetch_ok": True}
+        if truncated_at_cap:
+            yield {
+                "kind": "crawl_summary",
+                "truncated_at_cap": True,
+                "unprocessed_child_sitemaps": unprocessed_child_sitemaps,
+                "fetch_ok": True,
+            }
+
+    def fake_extract(url, html):
+        from app.extract import ExtractionResult
+
+        return ExtractionResult(url=url, markdown=html, status="ok")
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+
+def test_sitemap_truncation_skips_delete_missing_gemini_shaped(conn, second_conn, monkeypatch):
+    """gemini-api-shaped fixture: cap 500, and the corpus actually has 221
+    more in-scope URLs than the cap allows (721 total in scope). Sitemap
+    enumeration order is not stable, so a second run over the SAME 721-URL
+    corpus can return a different 500-URL slice -- this fixture shifts the
+    window by 167, so 167 previously-indexed pages are absent from this
+    run and 167 different pages are newly present. This is the exact shape
+    of the real incident: `gemini-api` fetched 167 pages and deleted 167
+    pages, every run, net corpus size unchanged but CONTENT churning for no
+    reason. With the `crawl_summary` truncation signal now honored, this
+    run must fetch its slice WITHOUT deleting the 167 pages missing from
+    it."""
+    source = make_source(max_pages=500)
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    existing_urls = [f"https://docs-fixture.dev/page-{i:04d}" for i in range(500)]
+    _seed_pages(conn, monkeypatch, source, existing_urls)
+    assert _existing_urls(conn, source.name) == set(existing_urls)
+
+    # A different arbitrary 500-URL slice of the same 721-URL in-scope
+    # corpus: shifted by 167 (167 old pages absent, 167 new pages present).
+    shifted_urls = [f"https://docs-fixture.dev/page-{i:04d}" for i in range(167, 667)]
+    assert len(shifted_urls) == 500
+    missing_from_this_run = set(existing_urls) - set(shifted_urls)
+    assert len(missing_from_this_run) == 167
+
+    _fake_crawl_with_summary(
+        monkeypatch,
+        {u: PAGE_MD for u in shifted_urls},
+        truncated_at_cap=True,
+        unprocessed_child_sitemaps=3,
+    )
+
+    outcome = store.sync_source(source, conn)
+
+    # The fix under test: zero pages removed, despite 167 previously-indexed
+    # pages being absent from this run's slice -- proving the fetch-167 /
+    # delete-167 churn no longer occurs.
+    assert outcome.pages_removed == 0
+    assert outcome.status == "partial"
+
+    remaining = _existing_urls(second_conn, source.name)
+    # Every old page (including the 167 "missing" ones) is still there,
+    # plus the newly fetched ones -- nothing was churned away.
+    assert missing_from_this_run <= remaining
+    assert set(shifted_urls) <= remaining
+    assert remaining == set(existing_urls) | set(shifted_urls)
+
+
+def test_sitemap_truncation_google_search_console_shaped_reports_partial(conn, monkeypatch):
+    """google-search-console-api-shaped fixture: cap 100, 34 of 40 child
+    sitemaps never even processed (one timed out mid-run in the real
+    incident). A truncated crawl -- even one where every fetched page
+    succeeded -- must classify as `partial`, not `ok`: the corpus sampled is
+    provably incomplete."""
+    source = make_source(max_pages=100)
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    urls = [f"https://docs-fixture.dev/gsc/page-{i:03d}" for i in range(100)]
+    _fake_crawl_with_summary(
+        monkeypatch,
+        {u: PAGE_MD for u in urls},
+        truncated_at_cap=True,
+        unprocessed_child_sitemaps=34,
+    )
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.status == "partial"
+    assert outcome.pages_fetched == 100
+    assert outcome.pages_failed == 0
+    assert outcome.pages_removed == 0
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_status FROM doc_sources WHERE name = %s", (source.name,))
+        (status,) = cur.fetchone()
+    assert status == "partial"
+
+
+def test_sitemap_truncation_absent_summary_still_purges_normally(conn, second_conn, monkeypatch):
+    """Regression guard for the guard itself: a crawl that completes WITHOUT
+    a `crawl_summary` sentinel (the untruncated, common case) must still
+    purge genuinely-removed pages exactly as before -- `crawl_truncated`
+    defaults to False and must not accidentally protect every sync."""
+    source = make_source(max_pages=500)
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    existing_urls = [f"https://docs-fixture.dev/plain-{i}" for i in range(5)]
+    _seed_pages(conn, monkeypatch, source, existing_urls)
+
+    # Untruncated re-crawl that legitimately no longer sees page-4.
+    _fake_crawl_with_summary(
+        monkeypatch,
+        {u: PAGE_MD for u in existing_urls[:4]},
+        truncated_at_cap=False,
+    )
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.pages_removed == 1
+    assert outcome.status == "ok"
+    assert _existing_urls(second_conn, source.name) == set(existing_urls[:4])
+
+
