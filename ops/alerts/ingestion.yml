@@ -1,0 +1,229 @@
+# Prometheus alerting rules for the `ingestion` service.
+#
+# Source of these seven metrics: `ingestion/app/metrics.py` /
+# `record_sync_outcome`, called once per *completed* sync (any status —
+# ok, partial, or failed) via `store.sync_source_with_metrics`, the single
+# choke point every sync entrypoint (main.py's `POST /sync`, admin.py's
+# manual-sync routes, the scheduler) routes through:
+#
+#   pages_fetched_total{source}            (Counter)
+#   pages_skipped_unchanged_total{source}  (Counter)
+#   pages_not_modified_total{source}       (Counter)
+#   pages_soft_failed_total{source}        (Counter)
+#   chunks_indexed_total{source}           (Counter)
+#   sync_duration_seconds{source}          (Histogram — _count increases once
+#                                            per completed sync regardless of
+#                                            status, so `increase(..._count)`
+#                                            is this file's "a sync attempt
+#                                            finished in this window" signal)
+#   sync_last_success_timestamp{source}    (Gauge — set to now() on status
+#                                            "ok" AND "partial"; left UNTOUCHED
+#                                            on "failed")
+#
+# KNOWN METRICS GAP (read before editing SourceSyncDegraded): there is no
+# `pages_failed_total` (hard-failure) counter exported today — see
+# `ingestion/app/store.py`'s `SourceOutcome.pages_failed` / `classify_sync`.
+# Hard failures are invisible to every one of the seven series above (a
+# hard-failed page increments neither `pages_fetched_total` nor any other
+# counter here). This file cannot literally query "status == partial"
+# because that label does not exist in Prometheus; `SourceSyncDegraded`
+# below uses the closest available proxy and says so in its own comment.
+# Do not edit `ingestion/app/metrics.py` to "fix" this from this task — it
+# is out of scope for T4 (metric names/labels are owned elsewhere); flag it
+# as a follow-up instead.
+#
+# Cadence assumption used throughout: syncs run ~daily and take ~3.5h
+# end-to-end for the full source set (see docs/runbook.md "Expected sync
+# durations"). Every "did a run happen / how much did it do" window below
+# uses 30h (24h cadence + ~6h slack for schedule jitter and the ~3.5h
+# per-source run length) so a rule evaluates the most recently completed
+# run without double-counting into the next one and without flapping
+# between evaluations.
+groups:
+  - name: self-docs-ingestion
+    rules:
+      # ----------------------------------------------------------------
+      # SourceSyncStale
+      #
+      # `time() - sync_last_success_timestamp` is an instant-vector
+      # expression: it only ever evaluates over series that already
+      # exist. A source whose gauge has NEVER been set (no completed
+      # "ok"/"partial" sync since the series was created — e.g. every
+      # attempt so far has hard-failed) simply has no
+      # `sync_last_success_timestamp{source="x"}` series to subtract
+      # against, so it is silently excluded from this expression's
+      # result set — it reads as ABSENT, not as a (bogus, arbitrarily
+      # large) "stale" value. That is intentional and is a DIFFERENT
+      # failure mode than staleness: per-label absence can't be alerted
+      # on directly here without an enumerated source list (which this
+      # file deliberately avoids — sources are added/removed at
+      # runtime), and in practice a source with zero-ever successful
+      # syncs is caught by other signals instead (SourceIndexedNothing
+      # once it does complete a run with zero pages, or plain absence
+      # of the source from `GET /status` for anyone actually watching
+      # a brand-new source's first sync). Do not "fix" this rule to
+      # also catch never-set series by using an `or vector(9e9)`-style
+      # trick — that would conflate two distinct failures into one
+      # alert name and muddy triage.
+      #
+      # Threshold: 48h. One missed daily sync is not yet an incident
+      # (could be a single scheduler hiccup); two is. 48h also comfortably
+      # exceeds the ~3.5h run length so a sync that's merely running long
+      # never trips this.
+      - alert: SourceSyncStale
+        expr: time() - max by (source) (sync_last_success_timestamp) > 172800
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Source "{{ $labels.source }}" has not completed a successful (ok/partial) sync in over 48h.'
+          description: >-
+            {{ $labels.source }}: last successful sync was {{ $value | humanizeDuration }} ago.
+            Check the scheduler and `GET /status` for this source.
+          runbook: 'docs/runbook.md#alert-sourcesyncstale'
+
+      # ----------------------------------------------------------------
+      # SourceSyncDegraded
+      #
+      # PROXY ALERT — see the file-level "KNOWN METRICS GAP" comment
+      # above. In lieu of a direct `pages_failed_total`/status signal,
+      # this treats a source whose total successfully-accounted-for page
+      # volume (fetched + hash-skipped + 304-not-modified — deliberately
+      # excluding pages_soft_failed_total, since soft failures are
+      # expected site noise and must NOT degrade status per
+      # docs/runbook.md's "Page Classification & Source Status Semantics")
+      # collapses to under half its own volume from the run before, on
+      # two consecutive runs, as the observable stand-in for "reporting
+      # partial repeatedly." A single bad run is noise (a flaky upstream
+      # page, a transient DB blip); the same source shrinking twice in a
+      # row is a trend worth paging on.
+      #
+      # `offset 30h` / `offset 60h` step back exactly one and two run
+      # windows (see the file header for the 30h "one completed run"
+      # rationale).
+      - alert: SourceSyncDegraded
+        expr: |-
+          (
+            (increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]))
+            <
+            0.5 * (increase(pages_fetched_total[30h] offset 30h) + increase(pages_skipped_unchanged_total[30h] offset 30h) + increase(pages_not_modified_total[30h] offset 30h))
+          )
+          and
+          (
+            (increase(pages_fetched_total[30h] offset 30h) + increase(pages_skipped_unchanged_total[30h] offset 30h) + increase(pages_not_modified_total[30h] offset 30h))
+            <
+            0.5 * (increase(pages_fetched_total[30h] offset 60h) + increase(pages_skipped_unchanged_total[30h] offset 60h) + increase(pages_not_modified_total[30h] offset 60h))
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Source "{{ $labels.source }}" indexed less than half its usual page volume on two consecutive runs.'
+          description: >-
+            {{ $labels.source }}: successfully-processed page volume dropped by
+            >50% run-over-run, twice in a row. Proxy signal for a repeatedly
+            "partial" source — see the runbook section for how to confirm the
+            actual status via `GET /status`.
+          runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
+
+      # ----------------------------------------------------------------
+      # SourceIndexedNothing
+      #
+      # The exact "reports ok but indexes nothing" trap (see docs/runbook.md
+      # Troubleshooting: dead/moved sitemap -> BFS fallback -> own
+      # include_prefixes filters out base_url -> zero pages, but
+      # last_status is still "ok" because pages_failed == 0). Requires
+      # BOTH: a sync attempt actually finished in the window
+      # (`sync_duration_seconds_count` increased — otherwise a source that
+      # simply hasn't run yet this window would falsely match "zero
+      # everything", which is SourceSyncStale's job, not this one) AND the
+      # three "something happened to a page" counters summed to zero.
+      - alert: SourceIndexedNothing
+        expr: |-
+          increase(sync_duration_seconds_count[30h]) > 0
+          and
+          (increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h])) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Source "{{ $labels.source }}" completed a sync but indexed zero pages.'
+          description: >-
+            {{ $labels.source }}: a sync run finished in the last 30h window
+            with pages_fetched + pages_skipped_unchanged + pages_not_modified
+            == 0. This is the "reports ok but indexed nothing" failure mode —
+            check the source's sitemap/include_prefixes.
+          runbook: 'docs/runbook.md#alert-sourceindexednothing'
+
+      # ----------------------------------------------------------------
+      # SoftFailRatioHigh
+      #
+      # The traefik case: 117 of 280 pages soft-failed (41.8%) while the
+      # source still reported "ok" (soft failures don't degrade status
+      # by design — see docs/runbook.md's classification section — but a
+      # large, silent share of a source's content going soft-failed is
+      # still worth a human's attention, hence a dedicated alert rather
+      # than relying on `last_status`). 20% is chosen as comfortably below
+      # the 41.8% traefik incident (would have caught it) while staying
+      # well above the low single-digit soft-fail rates expected from
+      # ordinary dead links/stub pages on a healthy source.
+      #
+      # `clamp_min(..., 1)` guards divide-by-zero for a source with no
+      # activity in the window (0/1 == 0, well under the 0.2 threshold,
+      # so no false positive); the explicit `> 20` on the denominator
+      # additionally guards against a single-digit-volume source where
+      # one soft-failed page out of a handful would otherwise look like
+      # a huge ratio on statistically meaningless volume.
+      - alert: SoftFailRatioHigh
+        expr: |-
+          (
+            increase(pages_soft_failed_total[30h])
+            /
+            clamp_min(increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]) + increase(pages_soft_failed_total[30h]), 1)
+          ) > 0.20
+          and
+          (increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]) + increase(pages_soft_failed_total[30h])) > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Source "{{ $labels.source }}" soft-failed over 20% of its pages in the last run.'
+          description: >-
+            {{ $labels.source }}: {{ $value | humanizePercentage }} of pages in
+            the last ~30h were soft-failed (dead links / stub content). Still
+            reports "ok" by design, but this share is high enough to warrant a
+            look — check for a moved/renamed sitemap or a bulk link rot event.
+          runbook: 'docs/runbook.md#alert-softfailratiohigh'
+
+      # ----------------------------------------------------------------
+      # NoSyncMetricsAtAll — meta-alert, high severity
+      #
+      # Regression guard for the exact bug this whole alerting program
+      # exists to close: `/metrics` previously emitted zero application
+      # samples because the counters were only incremented from a route
+      # handler no real sync went through. If `pages_fetched_total`
+      # (or, by construction, any of its siblings, since they're all
+      # incremented together in `record_sync_outcome`) is entirely
+      # absent, every other rule in this file is silently blind — none of
+      # them can fire on missing data, so this is the one rule standing
+      # between "the whole alerting story went dark" and "we noticed."
+      #
+      # `for: 4h` (> the ~3.5h full sync-set duration) so a normal
+      # container restart — where the metric family is legitimately
+      # absent until the first sync completes and recreates it — does not
+      # page. Anything absent for longer than one full sync cycle's
+      # worth of time is a real regression, not a restart window.
+      - alert: NoSyncMetricsAtAll
+        expr: absent(pages_fetched_total)
+        for: 4h
+        labels:
+          severity: critical
+        annotations:
+          summary: 'No pages_fetched_total series at all — /metrics is emitting zero application samples.'
+          description: >-
+            The ingestion service's /metrics endpoint has had no
+            pages_fetched_total sample for over 4h (longer than one full sync
+            cycle). This is the exact "metrics silently emit nothing" bug the
+            ingestion alert suite exists to catch — every other alert in this
+            file is blind while this fires.
+          runbook: 'docs/runbook.md#alert-nosyncmetricsatall'

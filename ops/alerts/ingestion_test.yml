@@ -1,0 +1,94 @@
+# promtool unit tests for ops/alerts/ingestion.yml.
+#
+# Scope: exercises the two rules that don't depend on wall-clock `time()`
+# (NoSyncMetricsAtAll, SourceIndexedNothing) plus SoftFailRatioHigh, using a
+# 30m sample interval so the 30h windows fit in 60 steps. SourceSyncStale and
+# SourceSyncDegraded are NOT covered here: SourceSyncStale's `time() -
+# sync_last_success_timestamp` depends on promtool's internal test clock
+# epoch in a way that's brittle to hand-encode reliably in this format, and
+# SourceSyncDegraded's two-consecutive-run offset comparison needs >60h of
+# synthetic history per case, which was judged not worth the added file
+# complexity for a unit test whose main value is smoke-testing PromQL syntax
+# and threshold arithmetic (already covered directly by `promtool check
+# rules`, which parses and validates every rule's PromQL).
+rule_files:
+  - ingestion.yml
+
+evaluation_interval: 30m
+
+tests:
+  # --- NoSyncMetricsAtAll -------------------------------------------------
+  - interval: 30m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 4h30m
+        alertname: NoSyncMetricsAtAll
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 'No pages_fetched_total series at all — /metrics is emitting zero application samples.'
+              description: >-
+                The ingestion service's /metrics endpoint has had no
+                pages_fetched_total sample for over 4h (longer than one full sync
+                cycle). This is the exact "metrics silently emit nothing" bug the
+                ingestion alert suite exists to catch — every other alert in this
+                file is blind while this fires.
+              runbook: 'docs/runbook.md#alert-nosyncmetricsatall'
+
+  # --- SourceIndexedNothing: a run completed but indexed zero pages ------
+  - interval: 30m
+    input_series:
+      # sync_duration_seconds_count jumps from 0 to 1 early in the window
+      # (and stays there) — one completed sync in the 30h window, held true
+      # long enough to satisfy `for: 10m`.
+      - series: 'sync_duration_seconds_count{source="traefik"}'
+        values: '0+0x9 1+0x50'
+      - series: 'pages_fetched_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_skipped_unchanged_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_not_modified_total{source="traefik"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 29h30m
+        alertname: SourceIndexedNothing
+        exp_alerts:
+          - exp_labels:
+              source: traefik
+              severity: critical
+            exp_annotations:
+              summary: 'Source "traefik" completed a sync but indexed zero pages.'
+              description: >-
+                traefik: a sync run finished in the last 30h window
+                with pages_fetched + pages_skipped_unchanged + pages_not_modified
+                == 0. This is the "reports ok but indexed nothing" failure mode —
+                check the source's sitemap/include_prefixes.
+              runbook: 'docs/runbook.md#alert-sourceindexednothing'
+
+  # --- SoftFailRatioHigh: 117/280 soft-failed (41.8%), the traefik case --
+  - interval: 30m
+    input_series:
+      - series: 'pages_fetched_total{source="traefik"}'
+        values: '0+0x9 163+0x50'
+      - series: 'pages_skipped_unchanged_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_not_modified_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_soft_failed_total{source="traefik"}'
+        values: '0+0x9 117+0x50'
+    alert_rule_test:
+      - eval_time: 29h30m
+        alertname: SoftFailRatioHigh
+        exp_alerts:
+          - exp_labels:
+              source: traefik
+              severity: warning
+            exp_annotations:
+              summary: 'Source "traefik" soft-failed over 20% of its pages in the last run.'
+              description: >-
+                traefik: 41.79% of pages in
+                the last ~30h were soft-failed (dead links / stub content). Still
+                reports "ok" by design, but this share is high enough to warrant a
+                look — check for a moved/renamed sitemap or a bulk link rot event.
+              runbook: 'docs/runbook.md#alert-softfailratiohigh'

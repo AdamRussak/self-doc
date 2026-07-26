@@ -971,3 +971,163 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   is in `doc_sources` now — carries an inline `WARNING:` comment about this
   same shape. If a source goes quiet, check
   whether its declared `sitemap` still 200s before looking anywhere else.
+
+  **Triage path (this is the failure this whole alerting program exists to
+  close — a log investigation once found all 40 sources reporting
+  `last_status="ok"`, including 6 holding zero pages and one silently
+  down 42% of its content).** Don't rely on eyeballing `last_status` alone —
+  it reads `"ok"` in exactly this scenario. Work through these in order:
+
+  1. **Did `SourceIndexedNothing` fire?** (`ops/alerts/ingestion.yml`, see
+     [Alerting](#alerting--prometheus-rules-opsalertsingestionyml) below).
+     If so, a completed sync run produced zero pages across
+     `pages_fetched_total` + `pages_skipped_unchanged_total` +
+     `pages_not_modified_total` for that `source` label — that is the exact
+     condition described above. Confirm by hand:
+     ```bash
+     curl -sS http://localhost:8080/metrics | grep -E '^(pages_fetched|pages_skipped_unchanged|pages_not_modified)_total\{source="<name>"'
+     ```
+     All three at (or unchanged from) their pre-incident values, alongside a
+     freshly-bumped `sync_duration_seconds_count{source="<name>"}`, confirms
+     "ran, indexed nothing."
+  2. **Check `GET /status` for the source** to confirm `last_status` and
+     `pages_seen`:
+     ```bash
+     curl -sS http://localhost:8080/status | jq '."<name>"'
+     ```
+  3. **Check whether the source's `sitemap` still 200s** (the traefik root
+     cause):
+     ```bash
+     curl -sS -o /dev/null -w '%{http_code}\n' '<the source'"'"'s sitemap URL>'
+     ```
+     A non-`200` here, on a source that also declares `include_prefixes` not
+     covering its own `base_url`, is the trap: config validation passed
+     (the sitemap-set BFS-seed-filter short-circuit), but a dead sitemap
+     falls back to a BFS crawl seeded on `base_url` that its own
+     `include_prefixes` immediately filters to zero. Fix the sitemap URL (or
+     the `include_prefixes`) on the source's admin UI edit form and re-sync.
+  4. **If the sitemap is fine**, check `docker compose logs ingestion` for
+     `page_fetch_skipped`/`page_content_skipped` volume on that source (soft
+     failures — see `SoftFailRatioHigh` below) versus a genuinely empty
+     crawl (`pages_seen == 0` in the logs' `sync_source` summary) to tell
+     apart "the whole crawl found nothing" from "the crawl found pages but
+     they were all soft-failed."
+
+---
+
+## Alerting — Prometheus rules (`ops/alerts/ingestion.yml`)
+
+Five alerting rules over the seven `/metrics` series from
+`ingestion/app/metrics.py` (`pages_fetched_total`,
+`pages_skipped_unchanged_total`, `pages_not_modified_total`,
+`pages_soft_failed_total`, `chunks_indexed_total`, `sync_duration_seconds`,
+`sync_last_success_timestamp`), all labelled `source`. Load them into
+Prometheus via the usual `rule_files:` entry in `prometheus.yml` (not wired
+into this repo's compose files yet — add
+`ops/alerts/ingestion.yml` to your Prometheus instance's `rule_files:` to
+activate them). Every rule fires per-`source` label — none of them enumerate
+source names, since sources are added/removed at runtime via the admin UI /
+MCP proposal flow.
+
+Lint/test locally:
+
+```bash
+promtool check rules ops/alerts/ingestion.yml
+```
+
+### Alert: SourceSyncStale
+
+Fires when `time() - sync_last_success_timestamp{source=...}` exceeds **48h**
+(`for: 30m`). Syncs run ~daily and take ~3.5h for the full source set, so 48h
+tolerates one missed/late run without paging on schedule jitter alone, while
+still catching "hasn't synced in 2+ days."
+
+**Triage:**
+1. `docker compose logs ingestion | grep '"source": "<name>"' | grep -E '"event": "(fired|skipped-not-due|skipped-locked|errored)"'` —
+   read the scheduler's `reason` field (see [The scheduler](#the-scheduler)
+   above) to see whether it's simply not scheduled (`no-schedule`), disabled,
+   or actually erroring.
+2. `curl -sS http://localhost:8080/status | jq '."<name>"'` — check
+   `last_synced`/`last_status`/`error`.
+3. If the source has genuinely never had a successful sync (no
+   `sync_last_success_timestamp` series at all — this alert can't detect
+   that case; see the rule file's own comment on why absence and staleness
+   are handled distinctly), trigger a manual sync (`POST /sync
+   {"source": "<name>"}` or the admin UI's Sync button) and watch the logs
+   for `sync_source_crashed`/`page_index_failed`.
+
+### Alert: SourceSyncDegraded
+
+Fires when a source's total successfully-processed page volume (fetched +
+hash-skipped + 304-not-modified) drops by more than half, run-over-run, on
+**two consecutive runs** (`for: 15m`). This is a **proxy**, not a literal
+"status == partial" check: `ingestion/app/metrics.py` does not export a
+`pages_failed_total` counter today, so Prometheus has no direct visibility
+into hard-failure counts or `last_status`. A sustained volume collapse is the
+closest available stand-in for repeated `partial` reports. See the rule
+file's own comment for the full rationale, and treat "add a
+`pages_failed_total` counter" as a follow-up if this proxy proves noisy or
+insufficiently sensitive in practice.
+
+**Triage:**
+1. `curl -sS http://localhost:8080/status | jq '."<name>"'` — check the real
+   `last_status` and `pages_failed` for the last couple of runs.
+2. `docker compose logs ingestion | grep '"source": "<name>"' | grep -E '"event": "(page_index_failed|sync_source_crashed)"'` —
+   hard failures show up here even though they're invisible to Prometheus.
+3. Also rule out `SourceIndexedNothing`/sitemap issues (above) — a source
+   trending toward zero pages will also trip this alert on its way down.
+
+### Alert: SourceIndexedNothing
+
+Fires when a sync run completes (`sync_duration_seconds_count` increases in
+the window) but `pages_fetched_total + pages_skipped_unchanged_total +
+pages_not_modified_total == 0` for that run (`for: 10m`, `severity:
+critical`). This is the headline failure mode this whole alert suite exists
+to close — see the ["A source reports `ok` but `pages_seen == 0`" triage
+path](#troubleshooting) above (in Troubleshooting), which this alert is
+designed to trigger.
+
+### Alert: SoftFailRatioHigh
+
+Fires when `pages_soft_failed_total` exceeds **20%** of a source's total
+page volume in its last run, on a run with at least 20 total pages
+(`for: 15m`). 20% is set comfortably below the `traefik` incident that
+motivated this rule (117 of 280 pages, 41.8%, soft-failed while still
+reporting `"ok"` — soft failures don't degrade status by design, see [Page
+Classification & Source Status Semantics](#page-classification--source-status-semantics)
+above) so it would have caught that incident, while staying well above the
+low single-digit soft-fail rates a healthy source normally shows from
+ordinary dead links/stub pages. The `> 20` total-page floor avoids alerting
+on statistically meaningless ratios from tiny sources (e.g. 1 soft-failed
+page out of 3 total).
+
+**Triage:** `curl -sS http://localhost:8080/status | jq '."<name>"'` to see
+`pages_soft_failed` alongside `pages_fetched`, then `docker compose logs
+ingestion | grep '"source": "<name>"' | grep -E '"event": "page_(content|fetch)_skipped"'`
+to see which URLs are soft-failing and why (dead link vs. stub content) —
+same as the general soft-failure guidance under [Page Classification & Source
+Status Semantics](#page-classification--source-status-semantics).
+
+### Alert: NoSyncMetricsAtAll
+
+`severity: critical` meta-alert. Fires when `pages_fetched_total` is
+`absent()` for over **4h** (`for: 4h`, chosen to exceed the ~3.5h full
+sync-set duration so a normal container restart — where the metric family is
+legitimately absent until the first sync completes and recreates it — does
+not page). This is the regression guard for the exact original incident: a
+prior version of `/metrics` emitted zero application samples because the
+counters were only incremented from a route handler no real sync went
+through. If this fires, every other rule in this file is blind at the same
+time — treat it as the highest-priority alert in the file.
+
+**Triage:**
+1. `curl -sS http://localhost:8080/metrics | grep pages_fetched_total` — confirm
+   the series is genuinely absent, not just filtered by your query.
+2. Confirm at least one sync has actually completed recently
+   (`docker compose logs ingestion | grep sync_source_crashed` — is
+   everything crashing before `record_sync_outcome` runs?) versus the
+   metrics-recording path itself being broken again (check
+   `ingestion/app/store.py`'s `sync_source_with_metrics` is still the entry
+   point every sync route calls, per its own docstring).
+3. Restart `ingestion` (`docker compose up -d ingestion`) only after
+   confirming it isn't simply mid-first-sync since a fresh deploy.
