@@ -199,14 +199,14 @@ def test_cfg_matches_record_true_when_llms_txt_also_matches() -> None:
 
 def test_missing_max_pages_is_accepted_and_none() -> None:
     # max_pages is optional (None => no page limit).
-    cfg = SourceConfig.model_validate({"name": "ok", "base_url": "https://example.com/"})
+    cfg = SourceConfig.model_validate({"name": "ok", "base_url": "https://docs-fixture.dev/"})
     assert cfg.max_pages is None
 
 
 def test_invalid_config_rejected_bad_name_pattern() -> None:
     with pytest.raises(Exception):
         SourceConfig.model_validate(
-            {"name": "Bad Name!", "base_url": "https://example.com/", "max_pages": 10}
+            {"name": "Bad Name!", "base_url": "https://docs-fixture.dev/", "max_pages": 10}
         )
 
 
@@ -215,7 +215,7 @@ def test_invalid_config_rejected_unknown_key() -> None:
         SourceConfig.model_validate(
             {
                 "name": "bad",
-                "base_url": "https://example.com/",
+                "base_url": "https://docs-fixture.dev/",
                 "max_pages": 10,
                 "totally_unknown_field": True,
             }
@@ -228,7 +228,7 @@ def test_invalid_config_rejected_negative_max_pages() -> None:
     it too, since neither implements a second validation pass."""
     with pytest.raises(Exception):
         SourceConfig.model_validate(
-            {"name": "bad", "base_url": "https://example.com/", "max_pages": -5}
+            {"name": "bad", "base_url": "https://docs-fixture.dev/", "max_pages": -5}
         )
 
 

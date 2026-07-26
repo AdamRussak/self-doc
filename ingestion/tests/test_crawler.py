@@ -11,9 +11,9 @@ ROBOTS_DISALLOW_PRIVATE = "User-agent: *\nDisallow: /private/\n"
 
 SITEMAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://example.com/docs/a</loc></url>
-  <url><loc>https://example.com/docs/b</loc></url>
-  <url><loc>https://example.com/blog/c</loc></url>
+  <url><loc>https://docs-fixture.dev/docs/a</loc></url>
+  <url><loc>https://docs-fixture.dev/docs/b</loc></url>
+  <url><loc>https://docs-fixture.dev/blog/c</loc></url>
 </urlset>
 """
 
@@ -44,8 +44,8 @@ def make_client(handler) -> httpx.Client:
 def test_sitemap_discovery_respects_include_exclude_and_max_pages():
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
-        sitemap="https://example.com/sitemap.xml",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
         include_prefixes=["/docs/"],
         exclude_prefixes=["/blog/"],
         max_pages=10,
@@ -54,22 +54,22 @@ def test_sitemap_discovery_respects_include_exclude_and_max_pages():
     handler = _handler_factory(
         sitemap_body=SITEMAP_XML,
         page_bodies={
-            "https://example.com/docs/a": PAGE_HTML,
-            "https://example.com/docs/b": PAGE_HTML,
-            "https://example.com/blog/c": PAGE_HTML,
+            "https://docs-fixture.dev/docs/a": PAGE_HTML,
+            "https://docs-fixture.dev/docs/b": PAGE_HTML,
+            "https://docs-fixture.dev/blog/c": PAGE_HTML,
         },
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = {p["url"] for p in pages}
-    assert urls == {"https://example.com/docs/a", "https://example.com/docs/b"}
+    assert urls == {"https://docs-fixture.dev/docs/a", "https://docs-fixture.dev/docs/b"}
 
 
 def test_sitemap_discovery_bounded_by_max_pages():
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
-        sitemap="https://example.com/sitemap.xml",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
         include_prefixes=["/docs/"],
         max_pages=1,
         rate_limit_rps=1000,
@@ -77,8 +77,8 @@ def test_sitemap_discovery_bounded_by_max_pages():
     handler = _handler_factory(
         sitemap_body=SITEMAP_XML,
         page_bodies={
-            "https://example.com/docs/a": PAGE_HTML,
-            "https://example.com/docs/b": PAGE_HTML,
+            "https://docs-fixture.dev/docs/a": PAGE_HTML,
+            "https://docs-fixture.dev/docs/b": PAGE_HTML,
         },
     )
     client = make_client(handler)
@@ -90,8 +90,8 @@ def test_sitemap_discovery_unlimited_when_max_pages_none():
     # max_pages=None (omitted) => no page limit: all in-scope pages are crawled.
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
-        sitemap="https://example.com/sitemap.xml",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
         include_prefixes=["/docs/"],
         rate_limit_rps=1000,
     )
@@ -99,15 +99,15 @@ def test_sitemap_discovery_unlimited_when_max_pages_none():
     handler = _handler_factory(
         sitemap_body=SITEMAP_XML,
         page_bodies={
-            "https://example.com/docs/a": PAGE_HTML,
-            "https://example.com/docs/b": PAGE_HTML,
+            "https://docs-fixture.dev/docs/a": PAGE_HTML,
+            "https://docs-fixture.dev/docs/b": PAGE_HTML,
         },
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     assert {p["url"] for p in pages} == {
-        "https://example.com/docs/a",
-        "https://example.com/docs/b",
+        "https://docs-fixture.dev/docs/a",
+        "https://docs-fixture.dev/docs/b",
     }
 
 
@@ -116,26 +116,26 @@ def test_bfs_fallback_when_no_sitemap():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(
                 200,
                 text='<html><body><a href="/docs/a">A</a><a href="https://other.com/x">ext</a></body></html>',
             )
-        if url == "https://example.com/docs/a":
+        if url == "https://docs-fixture.dev/docs/a":
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = {p["url"] for p in pages}
-    assert "https://example.com/" in urls
-    assert "https://example.com/docs/a" in urls
+    assert "https://docs-fixture.dev/" in urls
+    assert "https://docs-fixture.dev/docs/a" in urls
     assert not any("other.com" in u for u in urls)
 
 
@@ -148,7 +148,7 @@ def test_cross_host_redirect_is_rejected():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(302, headers={"Location": "https://evil.com/"})
         if url == "https://evil.com/":
             return httpx.Response(200, text=PAGE_HTML)
@@ -156,7 +156,7 @@ def test_cross_host_redirect_is_rejected():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
@@ -164,7 +164,7 @@ def test_cross_host_redirect_is_rejected():
     client = httpx.Client(transport=transport, follow_redirects=True, max_redirects=5)
     pages = list(crawl(source, client=client))
     assert len(pages) == 1
-    assert pages[0] == {"url": "https://example.com/", "html": None, "fetch_ok": False}
+    assert pages[0] == {"url": "https://docs-fixture.dev/", "html": None, "fetch_ok": False}
 
 
 def test_private_ip_redirect_rejected_when_base_host_public():
@@ -201,7 +201,7 @@ def test_is_private_ip_host_detects_rfc1918_and_link_local():
     assert _is_private_ip_host("169.254.169.254") is True  # link-local / cloud metadata
     assert _is_private_ip_host("127.0.0.1") is True  # loopback
     assert _is_private_ip_host("8.8.8.8") is False
-    assert _is_private_ip_host("example.com") is False  # hostname, not an IP literal
+    assert _is_private_ip_host("docs-fixture.dev") is False  # hostname, not an IP literal
 
 
 def test_validate_final_url_rejects_private_ip_literal():
@@ -271,13 +271,13 @@ def test_redirect_into_private_space_refused_before_request_is_issued():
         requested.append(url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(302, headers={"Location": "http://10.0.0.5:8080/reboot"})
         return httpx.Response(200, text=PAGE_HTML)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
@@ -288,7 +288,7 @@ def test_redirect_into_private_space_refused_before_request_is_issued():
     client = httpx.Client(transport=transport, follow_redirects=True, max_redirects=5)
     pages = list(crawl(source, client=client))
 
-    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
+    assert pages == [{"url": "https://docs-fixture.dev/", "html": None, "fetch_ok": False}]
     assert not any("10.0.0.5" in u for u in requested)
 
 
@@ -299,21 +299,21 @@ def test_same_host_in_scope_redirect_is_still_followed():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/docs/old":
+        if url == "https://docs-fixture.dev/docs/old":
             return httpx.Response(301, headers={"Location": "/docs/new"})
-        if url == "https://example.com/docs/new":
+        if url == "https://docs-fixture.dev/docs/new":
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/docs/old",
+        base_url="https://docs-fixture.dev/docs/old",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
-    assert pages[0]["url"] == "https://example.com/docs/old"
+    assert pages[0]["url"] == "https://docs-fixture.dev/docs/old"
     assert pages[0]["fetch_ok"] is True
     assert pages[0]["html"] == PAGE_HTML
 
@@ -331,13 +331,13 @@ def test_redirect_loop_beyond_max_redirects_yields_fetch_ok_false():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/hop/0",
+        base_url="https://docs-fixture.dev/hop/0",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
-    assert pages == [{"url": "https://example.com/hop/0", "html": None, "fetch_ok": False}]
+    assert pages == [{"url": "https://docs-fixture.dev/hop/0", "html": None, "fetch_ok": False}]
 
 
 def test_redirect_without_location_header_yields_fetch_ok_false():
@@ -349,13 +349,13 @@ def test_redirect_without_location_header_yields_fetch_ok_false():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
-    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
+    assert pages == [{"url": "https://docs-fixture.dev/", "html": None, "fetch_ok": False}]
 
 
 def test_off_host_child_sitemap_is_never_fetched():
@@ -364,13 +364,13 @@ def test_off_host_child_sitemap_is_never_fetched():
     requested: list[str] = []
     index_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <sitemap><loc>https://example.com/child-sitemap.xml</loc></sitemap>
+  <sitemap><loc>https://docs-fixture.dev/child-sitemap.xml</loc></sitemap>
   <sitemap><loc>http://169.254.169.254/latest/meta-data/sitemap.xml</loc></sitemap>
 </sitemapindex>
 """
     child_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://example.com/docs/a</loc></url>
+  <url><loc>https://docs-fixture.dev/docs/a</loc></url>
 </urlset>
 """
 
@@ -379,22 +379,22 @@ def test_off_host_child_sitemap_is_never_fetched():
         requested.append(url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/sitemap.xml":
+        if url == "https://docs-fixture.dev/sitemap.xml":
             return httpx.Response(200, text=index_xml)
-        if url == "https://example.com/child-sitemap.xml":
+        if url == "https://docs-fixture.dev/child-sitemap.xml":
             return httpx.Response(200, text=child_xml)
         return httpx.Response(200, text=PAGE_HTML)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
-        sitemap="https://example.com/sitemap.xml",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
-    assert [p["url"] for p in pages] == ["https://example.com/docs/a"]
+    assert [p["url"] for p in pages] == ["https://docs-fixture.dev/docs/a"]
     assert not any("169.254.169.254" in u for u in requested)
 
 
@@ -405,9 +405,9 @@ LLMS_INDEX = """# Example Docs
 > Summary of the project.
 
 ## Guides
-- [Quickstart](https://example.com/docs/quickstart): get started
-- [Configuration](https://example.com/docs/config)
-- [API](https://example.com/docs/api)
+- [Quickstart](https://docs-fixture.dev/docs/quickstart): get started
+- [Configuration](https://docs-fixture.dev/docs/config)
+- [API](https://docs-fixture.dev/docs/api)
 """
 
 LLMS_FULL = """# Quickstart
@@ -440,7 +440,7 @@ def test_llms_index_is_crawled_as_html_not_ingested_as_content():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="auto",
@@ -451,16 +451,16 @@ def test_llms_index_is_crawled_as_html_not_ingested_as_content():
     # Each linked doc page is yielded as an HTML item (html set, markdown absent),
     # so downstream extraction runs on the real page — NOT the index link-list.
     assert [p["url"] for p in pages] == [
-        "https://example.com/docs/quickstart",
-        "https://example.com/docs/config",
-        "https://example.com/docs/api",
+        "https://docs-fixture.dev/docs/quickstart",
+        "https://docs-fixture.dev/docs/config",
+        "https://docs-fixture.dev/docs/api",
     ]
     for p in pages:
         assert p["fetch_ok"] is True
         assert "html" in p and p["html"] == PAGE_HTML
         assert "markdown" not in p
     # The pages were actually fetched over HTTP.
-    assert "https://example.com/docs/quickstart" in requested
+    assert "https://docs-fixture.dev/docs/quickstart" in requested
 
 
 def test_llms_index_links_filtered_by_include_prefixes():
@@ -468,9 +468,9 @@ def test_llms_index_links_filtered_by_include_prefixes():
     discovery — an out-of-scope link is not crawled."""
     index = (
         "# Docs\n\n## S\n"
-        "- [in](https://example.com/docs/in)\n"
-        "- [out](https://example.com/blog/out)\n"
-        "- [also](https://example.com/docs/also)\n"
+        "- [in](https://docs-fixture.dev/docs/in)\n"
+        "- [out](https://docs-fixture.dev/blog/out)\n"
+        "- [also](https://docs-fixture.dev/docs/also)\n"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -485,7 +485,7 @@ def test_llms_index_links_filtered_by_include_prefixes():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/docs/",
+        base_url="https://docs-fixture.dev/docs/",
         include_prefixes=["/docs/"],
         max_pages=10,
         rate_limit_rps=1000,
@@ -494,8 +494,8 @@ def test_llms_index_links_filtered_by_include_prefixes():
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     assert [p["url"] for p in pages] == [
-        "https://example.com/docs/in",
-        "https://example.com/docs/also",
+        "https://docs-fixture.dev/docs/in",
+        "https://docs-fixture.dev/docs/also",
     ]
 
 
@@ -515,7 +515,7 @@ def test_llms_full_content_still_yields_markdown_sections():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="auto",
@@ -544,12 +544,12 @@ def test_llms_only_with_index_crawls_links_not_bfs():
         # A page whose HTML links elsewhere — BFS would follow these.
         return httpx.Response(
             200,
-            text='<html><body><a href="https://example.com/other/x">x</a>content</body></html>',
+            text='<html><body><a href="https://docs-fixture.dev/other/x">x</a>content</body></html>',
         )
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="only",
@@ -559,9 +559,9 @@ def test_llms_only_with_index_crawls_links_not_bfs():
     urls = [p["url"] for p in pages]
     # Only the three index links, no BFS-discovered /other/x.
     assert urls == [
-        "https://example.com/docs/quickstart",
-        "https://example.com/docs/config",
-        "https://example.com/docs/api",
+        "https://docs-fixture.dev/docs/quickstart",
+        "https://docs-fixture.dev/docs/config",
+        "https://docs-fixture.dev/docs/api",
     ]
 
 
@@ -579,14 +579,14 @@ def test_crawl_is_generator_and_preserves_fetch_ok_false_contract():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
     result = crawl(source, client=make_client(handler))
     assert inspect.isgenerator(result)
     pages = list(result)
-    assert pages == [{"url": "https://example.com/", "html": None, "fetch_ok": False}]
+    assert pages == [{"url": "https://docs-fixture.dev/", "html": None, "fetch_ok": False}]
 
 
 def test_robots_disallow_blocks_page():
@@ -594,20 +594,20 @@ def test_robots_disallow_blocks_page():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_DISALLOW_PRIVATE)
-        if url == "https://example.com/private/secret":
+        if url == "https://docs-fixture.dev/private/secret":
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(200, text=PAGE_HTML)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/private/secret",
+        base_url="https://docs-fixture.dev/private/secret",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     assert len(pages) == 1
-    assert pages[0] == {"url": "https://example.com/private/secret", "html": None, "fetch_ok": False}
+    assert pages[0] == {"url": "https://docs-fixture.dev/private/secret", "html": None, "fetch_ok": False}
 
 
 def test_page_fetch_non_200_yields_fetch_ok_false():
@@ -615,20 +615,20 @@ def test_page_fetch_non_200_yields_fetch_ok_false():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/error503":
+        if url == "https://docs-fixture.dev/error503":
             return httpx.Response(503, text="Service Unavailable")
         return httpx.Response(200, text=PAGE_HTML)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/error503",
+        base_url="https://docs-fixture.dev/error503",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     assert len(pages) == 1
-    assert pages[0] == {"url": "https://example.com/error503", "html": None, "fetch_ok": False}
+    assert pages[0] == {"url": "https://docs-fixture.dev/error503", "html": None, "fetch_ok": False}
 
 
 def test_page_fetch_exception_yields_fetch_ok_false():
@@ -636,20 +636,20 @@ def test_page_fetch_exception_yields_fetch_ok_false():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/timeout":
+        if url == "https://docs-fixture.dev/timeout":
             raise httpx.ConnectTimeout("Connection timed out")
         return httpx.Response(200, text=PAGE_HTML)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/timeout",
+        base_url="https://docs-fixture.dev/timeout",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     assert len(pages) == 1
-    assert pages[0] == {"url": "https://example.com/timeout", "html": None, "fetch_ok": False}
+    assert pages[0] == {"url": "https://docs-fixture.dev/timeout", "html": None, "fetch_ok": False}
 
 
 def test_scope_rejection_yields_nothing():
@@ -660,7 +660,7 @@ def test_scope_rejection_yields_nothing():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(
                 200,
                 text='<html><body><a href="https://other.com/x">ext</a><a href="/excluded/path">exc</a></body></html>',
@@ -669,7 +669,7 @@ def test_scope_rejection_yields_nothing():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         exclude_prefixes=["/excluded/"],
         max_pages=10,
         rate_limit_rps=1000,
@@ -677,7 +677,7 @@ def test_scope_rejection_yields_nothing():
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = [p["url"] for p in pages]
-    assert urls == ["https://example.com/"]
+    assert urls == ["https://docs-fixture.dev/"]
 
 
 def test_crawl_is_a_generator():
@@ -686,7 +686,7 @@ def test_crawl_is_a_generator():
     across a long crawl (see module docstring / crawl() docstring)."""
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
     )
@@ -707,7 +707,7 @@ def test_scope_leak_traefik_hub_rejected_traefik_routing_accepted():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/traefik/":
+        if url == "https://docs-fixture.dev/traefik/":
             return httpx.Response(
                 200,
                 text=(
@@ -720,17 +720,17 @@ def test_scope_leak_traefik_hub_rejected_traefik_routing_accepted():
                 ),
             )
         if url in (
-            "https://example.com/traefik/routing",
-            "https://example.com/traefik-hub/x",
-            "https://example.com/traefik-enterprise/y",
-            "https://example.com/traefik-mesh/z",
+            "https://docs-fixture.dev/traefik/routing",
+            "https://docs-fixture.dev/traefik-hub/x",
+            "https://docs-fixture.dev/traefik-enterprise/y",
+            "https://docs-fixture.dev/traefik-mesh/z",
         ):
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/traefik/",
+        base_url="https://docs-fixture.dev/traefik/",
         include_prefixes=["/traefik"],
         max_pages=10,
         rate_limit_rps=1000,
@@ -738,10 +738,10 @@ def test_scope_leak_traefik_hub_rejected_traefik_routing_accepted():
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = {p["url"] for p in pages}
-    assert "https://example.com/traefik/routing" in urls
-    assert "https://example.com/traefik-hub/x" not in urls
-    assert "https://example.com/traefik-enterprise/y" not in urls
-    assert "https://example.com/traefik-mesh/z" not in urls
+    assert "https://docs-fixture.dev/traefik/routing" in urls
+    assert "https://docs-fixture.dev/traefik-hub/x" not in urls
+    assert "https://docs-fixture.dev/traefik-enterprise/y" not in urls
+    assert "https://docs-fixture.dev/traefik-mesh/z" not in urls
 
 
 SITEMAP_INDEX_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -797,13 +797,13 @@ def test_sitemap_truncated_at_cap_fires_with_numbers_on_truncation():
     sitemap_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        + "".join(f"<url><loc>https://example.com/docs/{i}</loc></url>" for i in range(10))
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(10))
         + "</urlset>"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url == "https://example.com/sitemap.xml":
+        if url == "https://docs-fixture.dev/sitemap.xml":
             return httpx.Response(200, text=sitemap_xml)
         return httpx.Response(404)
 
@@ -811,11 +811,11 @@ def test_sitemap_truncated_at_cap_fires_with_numbers_on_truncation():
     log = _RecordingLog()
     urls = discover_sitemap_urls(
         client,
-        "https://example.com/sitemap.xml",
+        "https://docs-fixture.dev/sitemap.xml",
         max_pages=3,
         limiter=_new_limiter(),
         log=log,
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         include_prefixes=[],
         exclude_prefixes=[],
     )
@@ -835,13 +835,13 @@ def test_sitemap_truncated_at_cap_does_not_fire_when_under_cap():
     sitemap_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        + "".join(f"<url><loc>https://example.com/docs/{i}</loc></url>" for i in range(3))
+        + "".join(f"<url><loc>https://docs-fixture.dev/docs/{i}</loc></url>" for i in range(3))
         + "</urlset>"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url == "https://example.com/sitemap.xml":
+        if url == "https://docs-fixture.dev/sitemap.xml":
             return httpx.Response(200, text=sitemap_xml)
         return httpx.Response(404)
 
@@ -849,11 +849,11 @@ def test_sitemap_truncated_at_cap_does_not_fire_when_under_cap():
     log = _RecordingLog()
     urls = discover_sitemap_urls(
         client,
-        "https://example.com/sitemap.xml",
+        "https://docs-fixture.dev/sitemap.xml",
         max_pages=10,
         limiter=_new_limiter(),
         log=log,
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         include_prefixes=[],
         exclude_prefixes=[],
     )
@@ -1004,36 +1004,36 @@ def test_discover_sitemap_urls_depth_capped_for_sitemap_index_of_indexes():
     recurse unbounded."""
     nested_index = """<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <sitemap><loc>https://example.com/sitemaps/grandchild.xml</loc></sitemap>
+  <sitemap><loc>https://docs-fixture.dev/sitemaps/grandchild.xml</loc></sitemap>
 </sitemapindex>
 """
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url == "https://example.com/sitemap.xml":
+        if url == "https://docs-fixture.dev/sitemap.xml":
             return httpx.Response(
                 200,
                 text=(
                     '<?xml version="1.0"?>'
                     '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-                    '<sitemap><loc>https://example.com/sitemaps/child-index.xml</loc></sitemap>'
+                    '<sitemap><loc>https://docs-fixture.dev/sitemaps/child-index.xml</loc></sitemap>'
                     '</sitemapindex>'
                 ),
             )
-        if url == "https://example.com/sitemaps/child-index.xml":
+        if url == "https://docs-fixture.dev/sitemaps/child-index.xml":
             return httpx.Response(200, text=nested_index)
-        if url == "https://example.com/sitemaps/grandchild.xml":
+        if url == "https://docs-fixture.dev/sitemaps/grandchild.xml":
             return httpx.Response(200, text=CHILD_DOCS_XML)
         return httpx.Response(404)
 
     client = make_client(handler)
     urls = discover_sitemap_urls(
         client,
-        "https://example.com/sitemap.xml",
+        "https://docs-fixture.dev/sitemap.xml",
         max_pages=100,
         limiter=_new_limiter(),
         log=_test_log(),
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         include_prefixes=[],
         exclude_prefixes=[],
     )
@@ -1047,13 +1047,13 @@ def test_discover_sitemap_urls_self_referencing_index_terminates():
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if url == "https://example.com/sitemap.xml":
+        if url == "https://docs-fixture.dev/sitemap.xml":
             return httpx.Response(
                 200,
                 text=(
                     '<?xml version="1.0"?>'
                     '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-                    '<sitemap><loc>https://example.com/sitemap.xml</loc></sitemap>'
+                    '<sitemap><loc>https://docs-fixture.dev/sitemap.xml</loc></sitemap>'
                     '</sitemapindex>'
                 ),
             )
@@ -1062,11 +1062,11 @@ def test_discover_sitemap_urls_self_referencing_index_terminates():
     client = make_client(handler)
     urls = discover_sitemap_urls(
         client,
-        "https://example.com/sitemap.xml",
+        "https://docs-fixture.dev/sitemap.xml",
         max_pages=100,
         limiter=_new_limiter(),
         log=_test_log(),
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         include_prefixes=[],
         exclude_prefixes=[],
     )
@@ -1086,24 +1086,24 @@ def test_crawl_falls_back_to_bfs_on_sitemap_valueerror():
         if url.endswith("sitemap.xml"):
             # unexpected root element -> parse_sitemap raises ValueError
             return httpx.Response(200, text="<not-a-sitemap-or-index/>")
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(200, text='<html><body><a href="/docs/a">A</a></body></html>')
-        if url == "https://example.com/docs/a":
+        if url == "https://docs-fixture.dev/docs/a":
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
-        sitemap="https://example.com/sitemap.xml",
+        base_url="https://docs-fixture.dev/",
+        sitemap="https://docs-fixture.dev/sitemap.xml",
         max_pages=10,
         rate_limit_rps=1000,
     )
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = {p["url"] for p in pages}
-    assert "https://example.com/" in urls
-    assert "https://example.com/docs/a" in urls
+    assert "https://docs-fixture.dev/" in urls
+    assert "https://docs-fixture.dev/docs/a" in urls
 
 
 def test_extract_links_suppresses_xml_warning(recwarn):
@@ -1111,8 +1111,8 @@ def test_extract_links_suppresses_xml_warning(recwarn):
     from app.crawler import extract_links
     from bs4 import XMLParsedAsHTMLWarning
 
-    xml_content = '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/page1</loc></url></urlset>'
-    extract_links(xml_content, "https://example.com/sitemap.xml")
+    xml_content = '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://docs-fixture.dev/page1</loc></url></urlset>'
+    extract_links(xml_content, "https://docs-fixture.dev/sitemap.xml")
     assert not [w for w in recwarn if issubclass(w.category, XMLParsedAsHTMLWarning)]
 
 
@@ -1128,17 +1128,17 @@ def test_llms_auto_falls_back_to_bfs_when_discover_finds_nothing():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url in ("https://example.com/llms-full.txt", "https://example.com/llms.txt"):
+        if url in ("https://docs-fixture.dev/llms-full.txt", "https://docs-fixture.dev/llms.txt"):
             return httpx.Response(404)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(200, text='<html><body><a href="/docs/a">A</a></body></html>')
-        if url == "https://example.com/docs/a":
+        if url == "https://docs-fixture.dev/docs/a":
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="auto",
@@ -1146,8 +1146,8 @@ def test_llms_auto_falls_back_to_bfs_when_discover_finds_nothing():
     client = make_client(handler)
     pages = list(crawl(source, client=client))
     urls = {p["url"] for p in pages}
-    assert "https://example.com/" in urls
-    assert "https://example.com/docs/a" in urls
+    assert "https://docs-fixture.dev/" in urls
+    assert "https://docs-fixture.dev/docs/a" in urls
     # BFS items carry "html", not "markdown".
     assert all("html" in p for p in pages)
 
@@ -1164,7 +1164,7 @@ def test_llms_only_yields_nothing_when_discover_finds_nothing():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="only",
@@ -1182,13 +1182,13 @@ def test_llms_discovered_body_yields_one_markdown_item_per_section_capped():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/llms-full.txt":
+        if url == "https://docs-fixture.dev/llms-full.txt":
             return httpx.Response(200, text=LLMS_FULL_THREE_SECTIONS)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=2,
         rate_limit_rps=1000,
         llms_txt="auto",
@@ -1207,7 +1207,7 @@ def test_conditional_304_on_html_url_yields_not_modified_with_no_html():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             if request.headers.get("if-none-match") == "abc123":
                 return httpx.Response(304)
             return httpx.Response(200, text=PAGE_HTML)
@@ -1215,16 +1215,16 @@ def test_conditional_304_on_html_url_yields_not_modified_with_no_html():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",
     )
     client = make_client(handler)
     pages = list(
-        crawl(source, client=client, conditional={"https://example.com/": ("abc123", None)})
+        crawl(source, client=client, conditional={"https://docs-fixture.dev/": ("abc123", None)})
     )
-    assert pages == [{"url": "https://example.com/", "not_modified": True, "fetch_ok": True}]
+    assert pages == [{"url": "https://docs-fixture.dev/", "not_modified": True, "fetch_ok": True}]
 
 
 def test_200_html_response_surfaces_etag_and_last_modified_on_item():
@@ -1232,7 +1232,7 @@ def test_200_html_response_surfaces_etag_and_last_modified_on_item():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             return httpx.Response(
                 200,
                 text=PAGE_HTML,
@@ -1242,7 +1242,7 @@ def test_200_html_response_surfaces_etag_and_last_modified_on_item():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",
@@ -1261,25 +1261,25 @@ def test_conditional_headers_only_sent_on_first_hop_not_redirect_target():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/docs/old":
+        if url == "https://docs-fixture.dev/docs/old":
             requested_headers["old"] = dict(request.headers)
             return httpx.Response(301, headers={"Location": "/docs/new"})
-        if url == "https://example.com/docs/new":
+        if url == "https://docs-fixture.dev/docs/new":
             requested_headers["new"] = dict(request.headers)
             return httpx.Response(200, text=PAGE_HTML)
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/docs/old",
+        base_url="https://docs-fixture.dev/docs/old",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",
     )
     client = make_client(handler)
     conditional = {
-        "https://example.com/docs/old": ("etag-old", None),
-        "https://example.com/docs/new": ("etag-new", None),
+        "https://docs-fixture.dev/docs/old": ("etag-old", None),
+        "https://docs-fixture.dev/docs/new": ("etag-new", None),
     }
     pages = list(crawl(source, client=client, conditional=conditional))
     assert len(pages) == 1
@@ -1292,7 +1292,7 @@ def test_llms_index_unchanged_sentinel_emitted_on_304_with_stored_validator():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/llms-full.txt":
+        if url == "https://docs-fixture.dev/llms-full.txt":
             if request.headers.get("if-none-match") == "etag-full":
                 return httpx.Response(304)
             return httpx.Response(404)
@@ -1300,18 +1300,18 @@ def test_llms_index_unchanged_sentinel_emitted_on_304_with_stored_validator():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="auto",
     )
     client = make_client(handler)
-    conditional = {"https://example.com/llms-full.txt": ("etag-full", None)}
+    conditional = {"https://docs-fixture.dev/llms-full.txt": ("etag-full", None)}
     pages = list(crawl(source, client=client, conditional=conditional))
     assert pages == [
         {
             "kind": "llms_index_unchanged",
-            "url": "https://example.com/llms-full.txt",
+            "url": "https://docs-fixture.dev/llms-full.txt",
             "not_modified": True,
             "fetch_ok": True,
         }
@@ -1364,7 +1364,7 @@ def test_transient_503_retried_and_succeeds_on_second_attempt():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             attempts += 1
             if attempts == 1:
                 return httpx.Response(503, text="Service Unavailable")
@@ -1373,7 +1373,7 @@ def test_transient_503_retried_and_succeeds_on_second_attempt():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",
@@ -1394,7 +1394,7 @@ def test_transient_429_with_retry_after_header_respected():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             attempts += 1
             if attempts == 1:
                 return httpx.Response(429, headers={"Retry-After": "0.15"}, text="Too Many Requests")
@@ -1403,7 +1403,7 @@ def test_transient_429_with_retry_after_header_respected():
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",
@@ -1427,14 +1427,14 @@ def test_permanent_failure_after_retry_exhaustion_yields_fetch_ok_false():
         url = str(request.url)
         if url.endswith("/robots.txt"):
             return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
-        if url == "https://example.com/":
+        if url == "https://docs-fixture.dev/":
             attempts += 1
             return httpx.Response(503, text="Service Unavailable")
         return httpx.Response(404)
 
     source = SourceConfig(
         name="example",
-        base_url="https://example.com/",
+        base_url="https://docs-fixture.dev/",
         max_pages=10,
         rate_limit_rps=1000,
         llms_txt="off",

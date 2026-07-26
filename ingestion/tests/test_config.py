@@ -24,7 +24,7 @@ def test_valid_minimal_source(tmp_path):
         """
         sources:
           - name: my-docs
-            base_url: https://example.com/docs
+            base_url: https://docs-fixture.dev/docs
             max_pages: 10
         """,
     )
@@ -44,10 +44,10 @@ def test_duplicate_name_raises(tmp_path):
         """
         sources:
           - name: dupe
-            base_url: https://example.com/a
+            base_url: https://docs-fixture.dev/a
             max_pages: 5
           - name: dupe
-            base_url: https://example.com/b
+            base_url: https://docs-fixture.dev/b
             max_pages: 5
         """,
     )
@@ -75,7 +75,7 @@ def test_unknown_key_raises(tmp_path):
         """
         sources:
           - name: extra-key
-            base_url: https://example.com
+            base_url: https://docs-fixture.dev
             max_pages: 5
             bogus_field: true
         """,
@@ -90,7 +90,7 @@ def test_invalid_name_pattern_raises(tmp_path):
         """
         sources:
           - name: Not_Valid_Name
-            base_url: https://example.com
+            base_url: https://docs-fixture.dev
             max_pages: 5
         """,
     )
@@ -105,7 +105,7 @@ def test_missing_max_pages_is_allowed_and_means_unlimited(tmp_path):
         """
         sources:
           - name: no-max-pages
-            base_url: https://example.com
+            base_url: https://docs-fixture.dev
         """,
     )
     sources = load_sources(p)
@@ -120,7 +120,7 @@ def test_zero_or_negative_max_pages_still_raises(tmp_path):
         """
         sources:
           - name: bad-max-pages
-            base_url: https://example.com
+            base_url: https://docs-fixture.dev
             max_pages: 0
         """,
     )
@@ -137,7 +137,7 @@ def test_base_url_excluded_by_own_include_prefixes_raises(tmp_path):
         """
         sources:
           - name: bad-seed
-            base_url: https://example.com/docs
+            base_url: https://docs-fixture.dev/docs
             include_prefixes: ["/docs/"]
             max_pages: 10
         """,
@@ -152,7 +152,7 @@ def test_base_url_excluded_by_own_exclude_prefixes_raises(tmp_path):
         """
         sources:
           - name: bad-seed-excluded
-            base_url: https://example.com/blog
+            base_url: https://docs-fixture.dev/blog
             exclude_prefixes: ["/blog"]
             max_pages: 10
         """,
@@ -167,7 +167,7 @@ def test_base_url_allowed_by_own_prefixes_loads_fine(tmp_path):
         """
         sources:
           - name: good-seed
-            base_url: https://example.com/docs
+            base_url: https://docs-fixture.dev/docs
             include_prefixes: ["/docs"]
             max_pages: 10
         """,
@@ -184,8 +184,8 @@ def test_sitemap_source_skips_base_url_prefix_check(tmp_path):
         """
         sources:
           - name: sitemap-src
-            base_url: https://example.com/
-            sitemap: https://example.com/sitemap.xml
+            base_url: https://docs-fixture.dev/
+            sitemap: https://docs-fixture.dev/sitemap.xml
             include_prefixes: ["/tutorial/"]
             max_pages: 10
         """,
@@ -292,4 +292,85 @@ def test_unresolvable_host_is_not_rejected_at_validation_time(tmp_path, monkeypa
     refuses to fetch an unresolvable host (see test_crawler)."""
     monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({}))
     p = write_yaml(tmp_path, _yaml_source(base_url="https://widget.example.com/"))
+    assert load_sources(p)[0].name == "widget"
+
+
+# --- Placeholder/reserved documentation-example hosts (T13) ----------------
+#
+# A live-database audit found test/placeholder rows in the production index,
+# including a page indexed under a trusted source name at
+# 'https://docs.company.com/api-reference'. Reject RFC 2606/6761
+# reserved/placeholder hosts at validation time so this class of row can
+# never be re-added.
+#
+# NOTE: the assertion below checks for "reserved documentation-example host"
+# (the placeholder validator's own wording), not the bare word "placeholder"
+# — pytest's tmp_path for these parametrized tests is itself derived from the
+# test's own name (which contains the substring "placeholder"), and that
+# tmp_path is embedded in ConfigError's message, so a naive substring check
+# on "placeholder" would pass for the wrong reason (matching the tmp file
+# path, not the actual validation error).
+
+# Hosts caught by _base_url_must_not_be_placeholder itself.
+PLACEHOLDER_HOST_CASES = [
+    "https://example.com/docs",
+    "https://example.org/docs",
+    "https://example.net/docs",
+    "https://docs.company.com/docs",
+    "https://foo.test/docs",
+    "https://foo.invalid/docs",
+    "https://foo.example/docs",
+]
+
+# Hosts that are ALSO placeholder hosts, but resolve to loopback for real (via
+# this suite's DNS stub's _ALLOW_REAL_DNS_HOSTS passthrough for
+# 'localhost'/'*.localhost'), so _hosts_must_not_be_private (declared earlier
+# in SourceConfig, and therefore runs first) rejects them before the
+# placeholder validator ever gets a chance to. Still rejected — just for a
+# different, earlier-in-the-chain reason.
+LOOPBACK_PLACEHOLDER_HOST_CASES = [
+    "https://localhost/docs",
+    "https://foo.localhost/docs",
+]
+
+
+@pytest.mark.parametrize("base_url", PLACEHOLDER_HOST_CASES)
+def test_placeholder_base_url_is_rejected(tmp_path, base_url):
+    p = write_yaml(tmp_path, _yaml_source(base_url=base_url))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "reserved documentation-example host" in str(e.value)
+
+
+@pytest.mark.parametrize("base_url", LOOPBACK_PLACEHOLDER_HOST_CASES)
+def test_loopback_placeholder_base_url_is_rejected(tmp_path, base_url):
+    p = write_yaml(tmp_path, _yaml_source(base_url=base_url))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "private" in str(e.value)
+
+
+@pytest.mark.parametrize("sitemap_host", ["example.com", "docs.company.com", "foo.test"])
+def test_placeholder_sitemap_host_is_rejected(tmp_path, sitemap_host):
+    # sitemap must share base_url's host to pass the H1 SSRF guard, so give
+    # both the same placeholder host to isolate the placeholder rejection.
+    p = write_yaml(tmp_path, _yaml_source(
+        base_url=f"https://{sitemap_host}/",
+        sitemap=f"https://{sitemap_host}/sitemap.xml",
+    ))
+    with pytest.raises(ConfigError) as e:
+        load_sources(p)
+    assert "reserved documentation-example host" in str(e.value)
+
+
+def test_subdomain_of_placeholder_host_is_not_rejected(tmp_path):
+    """Only exact placeholder hosts / their reserved suffixes are rejected —
+    a real subdomain like widget.example.com is a legitimate-looking fixture
+    host elsewhere in this suite and must keep loading fine."""
+    p = write_yaml(tmp_path, _yaml_source(base_url="https://widget.example.com/"))
+    assert load_sources(p)[0].name == "widget"
+
+
+def test_legitimate_host_is_not_rejected_by_placeholder_check(tmp_path):
+    p = write_yaml(tmp_path, _yaml_source(base_url="https://docs-fixture.dev/"))
     assert load_sources(p)[0].name == "widget"

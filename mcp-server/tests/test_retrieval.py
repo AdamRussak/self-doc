@@ -48,7 +48,7 @@ def test_hybrid_sql_fts_arm_uses_per_chunk_fts_config():
 def _base_source_kwargs(**overrides):
     kwargs = {
         "name": "example-docs",
-        "base_url": "https://example.com/docs/",
+        "base_url": "https://docs.python.org/docs/",
         "max_pages": 10,
     }
     kwargs.update(overrides)

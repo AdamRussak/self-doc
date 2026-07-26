@@ -262,6 +262,24 @@ def list_sources() -> str:
 
 NAME_PATTERN = r"^[a-z0-9-]+$"
 
+# Placeholder / documentation-example hosts (RFC 2606, RFC 6761) plus a
+# handful of test fixtures that have leaked into the live index before (T13
+# live-database audit: 's1'/'s2' sources, a 'docs.company.com' page indexed
+# under a trusted source name). Rejected outright at proposal time so they
+# can never be re-added. DELIBERATE MIRROR of ingestion/app/config.py's
+# `PLACEHOLDER_HOSTS` / `PLACEHOLDER_HOST_SUFFIXES` — see module note above
+# `ProposedSourceConfig`.
+PLACEHOLDER_HOSTS = frozenset(
+    {
+        "example.com",
+        "example.org",
+        "example.net",
+        "docs.company.com",
+        "localhost",
+    }
+)
+PLACEHOLDER_HOST_SUFFIXES = (".test", ".invalid", ".example", ".localhost")
+
 # Postgres built-in text-search configuration names (see `\dF` / pg_catalog
 # `pg_ts_config` in a default install). `language` must be one of these,
 # lowercased, since it is passed straight through to `to_tsvector(language, ...)`
@@ -459,6 +477,25 @@ class ProposedSourceConfig(BaseModel):
                     f"{urlparse(str(value)).hostname!r} is, resolves to, or cannot be "
                     "resolved away from a private/loopback/link-local/reserved address — "
                     "refusing to propose a source that could crawl internal network space."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _base_url_must_not_be_placeholder(self) -> ProposedSourceConfig:
+        # T13 live-database audit: test/placeholder rows (RFC 2606/6761
+        # reserved names like example.com, plus a fixture 'docs.company.com'
+        # page that got indexed under a trusted source name) leaked into the
+        # production doc index. Reject them at proposal time. Mirrors
+        # ingestion/app/config.py's `SourceConfig._base_url_must_not_be_placeholder`.
+        for field_name, value in (("base_url", self.base_url), ("sitemap", self.sitemap)):
+            if value is None:
+                continue
+            host = (urlparse(str(value)).hostname or "").lower()
+            if host in PLACEHOLDER_HOSTS or host.endswith(PLACEHOLDER_HOST_SUFFIXES):
+                raise ValueError(
+                    f"source '{self.name}': {field_name} host {host!r} is a placeholder/"
+                    "reserved documentation-example host (RFC 2606/6761) — not a real "
+                    "documentation site. Use the actual source URL."
                 )
         return self
 

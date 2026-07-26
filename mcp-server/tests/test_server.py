@@ -287,7 +287,7 @@ def _install_fake_pool(monkeypatch, on_execute):
 def _valid_kwargs(**overrides):
     kwargs = dict(
         name="my-new-source",
-        base_url="https://example.com/docs/",
+        base_url="https://docs.python.org/docs/",
         max_pages=100,
         sitemap=None,
         include_prefixes=["/docs/"],
@@ -491,6 +491,102 @@ def test_propose_source_fails_closed_when_dns_resolution_fails(monkeypatch):
             **_valid_kwargs(base_url="https://this-host-does-not-resolve.invalid/docs/")
         )
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# T13: placeholder/reserved documentation-example hosts. A live-database
+# audit found test/placeholder rows in the production index, including a
+# page indexed under a trusted source name at
+# 'https://docs.company.com/api-reference'. Reject RFC 2606/6761
+# reserved/placeholder hosts at proposal time so this class of row can never
+# be re-proposed. Mirrors ingestion/tests/test_config.py's coverage of
+# SourceConfig's identical validator.
+# ---------------------------------------------------------------------------
+
+
+def _make_public_getaddrinfo(hosts: tuple[str, ...]):
+    """Real `socket.getaddrinfo`, except the given hostnames are stubbed to
+    resolve to a fixed public, non-reserved IPv4 literal — needed because
+    ProposedSourceConfig's `_hosts_must_not_be_private` fails CLOSED on an
+    unresolvable host, and several of these fixture hostnames (foo.test,
+    foo.invalid, foo.example, docs.company.com, widget.example.com) are not
+    real, resolvable domains. Without this, those cases would be rejected by
+    the private-host check before ever reaching the placeholder check this
+    test targets."""
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake(host, *args, **kwargs):
+        if host in hosts:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    return fake
+
+
+# example.com/.org/.net are real, publicly resolvable RFC 2606 domains, so no
+# DNS stub is needed for them; the others are not real domains and need one.
+_UNRESOLVABLE_PLACEHOLDER_HOSTS = ("docs.company.com", "foo.test", "foo.invalid", "foo.example")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://example.com/docs/",
+        "https://example.org/docs/",
+        "https://example.net/docs/",
+        "https://docs.company.com/docs/",
+        "https://foo.test/docs/",
+        "https://foo.invalid/docs/",
+        "https://foo.example/docs/",
+    ],
+)
+def test_propose_source_rejects_placeholder_base_url(monkeypatch, base_url):
+    calls = []
+    _install_fake_pool(monkeypatch, lambda sql, params: calls.append((sql, params)))
+    monkeypatch.setattr(
+        retrieval.socket, "getaddrinfo", _make_public_getaddrinfo(_UNRESOLVABLE_PLACEHOLDER_HOSTS)
+    )
+
+    with pytest.raises(retrieval.ProposalError) as e:
+        retrieval.propose_source(**_valid_kwargs(base_url=base_url))
+    assert "reserved documentation-example host" in str(e.value)
+    assert calls == []
+
+
+@pytest.mark.parametrize("base_url", ["https://localhost/docs/", "https://foo.localhost/docs/"])
+def test_propose_source_rejects_loopback_placeholder_base_url(monkeypatch, base_url):
+    """localhost / *.localhost are also placeholder hosts, but resolve to
+    loopback for real, so `_hosts_must_not_be_private` (declared earlier in
+    ProposedSourceConfig, and therefore runs first) rejects them before the
+    placeholder validator gets a chance to. Still rejected, just for a
+    different, earlier-in-the-chain reason — mirrors ingestion's
+    test_loopback_placeholder_base_url_is_rejected."""
+    calls = []
+    _install_fake_pool(monkeypatch, lambda sql, params: calls.append((sql, params)))
+
+    with pytest.raises(retrieval.ProposalError, match="invalid source configuration"):
+        retrieval.propose_source(**_valid_kwargs(base_url=base_url))
+    assert calls == []
+
+
+def test_propose_source_accepts_subdomain_of_placeholder_host(monkeypatch):
+    """Only exact placeholder hosts / their reserved suffixes are rejected —
+    a real subdomain like widget.example.com must keep working (given a DNS
+    stub, since widget.example.com isn't a real resolvable domain)."""
+    calls = []
+
+    def on_execute(sql, params):
+        calls.append((sql, params))
+        return {"id": 42}
+
+    _install_fake_pool(monkeypatch, on_execute)
+    monkeypatch.setattr(
+        retrieval.socket, "getaddrinfo", _make_public_getaddrinfo(("widget.example.com",))
+    )
+
+    source_id = retrieval.propose_source(**_valid_kwargs(base_url="https://widget.example.com/docs/"))
+    assert source_id == 42
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------

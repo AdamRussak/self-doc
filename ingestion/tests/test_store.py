@@ -78,7 +78,7 @@ def second_conn():
 
 def make_source(name: str = "test-src", max_pages: int = 10) -> SourceConfig:
     return SourceConfig.model_validate(
-        {"name": name, "base_url": "https://example.com/", "max_pages": max_pages}
+        {"name": name, "base_url": "https://docs-fixture.dev/", "max_pages": max_pages}
     )
 
 
@@ -138,12 +138,12 @@ def test_ensure_source_creates_and_upserts(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT name, base_url FROM doc_sources WHERE id = %s", (sid1,))
         row = cur.fetchone()
-    assert row == ("test-src", "https://example.com/")
+    assert row == ("test-src", "https://docs-fixture.dev/")
 
 
 def test_sync_source_indexes_new_pages_and_second_sync_skips_unchanged(conn, monkeypatch):
     source = make_source()
-    _fake_crawl_extract(monkeypatch, {"https://example.com/a": PAGE_MD})
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/a": PAGE_MD})
 
     outcome1 = store.sync_source(source, conn)
     assert outcome1.status == "ok"
@@ -186,21 +186,21 @@ def test_changed_page_is_reembedded_others_untouched(conn, monkeypatch):
     source = make_source()
     _fake_crawl_extract(
         monkeypatch,
-        {"https://example.com/a": PAGE_MD, "https://example.com/b": PAGE_MD.replace("Intro", "Intro B")},
+        {"https://docs-fixture.dev/a": PAGE_MD, "https://docs-fixture.dev/b": PAGE_MD.replace("Intro", "Intro B")},
     )
     outcome1 = store.sync_source(source, conn)
     assert outcome1.pages_fetched == 2
 
     with conn.cursor() as cur:
-        cur.execute("SELECT id, content_hash FROM doc_pages WHERE url = %s", ("https://example.com/a",))
+        cur.execute("SELECT id, content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/a",))
         page_a_id, hash_before = cur.fetchone()
 
     # Mutate only page b's content; page a stays identical.
     _fake_crawl_extract(
         monkeypatch,
         {
-            "https://example.com/a": PAGE_MD,
-            "https://example.com/b": PAGE_MD.replace("Intro", "Intro B changed now") + "\nextra paragraph text here.",
+            "https://docs-fixture.dev/a": PAGE_MD,
+            "https://docs-fixture.dev/b": PAGE_MD.replace("Intro", "Intro B changed now") + "\nextra paragraph text here.",
         },
     )
     outcome2 = store.sync_source(source, conn)
@@ -208,7 +208,7 @@ def test_changed_page_is_reembedded_others_untouched(conn, monkeypatch):
     assert outcome2.pages_skipped == 1  # a skipped
 
     with conn.cursor() as cur:
-        cur.execute("SELECT id, content_hash FROM doc_pages WHERE url = %s", ("https://example.com/a",))
+        cur.execute("SELECT id, content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/a",))
         page_a_id_after, hash_after = cur.fetchone()
     assert page_a_id_after == page_a_id
     assert hash_after == hash_before
@@ -218,7 +218,7 @@ def test_pages_removed_upstream_are_deleted(conn, second_conn, monkeypatch):
     source = make_source()
     _fake_crawl_extract(
         monkeypatch,
-        {"https://example.com/a": PAGE_MD, "https://example.com/b": PAGE_MD.replace("Intro", "Intro B")},
+        {"https://docs-fixture.dev/a": PAGE_MD, "https://docs-fixture.dev/b": PAGE_MD.replace("Intro", "Intro B")},
     )
     store.sync_source(source, conn)
 
@@ -233,7 +233,7 @@ def test_pages_removed_upstream_are_deleted(conn, second_conn, monkeypatch):
     assert count_before == 2
 
     # Next crawl only returns page a — page b was removed upstream.
-    _fake_crawl_extract(monkeypatch, {"https://example.com/a": PAGE_MD})
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/a": PAGE_MD})
     outcome = store.sync_source(source, conn)
     assert outcome.pages_removed == 1
 
@@ -243,7 +243,7 @@ def test_pages_removed_upstream_are_deleted(conn, second_conn, monkeypatch):
             (source.name,),
         )
         urls = {r[0] for r in cur.fetchall()}
-    assert urls == {"https://example.com/a"}
+    assert urls == {"https://docs-fixture.dev/a"}
 
 
 def test_source_status_failed_on_crawl_error(conn, monkeypatch):
@@ -292,7 +292,7 @@ def test_crawl_failure_mid_iteration_keeps_already_committed_pages(conn, monkeyp
     source = make_source()
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/good", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/good", "html": PAGE_MD}
         raise RuntimeError("the connection is lost")
 
     def fake_extract(url, html):
@@ -310,7 +310,7 @@ def test_crawl_failure_mid_iteration_keeps_already_committed_pages(conn, monkeyp
     assert outcome.status != "ok"
 
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM doc_pages WHERE url = %s", ("https://example.com/good",))
+        cur.execute("SELECT count(*) FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/good",))
         (n,) = cur.fetchone()
     assert n == 1
 
@@ -328,12 +328,12 @@ def test_mid_crawl_abort_does_not_prune_pages_it_never_reached(conn, second_conn
     must never happen: an aborted sync should leave the existing corpus
     fully intact and report pages_removed == 0."""
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(10)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(10)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
     assert _existing_urls(conn, source.name) == set(existing_urls)
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/page-0", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/page-0", "html": PAGE_MD}
         raise RuntimeError("the connection is lost")
 
     def fake_extract(url, html):
@@ -357,7 +357,7 @@ def test_mid_crawl_abort_on_very_first_page_does_not_wipe_source(conn, second_co
     now has zero pages" — `_delete_missing_pages` deletes everything for the
     source when `seen_urls` is empty, so this path must be skipped entirely."""
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(5)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(5)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     def fake_crawl(source, client=None):
@@ -383,7 +383,7 @@ def test_completed_but_empty_crawl_does_not_wipe_source(conn, second_conn, monke
     empty too, independent of whether the crawl "failed" or just legitimately
     found nothing this run."""
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(6)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(6)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     def empty_but_completed_crawl(source, client=None):
@@ -403,7 +403,7 @@ def test_delete_missing_pages_refuses_empty_seen_urls_by_default(conn, second_co
     empty `seen_urls` — defense in depth independent of any caller-side
     guard in `sync_source`."""
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(3)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(3)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     with conn.cursor() as cur:
@@ -432,7 +432,7 @@ def test_purge_ratio_guard_refuses_bfs_collapse_real_traefik_numbers(conn, secon
     source = make_source(max_pages=500)
     _use_fast_chunk_and_embed(monkeypatch)
 
-    existing_urls = [f"https://example.com/page-{i}" for i in range(397)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(397)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     # BFS collapse: the crawl only reaches a small connected subset.
@@ -458,15 +458,15 @@ def test_purge_ratio_guard_permits_traefik_style_self_heal_real_numbers(conn, se
     source = make_source(max_pages=500)
     _use_fast_chunk_and_embed(monkeypatch)
 
-    in_scope_existing = [f"https://example.com/traefik/page-{i}" for i in range(165)]
-    wrong_product_existing = [f"https://example.com/traefik-hub/page-{i}" for i in range(232)]
+    in_scope_existing = [f"https://docs-fixture.dev/traefik/page-{i}" for i in range(165)]
+    wrong_product_existing = [f"https://docs-fixture.dev/traefik-hub/page-{i}" for i in range(232)]
     existing_urls = in_scope_existing + wrong_product_existing
     assert len(existing_urls) == 397
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     # Corrected crawl (include_prefixes now scopes to /traefik/ only): the
     # 165 previously-seen in-scope pages plus 115 newly-discovered ones.
-    corrected_urls = [f"https://example.com/traefik/page-{i}" for i in range(280)]
+    corrected_urls = [f"https://docs-fixture.dev/traefik/page-{i}" for i in range(280)]
     _fake_crawl_extract(monkeypatch, {u: PAGE_MD for u in corrected_urls})
 
     outcome = store.sync_source(source, conn)
@@ -499,8 +499,8 @@ def test_source_status_partial_on_soft_page_failure_ratio(conn, monkeypatch):
 
     def fake_crawl(source, client=None):
         return [
-            {"url": "https://example.com/a", "html": "x"},
-            {"url": "https://example.com/b", "html": "longer content"},
+            {"url": "https://docs-fixture.dev/a", "html": "x"},
+            {"url": "https://docs-fixture.dev/b", "html": "longer content"},
         ]
 
     from app.extract import ExtractionResult
@@ -527,8 +527,8 @@ def test_source_status_partial_on_hard_page_failures(conn, monkeypatch):
 
     def fake_crawl(source, client=None):
         return [
-            {"url": "https://example.com/good", "html": "good content"},
-            {"url": "https://example.com/bad", "html": "bad content"},
+            {"url": "https://docs-fixture.dev/good", "html": "good content"},
+            {"url": "https://docs-fixture.dev/bad", "html": "bad content"},
         ]
 
     from app.extract import ExtractionResult
@@ -539,7 +539,7 @@ def test_source_status_partial_on_hard_page_failures(conn, monkeypatch):
     orig_replace = store.replace_page
 
     def fake_replace_page(conn_arg, source_id, url, content_hash, chunks, **kwargs):
-        if url == "https://example.com/bad":
+        if url == "https://docs-fixture.dev/bad":
             raise RuntimeError("hard DB write error")
         return orig_replace(conn_arg, source_id, url, content_hash, chunks, **kwargs)
 
@@ -583,7 +583,7 @@ def test_sync_source_durability_visible_from_second_connection(conn, monkeypatch
     second, independent database connection without waiting for the sync connection
     to close."""
     source = make_source()
-    _fake_crawl_extract(monkeypatch, {"https://example.com/durability": PAGE_MD})
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/durability": PAGE_MD})
 
     outcome = store.sync_source(source, conn)
     assert outcome.status == "ok"
@@ -598,7 +598,7 @@ def test_sync_source_durability_visible_from_second_connection(conn, monkeypatch
                 JOIN doc_sources s ON s.id = p.source_id
                 WHERE s.name = %s AND p.url = %s
                 """,
-                (source.name, "https://example.com/durability"),
+                (source.name, "https://docs-fixture.dev/durability"),
             )
             (n_pages,) = cur.fetchone()
             assert n_pages == 1
@@ -625,8 +625,8 @@ def test_crash_after_n_pages_leaves_exactly_n_pages_durable_verified_cross_conne
     source = make_source()
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/page1", "html": PAGE_MD}
-        yield {"url": "https://example.com/page2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/page1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/page2", "html": PAGE_MD}
         raise RuntimeError("network failure after 2 pages")
 
     def fake_extract(url, html):
@@ -654,7 +654,7 @@ def test_crash_after_n_pages_leaves_exactly_n_pages_durable_verified_cross_conne
                 (source.name,),
             )
             urls = [r[0] for r in cur.fetchall()]
-            assert urls == ["https://example.com/page1", "https://example.com/page2"]
+            assert urls == ["https://docs-fixture.dev/page1", "https://docs-fixture.dev/page2"]
     finally:
         second_conn.close()
 
@@ -664,7 +664,7 @@ def test_replace_page_atomic_no_partial_chunks_on_failure(conn, monkeypatch):
     through, the entire replace_page transaction rolls back, leaving no partial chunks
     and preserving the old page state. Verified cross-connection."""
     source = make_source()
-    _fake_crawl_extract(monkeypatch, {"https://example.com/atomic": PAGE_MD})
+    _fake_crawl_extract(monkeypatch, {"https://docs-fixture.dev/atomic": PAGE_MD})
     outcome = store.sync_source(source, conn)
     assert outcome.pages_fetched == 1
 
@@ -680,14 +680,14 @@ def test_replace_page_atomic_no_partial_chunks_on_failure(conn, monkeypatch):
     ]
 
     with pytest.raises(psycopg.Error):
-        store.replace_page(conn, source_id, "https://example.com/atomic", "new_hash", bad_chunks)
+        store.replace_page(conn, source_id, "https://docs-fixture.dev/atomic", "new_hash", bad_chunks)
 
     second_conn = store.get_connection()
     try:
         with second_conn.cursor() as cur:
             cur.execute(
                 "SELECT content_hash FROM doc_pages WHERE url = %s",
-                ("https://example.com/atomic",),
+                ("https://docs-fixture.dev/atomic",),
             )
             row = cur.fetchone()
             assert row is not None
@@ -716,7 +716,7 @@ def test_no_idle_in_transaction_during_multi_page_sync(conn, monkeypatch):
     observed_states = []
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
         second_conn = store.get_connection()
         try:
             with second_conn.cursor() as cur:
@@ -729,7 +729,7 @@ def test_no_idle_in_transaction_during_multi_page_sync(conn, monkeypatch):
                     observed_states.append(row[0])
         finally:
             second_conn.close()
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
@@ -753,7 +753,7 @@ def test_sync_source_fetch_failed_503_preserves_existing_page_verified_second_co
     source = make_source()
 
     def fake_crawl_first(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD, "fetch_ok": True}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD, "fetch_ok": True}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
@@ -768,7 +768,7 @@ def test_sync_source_fetch_failed_503_preserves_existing_page_verified_second_co
 
     # Second sync where the page fails to fetch (503 / fetch_ok=False)
     def fake_crawl_second(source, client=None):
-        yield {"url": "https://example.com/p1", "html": None, "fetch_ok": False}
+        yield {"url": "https://docs-fixture.dev/p1", "html": None, "fetch_ok": False}
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl_second)
     outcome_second = store.sync_source(source, conn)
@@ -783,7 +783,7 @@ def test_sync_source_fetch_failed_503_preserves_existing_page_verified_second_co
     second_conn = store.get_connection()
     try:
         with second_conn.cursor() as cur:
-            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://example.com/p1",))
+            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/p1",))
             assert cur.fetchone() is not None
 
             cur.execute(
@@ -807,8 +807,8 @@ def test_sync_source_genuinely_absent_page_is_still_purged(conn, monkeypatch):
     source = make_source()
 
     def fake_crawl_first(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD, "fetch_ok": True}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD, "fetch_ok": True}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD, "fetch_ok": True}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD, "fetch_ok": True}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
@@ -822,7 +822,7 @@ def test_sync_source_genuinely_absent_page_is_still_purged(conn, monkeypatch):
 
     # Second sync where p2 is genuinely gone (neither fetch_ok=True nor fetch_ok=False)
     def fake_crawl_second(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD, "fetch_ok": True}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD, "fetch_ok": True}
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl_second)
     outcome_second = store.sync_source(source, conn)
@@ -831,9 +831,9 @@ def test_sync_source_genuinely_absent_page_is_still_purged(conn, monkeypatch):
     second_conn = store.get_connection()
     try:
         with second_conn.cursor() as cur:
-            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://example.com/p2",))
+            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/p2",))
             assert cur.fetchone() is None
-            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://example.com/p1",))
+            cur.execute("SELECT url FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/p1",))
             assert cur.fetchone() is not None
     finally:
         second_conn.close()
@@ -848,8 +848,8 @@ def test_sync_source_all_pages_soft_failed_reports_status_failed(conn, monkeypat
     source = make_source()
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/broken1", "html": None, "fetch_ok": False}
-        yield {"url": "https://example.com/broken2", "html": None, "fetch_ok": False}
+        yield {"url": "https://docs-fixture.dev/broken1", "html": None, "fetch_ok": False}
+        yield {"url": "https://docs-fixture.dev/broken2", "html": None, "fetch_ok": False}
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
 
@@ -875,7 +875,7 @@ def test_purge_ratio_guard_computed_against_pre_sync_snapshot(conn, second_conn,
     source = make_source(max_pages=500)
     _use_fast_chunk_and_embed(monkeypatch)
 
-    existing_urls = [f"https://example.com/page-{i}" for i in range(397)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(397)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     # We discover 125 of the old existing pages, plus 100 brand new pages.
@@ -887,7 +887,7 @@ def test_purge_ratio_guard_computed_against_pre_sync_snapshot(conn, second_conn,
     # If evaluated against post-loop existing_count = 397 + 100 = 497:
     #   coverage_ratio = 125/497 = 0.252 (< 0.3 floor), which would REFUSE the purge!
     old_seen = existing_urls[:125]
-    new_seen = [f"https://example.com/new-page-{i}" for i in range(100)]
+    new_seen = [f"https://docs-fixture.dev/new-page-{i}" for i in range(100)]
     _fake_crawl_extract(monkeypatch, {u: PAGE_MD for u in old_seen + new_seen})
 
     outcome = store.sync_source(source, conn)
@@ -904,7 +904,7 @@ def test_purge_ratio_guard_excludes_fetch_failures_from_coverage_ratio(conn, sec
     source = make_source(max_pages=500)
     _use_fast_chunk_and_embed(monkeypatch)
 
-    existing_urls = [f"https://example.com/page-{i}" for i in range(397)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(397)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     # A mass-fetch-failure run: 150 URLs attempted but all fail (fetch_ok=False), 0 successes.
@@ -915,7 +915,7 @@ def test_purge_ratio_guard_excludes_fetch_failures_from_coverage_ratio(conn, sec
     #   coverage = 0 / 397 = 0.0 (< 0.3 floor) -> REFUSED by guard.
     def fake_crawl(source, client=None):
         for i in range(150):
-            yield {"url": f"https://example.com/broken-{i}", "html": None, "fetch_ok": False}
+            yield {"url": f"https://docs-fixture.dev/broken-{i}", "html": None, "fetch_ok": False}
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
 
@@ -931,16 +931,16 @@ def test_recovery_page_extract_failed_preserves_existing_row_and_continues(conn,
     """(B2) If a page yields but extraction fails (status != 'ok'), existing row
     and chunks survive, pages_failed is incremented, and sync continues to subsequent pages."""
     source = make_source()
-    _seed_pages(conn, monkeypatch, source, ["https://example.com/p1", "https://example.com/p2"])
+    _seed_pages(conn, monkeypatch, source, ["https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"])
     assert len(_existing_urls(second_conn, source.name)) == 2
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/p1", "html": "bad html"}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": "bad html"}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
-        if url == "https://example.com/p1":
+        if url == "https://docs-fixture.dev/p1":
             return ExtractionResult(url=url, markdown="", status="error", reason="malformed HTML")
         return ExtractionResult(url=url, markdown=html, status="ok")
 
@@ -953,7 +953,7 @@ def test_recovery_page_extract_failed_preserves_existing_row_and_continues(conn,
     assert outcome.pages_fetched == 1 or outcome.pages_skipped == 1
 
     urls = _existing_urls(second_conn, source.name)
-    assert urls == {"https://example.com/p1", "https://example.com/p2"}
+    assert urls == {"https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"}
 
 
 def test_recovery_replace_page_raises_preserves_existing_and_continues(conn, second_conn, monkeypatch):
@@ -961,30 +961,30 @@ def test_recovery_replace_page_raises_preserves_existing_and_continues(conn, sec
     for that page, the previous good version of the row is intact, and sync continues
     to subsequent pages."""
     source = make_source()
-    _seed_pages(conn, monkeypatch, source, ["https://example.com/p1", "https://example.com/p2"])
+    _seed_pages(conn, monkeypatch, source, ["https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"])
 
     with second_conn.cursor() as cur:
-        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/p1",))
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/p1",))
         (old_hash,) = cur.fetchone()
 
     real_replace_page = store.replace_page
     def fake_replace_page(c, source_id, url, content_hash, chunks):
-        if url == "https://example.com/p1":
+        if url == "https://docs-fixture.dev/p1":
             raise psycopg.OperationalError("simulated database failure on replace_page")
         return real_replace_page(c, source_id, url, content_hash, chunks)
 
     monkeypatch.setattr(store, "replace_page", fake_replace_page)
 
     _fake_crawl_extract(monkeypatch, {
-        "https://example.com/p1": PAGE_MD.replace("Intro", "Intro Modified"),
-        "https://example.com/p2": PAGE_MD
+        "https://docs-fixture.dev/p1": PAGE_MD.replace("Intro", "Intro Modified"),
+        "https://docs-fixture.dev/p2": PAGE_MD
     })
 
     outcome = store.sync_source(source, conn)
     assert outcome.pages_failed == 1
 
     with second_conn.cursor() as cur:
-        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/p1",))
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/p1",))
         (current_hash,) = cur.fetchone()
         assert current_hash == old_hash
 
@@ -994,19 +994,19 @@ def test_recovery_mixed_source_partial_status_no_purge(conn, second_conn, monkey
     prior content intact, status is 'partial' not 'ok', and NOTHING is purged."""
     source = make_source()
     _seed_pages(conn, monkeypatch, source, [
-        "https://example.com/good",
-        "https://example.com/fetch_fail",
-        "https://example.com/extract_fail"
+        "https://docs-fixture.dev/good",
+        "https://docs-fixture.dev/fetch_fail",
+        "https://docs-fixture.dev/extract_fail"
     ])
 
     def fake_crawl(source, client=None):
-        yield {"url": "https://example.com/good", "html": PAGE_MD}
-        yield {"url": "https://example.com/fetch_fail", "html": None, "fetch_ok": False}
-        yield {"url": "https://example.com/extract_fail", "html": "bad html"}
+        yield {"url": "https://docs-fixture.dev/good", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/fetch_fail", "html": None, "fetch_ok": False}
+        yield {"url": "https://docs-fixture.dev/extract_fail", "html": "bad html"}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
-        if url == "https://example.com/extract_fail":
+        if url == "https://docs-fixture.dev/extract_fail":
             return ExtractionResult(url=url, markdown="", status="error", reason="extraction error")
         return ExtractionResult(url=url, markdown=html, status="ok")
 
@@ -1022,9 +1022,9 @@ def test_recovery_mixed_source_partial_status_no_purge(conn, second_conn, monkey
 
     urls = _existing_urls(second_conn, source.name)
     assert urls == {
-        "https://example.com/good",
-        "https://example.com/fetch_fail",
-        "https://example.com/extract_fail"
+        "https://docs-fixture.dev/good",
+        "https://docs-fixture.dev/fetch_fail",
+        "https://docs-fixture.dev/extract_fail"
     }
 
 
@@ -1035,8 +1035,8 @@ def test_recovery_resume_across_syncs_incremental(conn, second_conn, monkeypatch
     source = make_source()
 
     def crawl_run1(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
-        yield {"url": "https://example.com/p2", "html": None, "fetch_ok": False}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": None, "fetch_ok": False}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
@@ -1049,18 +1049,18 @@ def test_recovery_resume_across_syncs_incremental(conn, second_conn, monkeypatch
     assert outcome1.pages_fetched == 1
     assert outcome1.pages_soft_failed == 1
     assert outcome1.pages_failed == 0
-    assert _existing_urls(second_conn, source.name) == {"https://example.com/p1"}
+    assert _existing_urls(second_conn, source.name) == {"https://docs-fixture.dev/p1"}
 
     def crawl_run2(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
 
     monkeypatch.setattr(store.crawler, "crawl", crawl_run2)
     outcome2 = store.sync_source(source, conn)
     assert outcome2.pages_skipped == 1  # p1 skipped by hash!
     assert outcome2.pages_fetched == 1  # p2 indexed!
     assert outcome2.status == "ok"
-    assert _existing_urls(second_conn, source.name) == {"https://example.com/p1", "https://example.com/p2"}
+    assert _existing_urls(second_conn, source.name) == {"https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"}
 
 
 def _fake_crawl_items(monkeypatch, items):
@@ -1082,14 +1082,14 @@ def test_sync_source_markdown_item_indexes_with_source_language_fts_config(conn,
     indexed without going through extract.extract, and every inserted
     doc_chunks row's fts_config must equal source.language."""
     source = SourceConfig.model_validate(
-        {"name": "test-src", "base_url": "https://example.com/", "max_pages": 10, "language": "french"}
+        {"name": "test-src", "base_url": "https://docs-fixture.dev/", "max_pages": 10, "language": "french"}
     )
     _use_fast_chunk_and_embed(monkeypatch)
     _fake_crawl_items(
         monkeypatch,
         [
             {
-                "url": "https://example.com/fr-page",
+                "url": "https://docs-fixture.dev/fr-page",
                 "markdown": "# Titre\nCeci est un contenu de test en francais pour la config fts.",
                 "heading_path": "Titre",
                 "fetch_ok": True,
@@ -1127,7 +1127,7 @@ def test_sync_source_per_page_not_modified_bumps_outcome_and_leaves_row_untouche
         monkeypatch,
         [
             {
-                "url": "https://example.com/nm",
+                "url": "https://docs-fixture.dev/nm",
                 "markdown": "# Title\nSome content that is indexed the first time around.",
                 "heading_path": "Title",
                 "fetch_ok": True,
@@ -1138,12 +1138,12 @@ def test_sync_source_per_page_not_modified_bumps_outcome_and_leaves_row_untouche
     assert outcome1.pages_fetched == 1
 
     with conn.cursor() as cur:
-        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/nm",))
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/nm",))
         (hash_before,) = cur.fetchone()
 
     _fake_crawl_items(
         monkeypatch,
-        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+        [{"url": "https://docs-fixture.dev/nm", "not_modified": True, "fetch_ok": True}],
     )
     outcome2 = store.sync_source(source, conn)
     assert outcome2.pages_not_modified == 1
@@ -1151,7 +1151,7 @@ def test_sync_source_per_page_not_modified_bumps_outcome_and_leaves_row_untouche
     assert outcome2.pages_removed == 0
 
     with conn.cursor() as cur:
-        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://example.com/nm",))
+        cur.execute("SELECT content_hash FROM doc_pages WHERE url = %s", ("https://docs-fixture.dev/nm",))
         (hash_after,) = cur.fetchone()
     assert hash_after == hash_before
 
@@ -1161,7 +1161,7 @@ def test_sync_source_llms_index_unchanged_sentinel_skips_purge_entirely(conn, se
     in zero deletes (pages_removed == 0) even though doc_pages has rows for
     this source that were never in seen_urls this run."""
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(5)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(5)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     _fake_crawl_items(
@@ -1169,7 +1169,7 @@ def test_sync_source_llms_index_unchanged_sentinel_skips_purge_entirely(conn, se
         [
             {
                 "kind": "llms_index_unchanged",
-                "url": "https://example.com/llms-full.txt",
+                "url": "https://docs-fixture.dev/llms-full.txt",
                 "not_modified": True,
                 "fetch_ok": True,
             }
@@ -1189,8 +1189,8 @@ def test_recovery_crash_resume_incremental(conn, second_conn, monkeypatch):
     source = make_source()
 
     def crawl_run1(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
         raise RuntimeError("connection lost after 2 pages")
 
     def fake_extract(url, html):
@@ -1203,13 +1203,13 @@ def test_recovery_crash_resume_incremental(conn, second_conn, monkeypatch):
     outcome1 = store.sync_source(source, conn)
     assert outcome1.status == "partial"
     assert outcome1.pages_fetched == 2
-    assert _existing_urls(second_conn, source.name) == {"https://example.com/p1", "https://example.com/p2"}
+    assert _existing_urls(second_conn, source.name) == {"https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"}
 
     def crawl_run2(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
-        yield {"url": "https://example.com/p3", "html": PAGE_MD}
-        yield {"url": "https://example.com/p4", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p3", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p4", "html": PAGE_MD}
 
     monkeypatch.setattr(store.crawler, "crawl", crawl_run2)
     outcome2 = store.sync_source(source, conn)
@@ -1217,16 +1217,16 @@ def test_recovery_crash_resume_incremental(conn, second_conn, monkeypatch):
     assert outcome2.pages_fetched == 2  # p3 and p4 indexed!
     assert outcome2.status == "ok"
     assert _existing_urls(second_conn, source.name) == {
-        "https://example.com/p1",
-        "https://example.com/p2",
-        "https://example.com/p3",
-        "https://example.com/p4",
+        "https://docs-fixture.dev/p1",
+        "https://docs-fixture.dev/p2",
+        "https://docs-fixture.dev/p3",
+        "https://docs-fixture.dev/p4",
     }
 
 
 def test_purge_source_removes_data_and_resets_metadata(conn, second_conn, monkeypatch):
     source = make_source()
-    existing_urls = [f"https://example.com/page-{i}" for i in range(3)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(3)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     source_id = store.ensure_source(conn, source)
@@ -1265,15 +1265,15 @@ def test_sync_source_aborted_by_cancellation(conn, monkeypatch):
     cancel_event = threading.Event()
 
     def crawl_with_cancel(source, client=None):
-        yield {"url": "https://example.com/p1", "html": PAGE_MD}
-        yield {"url": "https://example.com/p2", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p1", "html": PAGE_MD}
+        yield {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
         return ExtractionResult(url=url, markdown=html, status="ok")
 
     def progress_cb(outcome, url):
-        if url == "https://example.com/p1":
+        if url == "https://docs-fixture.dev/p1":
             cancel_event.set()
 
     monkeypatch.setattr(store.crawler, "crawl", crawl_with_cancel)
@@ -1305,7 +1305,7 @@ def test_all_pages_304_not_modified_reports_status_ok(conn, monkeypatch):
     source = make_source()
     _fake_crawl_items(
         monkeypatch,
-        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+        [{"url": "https://docs-fixture.dev/nm", "not_modified": True, "fetch_ok": True}],
     )
     outcome = store.sync_source(source, conn)
     assert outcome.status == "ok"
@@ -1317,19 +1317,19 @@ def test_all_pages_304_not_modified_reports_status_ok(conn, monkeypatch):
 def test_all_pages_304_not_modified_does_not_purge_existing_pages(conn, second_conn, monkeypatch):
     source = make_source()
     _use_fast_chunk_and_embed(monkeypatch)
-    _seed_pages(conn, monkeypatch, source, ["https://example.com/p1", "https://example.com/p2"])
+    _seed_pages(conn, monkeypatch, source, ["https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"])
     _fake_crawl_items(
         monkeypatch,
         [
-            {"url": "https://example.com/p1", "not_modified": True, "fetch_ok": True},
-            {"url": "https://example.com/p2", "not_modified": True, "fetch_ok": True},
+            {"url": "https://docs-fixture.dev/p1", "not_modified": True, "fetch_ok": True},
+            {"url": "https://docs-fixture.dev/p2", "not_modified": True, "fetch_ok": True},
         ],
     )
     outcome = store.sync_source(source, conn)
     assert outcome.status == "ok"
     assert outcome.pages_removed == 0
     assert outcome.pages_not_modified == 2
-    assert _existing_urls(second_conn, source.name) == {"https://example.com/p1", "https://example.com/p2"}
+    assert _existing_urls(second_conn, source.name) == {"https://docs-fixture.dev/p1", "https://docs-fixture.dev/p2"}
 
 
 def test_mixed_304_and_fetched_pages_reports_status_ok(conn, monkeypatch):
@@ -1338,8 +1338,8 @@ def test_mixed_304_and_fetched_pages_reports_status_ok(conn, monkeypatch):
     _fake_crawl_items(
         monkeypatch,
         [
-            {"url": "https://example.com/p1", "not_modified": True, "fetch_ok": True},
-            {"url": "https://example.com/p2", "html": PAGE_MD, "fetch_ok": True},
+            {"url": "https://docs-fixture.dev/p1", "not_modified": True, "fetch_ok": True},
+            {"url": "https://docs-fixture.dev/p2", "html": PAGE_MD, "fetch_ok": True},
         ],
     )
 
@@ -1386,7 +1386,7 @@ def test_pages_not_modified_appears_in_sync_complete_log(conn, monkeypatch):
 
     _fake_crawl_items(
         monkeypatch,
-        [{"url": "https://example.com/nm", "not_modified": True, "fetch_ok": True}],
+        [{"url": "https://docs-fixture.dev/nm", "not_modified": True, "fetch_ok": True}],
     )
     outcome = store.sync_source(source, conn)
     assert outcome.status == "ok"
