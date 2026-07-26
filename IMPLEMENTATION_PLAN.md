@@ -77,11 +77,13 @@ self-docs/
 │   │   ├── embedder.py         # FastEmbed passage_embed wrapper
 │   │   └── store.py            # hash-diff upsert into Postgres
 │   └── config/
-│       └── sources.yaml        # PHASE 6: historical/seed only — doc_sources
-│                               # (Postgres) is now the source of truth for
-│                               # crawl config; this file is imported ONLY
-│                               # when IMPORT_SOURCES_YAML_ON_BOOT=1 is set
-│                               # at container start. See §8.
+│       └── .gitkeep            # PHASE 6: sources.yaml removed entirely —
+│                               # doc_sources (Postgres) is the sole source
+│                               # of truth for crawl config, populated via
+│                               # the admin UI, the MCP propose_doc_source
+│                               # tool, or scripts/push_sources.py.
+│                               # sources_repo.import_from_yaml still exists
+│                               # (tested) but has no caller. See §8.
 ├── mcp-server/
 │   ├── Dockerfile
 │   ├── pyproject.toml
@@ -153,11 +155,15 @@ state, adopt Alembic then (recorded as an ADR).
 
 > **This section describes the pre-Phase-6 design and is retained only for
 > historical schema reference.** As of Phase 6, `doc_sources` (Postgres) is
-> the source of truth for crawl config; `sources.yaml` is a one-way seed
-> file imported only when `IMPORT_SOURCES_YAML_ON_BOOT=1` is set at
-> container start, and is never re-read on `/sync` or any other request
-> path. See §8 "Phase 6 — Sources-in-Postgres, Admin UI, Scheduler, MCP
-> Proposals" and `docs/runbook.md` for the current behavior.
+> the sole source of truth for crawl config, populated via the admin UI, the
+> MCP `propose_doc_source` tool, or `scripts/push_sources.py`.
+> `ingestion/config/sources.yaml` has since been **deleted from the repo**
+> (`ingestion/config/` now holds only a `.gitkeep`); `sources_repo.import_from_yaml`
+> still exists and is still tested, but nothing in the codebase calls it — it
+> is a programmatic-only helper, not a wired-up boot path, and no
+> environment variable imports a YAML file at container start. See §8
+> "Phase 6 — Sources-in-Postgres, Admin UI, Scheduler, MCP Proposals" and
+> `docs/runbook.md` for the current behavior.
 
 Lives at `ingestion/config/sources.yaml`. The field schema below (name,
 base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language,
@@ -417,7 +423,7 @@ config path (see the superseded-notice callouts added at each such spot).
 
 | Area | What changed | Why |
 |---|---|---|
-| **Config storage** | `doc_sources` gains `sitemap`, `include_prefixes`, `exclude_prefixes`, `max_pages`, `language`, `rate_limit_rps`, `schedule_cron`, `enabled`, `status`, `proposed_by`, `created_at` (`db/init/02_sources_config.sql`). `sources.yaml` becomes a one-way seed, imported only when `IMPORT_SOURCES_YAML_ON_BOOT=1`. | A YAML file re-read on every `/sync` request can't hold per-source `schedule_cron`/`enabled`/`status` state cleanly, and gives no place for an MCP-proposed source to land pending review. |
+| **Config storage** | `doc_sources` gains `sitemap`, `include_prefixes`, `exclude_prefixes`, `max_pages`, `language`, `rate_limit_rps`, `schedule_cron`, `enabled`, `status`, `proposed_by`, `created_at` (`db/init/02_sources_config.sql`). `sources.yaml` was later **deleted from the repo** entirely (`ingestion/config/` now holds only a `.gitkeep`); `sources_repo.import_from_yaml` still exists and is tested but has no caller — no env var boots an import from it. | A YAML file re-read on every `/sync` request can't hold per-source `schedule_cron`/`enabled`/`status` state cleanly, and gives no place for an MCP-proposed source to land pending review. |
 | **Migration** | `db/init/*.sql` only runs against an empty Postgres data directory. On an existing DB, `02_sources_config.sql` must be applied by hand via `scripts/migrate.sh` (idempotent — `ADD COLUMN IF NOT EXISTS` / guarded `DO` block for the `CHECK` constraint). | `db/init` scripts are a first-boot-only mechanism; there is intentionally no auto-migration path for a running Postgres volume (§2 "Schema evolution" / GAP-8's nuke-and-rebuild philosophy still holds — this migration is the one exception because bulk re-crawling isn't needed, only a schema extension). |
 | **Admin UI** | Server-rendered (Jinja2 + vendored htmx) CRUD at `/admin` on the `ingestion` service, loopback-only (`127.0.0.1:8080`, no Traefik router) — full source CRUD, manual per-source sync, pending-proposal approve/reject. Auth: `SYNC_TOKEN` exchanged at `/admin/login` for an HMAC-derived session cookie + CSRF token (both deterministic functions of `SYNC_TOKEN` — no per-session store; rotating `SYNC_TOKEN` is the only revocation mechanism for a leaked cookie). | A CRUD surface over crawl config needs a human-operable UI, but must stay off the LAN/Traefik because it can trigger crawls and mutate `doc_sources` directly. |
 | **Scheduler** | New `app.scheduler` module: per-source `schedule_cron`, evaluated by a restricted 5-field cron subset (`*`, `*/N`, bare int, comma-list — no ranges, no named values) implemented from scratch in `sources_repo.py` (no `croniter`/`APScheduler` dependency). `SCHEDULER_ENABLED` defaults OFF. Every scheduling decision logs a distinct structlog event (`fired`/`skipped-not-due`/`skipped-locked`/`errored`), with `skipped-not-due` carrying a `reason`. | Replaces n8n's weekly cron trigger with an in-process equivalent that's per-source-configurable and answerable from logs alone; defaulting OFF avoids double-scheduling against a still-active n8n workflow. |

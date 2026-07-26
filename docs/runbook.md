@@ -14,9 +14,12 @@ crawl-config columns — `sitemap`, `include_prefixes`, `exclude_prefixes`,
 `status`, `proposed_by`, `created_at` — via `db/init/02_sources_config.sql`.
 **This reverses previously-documented guidance in this runbook**: editing
 `sources.yaml` no longer takes effect on the next `/sync` (see the corrected
-"Add a new doc source" section below) — `sources.yaml` is now only a
-one-way seed, imported *exclusively* when `IMPORT_SOURCES_YAML_ON_BOOT=1` is
-set at container start.
+"Add a new doc source" section below). `ingestion/config/sources.yaml` has
+since been **deleted from the repo entirely** (`ingestion/config/` now holds
+only a `.gitkeep` so the Docker build still has a directory to bind-mount).
+`sources_repo.import_from_yaml` still exists and is still tested, but
+nothing in the codebase calls it — it is a programmatic-only helper, not a
+wired-up boot path, and no env var triggers it at container start.
 
 **Update (ADR-003): `02_sources_config.sql` also carries the llms.txt /
 conditional-GET / multilingual-FTS columns.** The same file now additionally
@@ -167,8 +170,8 @@ checklist that prevents the failure mode in the first place).
 3. **Post-deploy: verify the Traefik `serversTransport` binding (production
    only).** `docker-compose.prod.yml` declares a Traefik `serversTransport`
    label intended to raise the backend timeout for slow embedding+pgvector
-   queries. **This is unverified in-repo** — `ingestion/config/sources.yaml` does
-   not index a Traefik documentation source, so this repo cannot cite
+   queries. **This is unverified in-repo** — `doc_sources` does not carry an
+   indexed Traefik documentation source, so this repo cannot cite
    `search_docs` evidence that the Traefik v3 Docker provider actually builds
    `http.serversTransports.*` from container labels the way the compose file
    assumes. Confirm it manually after deploying:
@@ -355,14 +358,17 @@ declared**.
 
 ## Add a new doc source
 
-**`doc_sources` in Postgres is the source of truth for crawl config —
-`ingestion/config/sources.yaml` is NOT.** `sources.yaml` survives only as a
-one-way seed file, imported once when the `ingestion` container boots with
-`IMPORT_SOURCES_YAML_ON_BOOT=1` set; it is never read on any request path
-and editing it has **no effect** on a running deployment. (Superseded
-guidance, corrected here: an earlier revision of this runbook said editing
-`sources.yaml` took effect on the next `/sync` — that has not been true
-since sources moved into Postgres.)
+**`doc_sources` in Postgres is the sole source of truth for crawl config.**
+`ingestion/config/sources.yaml` has been **deleted from the repo**
+(`ingestion/config/` now holds only a `.gitkeep` so the Docker build still
+has a directory to bind-mount). `sources_repo.import_from_yaml` still exists
+and is still tested, but nothing in the codebase calls it — it is a
+programmatic-only helper, not a wired-up boot path; no env var imports a
+YAML file at container start. (Superseded guidance, corrected here: an
+earlier revision of this runbook said editing `sources.yaml` took effect on
+the next `/sync` — that has not been true since sources moved into
+Postgres.) A source is added via the admin UI, the MCP `propose_doc_source`
+tool, or `scripts/push_sources.py`.
 
 There are two ways to add a source, human (admin UI) and agent (MCP
 proposal):
@@ -372,17 +378,32 @@ proposal):
 1. Open `http://127.0.0.1:8080/admin/login` (loopback-only — see
    [Admin UI](#admin-ui) below for exposure/auth details) and log in with
    `SYNC_TOKEN`.
-2. **Sources → New source**, fill in the same fields the old YAML schema
-   had — `name` (unique, `[a-z0-9-]`), `base_url`, `sitemap` (optional; BFS
-   fallback if absent), `include_prefixes`/`exclude_prefixes` (one per
-   line), `max_pages` (**required, no default** — omitting it fails
-   validation, same rule as before, now enforced by `app.config.SourceConfig`
-   against the form data instead of a YAML loader), `language` (default
-   `english`), `rate_limit_rps` (default `1.0`), `llms_txt` (default
-   `auto`). Validation errors re-render the form with the exact problem
-   (duplicate name, bad `base_url`, missing `max_pages`, a sitemap-less
-   source whose `base_url` isn't covered by its own `include_prefixes`, an
-   unsupported `language`) — nothing is written until it passes.
+2. **Sources → New source.** `base_url` is the only truly required field —
+   creation is **URL-only capable**: leave `name`, `include_prefixes`, and
+   `max_pages` blank and the server derives safe defaults for you
+   (`ingestion/app/source_defaults.py`):
+   - `name` — a `^[a-z0-9-]+$` slug derived from the host + first
+     meaningful path segment (e.g. `doc.traefik.io` → `traefik`,
+     `developers.google.com/maps` → `google-maps`), with a `-2`/`-3`/...
+     suffix on collision against every existing name (including
+     `rejected` ones).
+   - `include_prefixes` — `[base_url's path]` when `base_url` has a
+     non-root path (scoping the crawl to that path), or `[]` (whole host)
+     for a root URL.
+   - `max_pages` — defaults to `500` (`DEFAULT_MAX_PAGES`) when omitted,
+     so a bare URL on a root path can never crawl an entire shared docs
+     host uncapped with no ceiling at all.
+
+   Any field you *do* supply always wins over its derived default —
+   including explicitly passing an empty `include_prefixes` (whole host) or
+   an explicit "no limit" `max_pages`. Other fields: `sitemap` (optional;
+   BFS fallback if absent), `exclude_prefixes` (one per line), `language`
+   (default `english`), `rate_limit_rps` (default `1.0`), `llms_txt`
+   (default `auto`). Validation errors re-render the form with the exact
+   problem (duplicate name — more likely now that names are auto-derived
+   from `base_url` — bad `base_url`, a sitemap-less source whose `base_url`
+   isn't covered by its own `include_prefixes`, an unsupported `language`)
+   — nothing is written until it passes.
 
    - **`llms_txt` mode (`auto` | `off` | `only`, default `auto`).** Controls
      whether the crawler prefers a source's [llms.txt](https://llmstxt.org)
@@ -416,7 +437,13 @@ proposal):
    curl -sS http://localhost:8080/status | jq '."my-new-source"'
    ```
 
-   *(Note: A source reporting `last_status: "ok"` with `pages_soft_failed > 0` is completely healthy and normal — it indicates expected real-world site quirks like 404/503 links or stub pages. Only `pages_failed > 0` triggers `"partial"` or `"failed"`. See [Page Classification & Source Status Semantics](#page-classification--source-status-semantics) below.)*
+   *(Note: A source reporting `last_status: "ok"` with a small number of
+   `pages_soft_failed > 0` is healthy and normal — it indicates a few
+   expected real-world site quirks like 404/503 links or stub pages. But a
+   **high ratio** of soft failures relative to total pages seen — above
+   20% — degrades the status to `"partial"` even with zero hard failures,
+   by design. See [Page Classification & Source Status
+   Semantics](#page-classification--source-status-semantics) below.)*
 
 4. Optionally set a `schedule_cron` on the source's edit form to have it
    sync automatically — see [The scheduler](#the-scheduler) below for the
@@ -425,9 +452,13 @@ proposal):
 ### B. Agent: `propose_doc_source` (MCP tool)
 
 An AI agent with `search_docs`/`list_doc_sources` access can also call the
-MCP tool `propose_doc_source(name, base_url, max_pages, sitemap?,
-include_prefixes?, exclude_prefixes?, language?, rate_limit_rps?)`. This
-**never** crawls anything directly:
+MCP tool `propose_doc_source(base_url, name?, max_pages?, sitemap?,
+include_prefixes?, exclude_prefixes?, language?, rate_limit_rps?)`. Only
+`base_url` is required — `name`, `include_prefixes`, and `max_pages` are
+derived the same way as the URL-only admin-UI path above
+(`source_defaults.apply_creation_defaults`) when omitted, so a bare URL can
+never propose crawling an entire shared docs host uncapped. This **never**
+crawls anything directly:
 
 - It validates the same `SourceConfig` fields as the admin form and, on
   success, inserts a row with `status='pending'`.
@@ -810,9 +841,9 @@ current compose files, since `db` no longer publishes a port at all.
 ## Expected sync durations
 
 Driven by each source's `max_pages` and `rate_limit_rps` (`doc_sources`
-columns — see the admin UI or `ingestion/config/sources.yaml` only as the
-original one-way seed values for these three) (crawler etiquette: ~1 req/sec
-per source, sequential fetch):
+columns — see the admin UI for the live values; `ingestion/config/sources.yaml`
+no longer exists in the repo) (crawler etiquette: ~1 req/sec per source,
+sequential fetch):
 
 | Source            | `max_pages` | Rough duration            |
 |--------------------|------------:|----------------------------|
@@ -868,7 +899,7 @@ fetch+extract before comparing hashes.
 
 ## Page Classification & Source Status Semantics
 
-The ingestion pipeline separates transient, expected site quirks (`pages_soft_failed`) from actionable internal defects (`pages_failed`) so operational alarms and status checks remain high-signal.
+The ingestion pipeline separates transient, expected site quirks (`pages_soft_failed`) from actionable internal defects (`pages_failed`) so operational alarms and status checks remain high-signal. **`classify_sync` in `ingestion/app/store.py` is the single source of truth for how these counters (plus a few out-of-band signals) turn into a `last_status` of `ok`/`partial`/`failed` — this section summarizes it; read the function's docstring for the exact, ordered rule list.**
 
 ### Three-Tier Page Classification
 
@@ -876,7 +907,7 @@ The ingestion pipeline separates transient, expected site quirks (`pages_soft_fa
    Pages that encountered expected real-world site friction during crawling or content extraction:
    - **Stale/Broken Links (`fetch_ok=False`)**: Upstream sitemaps or HTML navigation links pointing to dead `404`/`503` URLs, or pages blocked by `robots.txt`. These URLs are added to `seen_urls` (so `_delete_missing_pages()` does not prematurely purge legitimate existing rows when a page is temporarily unreachable) and logged as `page_fetch_skipped`.
    - **Stub / Placeholder Pages (`extraction.status != "ok"`)**: Pages with very little or malformed content (e.g., `<200` characters of Markdown or empty shells after boilerplate stripping) that are skipped during extraction and logged as `page_content_skipped`.
-   - *Behavior:* Soft failures do **not** degrade a source's overall status. They are recorded for observability but do not trigger operational alerts or `"partial"` statuses.
+   - *Behavior:* A **small number** of soft failures does not degrade a source's overall status — they're recorded for observability. But a soft-failure **ratio** above `SOFT_FAIL_PARTIAL_RATIO` (20% of all pages seen) does degrade status to `"partial"`, even with zero hard failures — see "Source Status Determination" below for why this changed.
 
 2. **`pages_skipped` (Unchanged Hash Matches)**
    Pages whose content SHA-256 hash exactly matches existing database rows from a previous sync. These are skipped instantly without re-chunking or re-embedding (`page_unchanged_skip`).
@@ -886,10 +917,15 @@ The ingestion pipeline separates transient, expected site quirks (`pages_soft_fa
 
 ### Source Status Determination (`last_status`)
 
-At the conclusion of `sync_source()`, the source's overall `last_status` is assigned:
-- **`"ok"`**: Zero hard errors occurred (`pages_failed == 0`) AND at least one page was processed (`pages_fetched + pages_skipped + pages_soft_failed > 0`). A source with `pages_soft_failed > 0` and `pages_failed == 0` correctly reports `"ok"`.
-- **`"partial"`**: At least one hard error occurred (`pages_failed > 0`), but one or more pages in the source succeeded or skipped (`succeeded_any` is true).
-- **`"failed"`**: Every attempted page encountered a hard pipeline error (`pages_failed > 0` and `succeeded_any` is false), OR the crawl yielded zero pages (`pages_seen == 0`, e.g., dead sitemap URL or over-restrictive `include_prefixes`).
+**This section previously documented the pre-2026-07-26 rules, which had a real defect: a 40-source production run reported `last_status="ok"` for every single source — including 6 that indexed zero pages, and `traefik`, which silently lost 117 of 280 pages (42%) to soft failures while still reading `"ok"`.** The root cause was an implicit conditional chain where `pages_soft_failed` counted toward both "was anything processed" (defeating the empty-crawl guard) and "did this succeed" (making any nonzero soft-failure count look like success as long as the *hard*-failure counter was zero).
+
+`classify_sync` replaced that implicit chain with an explicit, ordered, unit-tested set of rules (`ingestion/app/store.py`, evaluated top to bottom, first match wins):
+
+1. **`"failed"`** — the sync was cancelled by the user, or nothing was indexed or confirmed this run at all (`pages_fetched + pages_skipped + pages_not_modified == 0`) — a source where every page soft/hard-failed, or the crawl saw nothing, must never read as `"ok"`.
+2. **`"partial"`** — the purge-ratio guard refused to delete anything (itself worth surfacing), OR the crawl was aborted early / a sitemap-cap truncation cut discovery short (either way, the corpus is known-incomplete), OR at least one **hard** pipeline failure occurred (`pages_failed > 0`), OR the **soft-failure ratio** exceeds `SOFT_FAIL_PARTIAL_RATIO` (`pages_soft_failed / pages_seen > 0.2`, where `pages_seen` sums every category: fetched, skipped, hard-failed, soft-failed, not-modified).
+3. **`"ok"`** — otherwise.
+
+**Why a *ratio* threshold, and why this is a deliberate reversal, not a bug fix:** the original intent — don't let expected site quirks (a few dead links, a stub page) degrade status and make alarms noisy — was sound and is preserved: a source with a couple of incidental soft failures out of hundreds of pages still reports `"ok"`. What was missing was any upper bound at all: a source silently losing almost half its content to soft failures (traefik's 117/280 = 41.8%) is not an "incidental quirk," it's a systematic loss that operators need paged on. A ratio floor (20%, chosen with comfortable margin below the traefik incident and above normal single-digit soft-fail noise) catches the systematic case while staying silent on the incidental one — see `SOFT_FAIL_PARTIAL_RATIO`'s comment in `ingestion/app/store.py` for the exact calibration.
 
 ### Observability & Signals
 
@@ -900,7 +936,7 @@ The JSON status payload exposes exact counts for each classification per source:
 ```bash
 curl -sS http://localhost:8080/status | jq '."traefik"'
 ```
-Example output for a healthy source with transient broken links/stubs (`pages_soft_failed > 0`):
+Example output for a healthy source with a few transient broken links/stubs (`pages_soft_failed > 0`, but well under the 20% ratio threshold — 5/163 ≈ 3%):
 ```json
 {
   "pages_fetched": 158,
@@ -916,15 +952,20 @@ Example output for a healthy source with transient broken links/stubs (`pages_so
 ```
 
 #### 2. Checking Prometheus Metrics
-The `/metrics` endpoint exposes counters for each outcome tier:
+The `/metrics` endpoint exposes counters/gauges for each outcome tier (`ingestion/app/metrics.py` is the single definition point for all of these):
 ```bash
-curl -sS http://localhost:8080/metrics | grep -E "^pages_(fetched|skipped|soft_failed|failed)_total"
+curl -sS http://localhost:8080/metrics | grep -E "^(pages_(fetched|skipped_unchanged|not_modified|soft_failed|failed)_total|sync_last_status|sync_last_success_timestamp)"
 ```
 Relevant series:
 - `pages_fetched_total{source="..."}`
-- `pages_skipped_total{source="..."}`
+- `pages_skipped_unchanged_total{source="..."}`
+- `pages_not_modified_total{source="..."}`
 - `pages_soft_failed_total{source="..."}`
-- `pages_failed_total{source="..."}`
+- `pages_failed_total{source="..."}` — hard pipeline failures; the counter that drives `partial`/`failed` alongside the soft-fail ratio.
+- `chunks_indexed_total{source="..."}`
+- `sync_duration_seconds{source="..."}` (histogram)
+- `sync_last_success_timestamp{source="..."}` — set to "now" for BOTH `ok` and `partial` (only `failed` leaves it stale; see [Alerting](#alerting--prometheus-rules-opsalertsingestionyml) below).
+- `sync_last_status{source="...", status="ok"|"partial"|"failed"}` — a labelled gauge, `1` for exactly one status per source at a time (the other two status series are removed, not merely zeroed, on every recorded sync — see `metrics.py`'s module docstring on the "stale series" pitfall this avoids). A **direct** read of `classify_sync`'s verdict, not a proxy computed from other series.
 
 #### 3. Filtering Structured JSON Logs (`structlog`)
 Every page classification logs a distinct, structured JSON event:
@@ -1021,7 +1062,7 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   indicate a broken sync.
 
 - **A source keeps coming back `partial` or `failed`.**
-  Remember that under our three-tier classification, transient dead links (`404`/`503`) or short stub pages are recorded in `pages_soft_failed` and do **not** trigger `partial` status. If a source reports `partial` or `failed`, it indicates real hard errors (`pages_failed > 0`) or an empty crawl (`pages_seen == 0`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` on the source's admin UI edit form (`doc_sources` — no longer `ingestion/config/sources.yaml`, see the migration note at the top of this runbook) and re-sync; other sources are unaffected by one source's failure.
+  Remember that under our three-tier classification, a **small number** of transient dead links (`404`/`503`) or short stub pages recorded in `pages_soft_failed` do not, by themselves, trigger `partial` status. But if a source reports `partial` or `failed`, it indicates one of: real hard errors (`pages_failed > 0`), an empty/unconfirmed crawl (nothing fetched, skipped, or not-modified), an aborted/truncated crawl, a refused purge guard, or a soft-failure **ratio** above 20% of pages seen (see [Page Classification & Source Status Semantics](#page-classification--source-status-semantics) above for the exact ordered rules in `classify_sync`). Check `docker compose logs ingestion` for `sync_source_crashed` or `page_index_failed` events — usually caused by database connectivity loss, transaction exceptions, or an over-restrictive prefix filter/dead sitemap resulting in zero discovered pages. Fix `include_prefixes`/`exclude_prefixes`/`sitemap` on the source's admin UI edit form (`doc_sources` — no longer `ingestion/config/sources.yaml`, see the migration note at the top of this runbook) and re-sync; other sources are unaffected by one source's failure.
 
   **A source reports `ok` but `pages_seen == 0` (silently indexed nothing)**,
   or a previously-healthy source suddenly goes empty after a sitemap moves.
@@ -1034,12 +1075,9 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   crawler falls back to BFS seeded on `base_url` — which `include_prefixes`
   then filters out immediately, before the first fetch — and the source
   syncs "successfully" with zero pages indexed. This is exactly what
-  happened with the `traefik` source (its original sitemap URL 404d) and is
-  why the `mcp` source in `ingestion/config/sources.yaml` — that file's
-  historical, one-way-seed content only; the live row for this same source
-  is in `doc_sources` now — carries an inline `WARNING:` comment about this
-  same shape. If a source goes quiet, check
-  whether its declared `sitemap` still 200s before looking anywhere else.
+  happened with the `traefik` source (its original sitemap URL 404d). If a
+  source goes quiet, check whether its declared `sitemap` still 200s before
+  looking anywhere else.
 
   **Triage path (this is the failure this whole alerting program exists to
   close — a log investigation once found all 40 sources reporting
@@ -1166,8 +1204,9 @@ designed to trigger.
 Fires when `pages_soft_failed_total` exceeds **20%** of a source's total
 page volume in its last run, on a run with at least 20 total pages
 (`for: 15m`). 20% is set comfortably below the `traefik` incident that
-motivated this rule (117 of 280 pages, 41.8%, soft-failed while still
-reporting `"ok"` — soft failures don't degrade status by design, see [Page
+motivated this rule (117 of 280 pages, 41.8%, soft-failed while, at the
+time, still reporting `"ok"` — this is the exact ratio `classify_sync`'s
+`SOFT_FAIL_PARTIAL_RATIO` rule now demotes to `"partial"`, see [Page
 Classification & Source Status Semantics](#page-classification--source-status-semantics)
 above) so it would have caught that incident, while staying well above the
 low single-digit soft-fail rates a healthy source normally shows from
