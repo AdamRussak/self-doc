@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,7 +38,7 @@ from urllib.parse import urlparse
 
 import psycopg
 
-from . import chunker, crawler, embedder, extract
+from . import chunker, crawler, embedder, extract, metrics
 from .config import SourceConfig
 from .logging_config import get_logger
 
@@ -786,6 +787,44 @@ def sync_source(
     return outcome
 
 
+def sync_source_with_metrics(
+    source: SourceConfig,
+    conn: psycopg.Connection,
+    progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> SourceOutcome:
+    """Instrumented wrapper around `sync_source` -- the ONE call every real
+    sync entrypoint (admin.py's manual/full-sync routes, `main.py`'s
+    `POST /sync` route, and the scheduler) should use instead of calling
+    `sync_source` directly, so a Prometheus sample is recorded for every
+    completed sync regardless of which layer triggered it (see
+    `app.metrics` for the recording logic and why it lives in a separate
+    leaf module rather than here or in `main.py`).
+
+    Calls the module-level `sync_source` by its bare name (not
+    `self.sync_source`) so a test that monkeypatches `store.sync_source`
+    (e.g. `ingestion/tests/test_sync_health.py`'s admin-path characterization
+    test) is still honored here -- this wrapper adds instrumentation, it
+    does not hardcode which underlying implementation runs.
+
+    Tolerates a `sync_source` double with a narrower signature (no
+    `cancel_event`, or no `progress_cb`/`cancel_event` at all) via the same
+    `TypeError`-fallback tolerance pattern used elsewhere in this codebase
+    for exactly that reason.
+    """
+    start = time.monotonic()
+    try:
+        outcome = sync_source(source, conn, progress_cb=progress_cb, cancel_event=cancel_event)
+    except TypeError:
+        try:
+            outcome = sync_source(source, conn, cancel_event=cancel_event)
+        except TypeError:
+            outcome = sync_source(source, conn)
+    duration = time.monotonic() - start
+    metrics.record_sync_outcome(source.name, outcome, duration)
+    return outcome
+
+
 def sync_all(
     sources: list[SourceConfig],
     progress_cb: Callable[[SourceOutcome, str], None] | None = None,
@@ -799,7 +838,9 @@ def sync_all(
             continue
         conn = get_connection()
         try:
-            results[source.name] = sync_source(source, conn, progress_cb=progress_cb, cancel_event=cancel_event)
+            results[source.name] = sync_source_with_metrics(
+                source, conn, progress_cb=progress_cb, cancel_event=cancel_event
+            )
         finally:
             conn.close()
     return results

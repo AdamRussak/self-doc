@@ -39,11 +39,20 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
-from . import admin, scheduler, security, sources_repo, store
+from . import admin, metrics, scheduler, security, sources_repo, store
 from .logging_config import get_logger
+from .metrics import (
+    CHUNKS_INDEXED,
+    PAGES_FETCHED,
+    PAGES_NOT_MODIFIED,
+    PAGES_SKIPPED,
+    PAGES_SOFT_FAILED,
+    SYNC_DURATION,
+    SYNC_LAST_SUCCESS,
+)
 from .sources_repo import SourceRecord
 
 logger = get_logger(component="main")
@@ -266,23 +275,13 @@ _state: dict = {
 }
 
 # --- Prometheus metrics ------------------------------------------------------------------
-PAGES_FETCHED = Counter(
-    "pages_fetched_total", "Pages fetched and (re)indexed (new or changed)", ["source"]
-)
-PAGES_SKIPPED = Counter(
-    "pages_skipped_unchanged_total", "Pages skipped because their content hash is unchanged", ["source"]
-)
-PAGES_NOT_MODIFIED = Counter(
-    "pages_not_modified_total", "Pages skipped via HTTP 304 conditional request", ["source"]
-)
-PAGES_SOFT_FAILED = Counter(
-    "pages_soft_failed_total", "Pages soft-failed due to expected site quirks (404/503 fetch or stub content)", ["source"]
-)
-CHUNKS_INDEXED = Counter("chunks_indexed_total", "Chunks written to doc_chunks", ["source"])
-SYNC_DURATION = Histogram("sync_duration_seconds", "Duration of a full sync run for one source", ["source"])
-SYNC_LAST_SUCCESS = Gauge(
-    "sync_last_success_timestamp", "Unix timestamp of the last successful (status=ok) sync", ["source"]
-)
+# Metric OBJECTS and the recording logic both live in `app.metrics` (a leaf
+# module with no dependency on `store` or `main`) so that `admin.py`'s sync
+# paths -- which must never import `main.py` (circular) -- can record the
+# same samples via `store.sync_source_with_metrics` without main.py being
+# the only place able to move these counters. Re-exported here under the
+# same names so existing call sites (`main.PAGES_FETCHED`, the `/metrics`
+# route via `generate_latest()`'s default registry) are unchanged.
 
 
 class SyncRequest(BaseModel):
@@ -437,24 +436,28 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             }
             admin._sync_status["source"] = name
             admin._sync_status["message"] = f"Syncing {name} ({i + 1} of {len(names)})..."
+            # `store.sync_source_with_metrics` is the single instrumented
+            # entrypoint every real sync path now routes through (see
+            # `store.py` and `app.metrics`) -- it records all seven
+            # Prometheus samples itself, so this handler only needs to cover
+            # the two failure modes that never even reach it: a dead
+            # connection, and `sync_source` crashing outright.
             try:
                 conn = store.get_connection()
             except Exception as e:  # noqa: BLE001
                 log.error("sync_db_connect_failed", error=str(e))
                 outcome = store.SourceOutcome(name=name, status="failed", error=str(e))
+                metrics.record_sync_outcome(name, outcome, time.monotonic() - start)
             else:
                 try:
                     cfg = admin._record_to_config(source)
-                    try:
-                        outcome = store.sync_source(cfg, conn, progress_cb=admin._on_sync_progress, cancel_event=admin._sync_cancel_event)
-                    except TypeError:
-                        try:
-                            outcome = store.sync_source(cfg, conn, cancel_event=admin._sync_cancel_event)
-                        except TypeError:
-                            outcome = store.sync_source(cfg, conn)
+                    outcome = store.sync_source_with_metrics(
+                        cfg, conn, progress_cb=admin._on_sync_progress, cancel_event=admin._sync_cancel_event
+                    )
                 except Exception as e:  # noqa: BLE001 - source-level safety net
                     log.error("sync_source_crashed", error=str(e))
                     outcome = store.SourceOutcome(name=name, status="failed", error=str(e))
+                    metrics.record_sync_outcome(name, outcome, time.monotonic() - start)
                     # `conn` may be the reason we're here (e.g. a dropped
                     # connection), so `sync_source` never reached its own
                     # `_update_source_status` call — without this, doc_sources
@@ -463,16 +466,6 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                     store.mark_source_failed(name)
                 finally:
                     conn.close()
-            duration = time.monotonic() - start
-
-            PAGES_FETCHED.labels(source=name).inc(outcome.pages_fetched)
-            PAGES_SKIPPED.labels(source=name).inc(outcome.pages_skipped)
-            PAGES_NOT_MODIFIED.labels(source=name).inc(outcome.pages_not_modified)
-            PAGES_SOFT_FAILED.labels(source=name).inc(outcome.pages_soft_failed)
-            CHUNKS_INDEXED.labels(source=name).inc(outcome.chunks_indexed)
-            SYNC_DURATION.labels(source=name).observe(duration)
-            if outcome.status == "ok":
-                SYNC_LAST_SUCCESS.labels(source=name).set(time.time())
 
             _state["results"][name] = {
                 "pages_fetched": outcome.pages_fetched,
@@ -781,7 +774,13 @@ async def health():
 
 
 @app.get("/metrics")
-async def metrics():
+async def metrics_endpoint():
+    # NOTE: deliberately not named `metrics` -- that name is the module-level
+    # `from . import metrics` import (the shared Prometheus objects +
+    # `record_sync_outcome` helper in `app/metrics.py`); a route function of
+    # the same name would rebind the module-global `metrics` identifier to
+    # this coroutine for the rest of the file, breaking every later
+    # `metrics.record_sync_outcome(...)` call with an `AttributeError`.
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 

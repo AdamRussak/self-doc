@@ -348,23 +348,11 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
     try:
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
             conn = conn_factory()
-            try:
-                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
-            except TypeError:
-                try:
-                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
-                except TypeError:
-                    outcome = store.sync_source(cfg, conn)
+            outcome = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         else:
             conn = store.get_connection()
             try:
-                try:
-                    outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
-                except TypeError:
-                    try:
-                        outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
-                    except TypeError:
-                        outcome = store.sync_source(cfg, conn)
+                outcome = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
             finally:
                 conn.close()
         logger.info("admin_manual_sync_complete", source_id=source_id, name=cfg.name, status=outcome.status)
@@ -429,7 +417,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                     results[rec.name] = store.SourceOutcome(name=rec.name, status="failed", error="Aborted by user")
                     continue
                 cfg = _record_to_config(rec)
-                results[cfg.name] = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
+                results[cfg.name] = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         else:
             cfgs = [_record_to_config(rec) for rec in sources]
             results = store.sync_all(cfgs, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
@@ -889,13 +877,7 @@ def sync_source_submit(
         _sync_status["last_url"] = ""
         outcome = None
         try:
-            try:
-                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
-            except TypeError:
-                try:
-                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
-                except TypeError:
-                    outcome = store.sync_source(cfg, conn)
+            outcome = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         finally:
             try:
                 _sync_status["running"] = False
@@ -1049,13 +1031,7 @@ def refresh_source_submit(
         _sync_status["last_url"] = ""
         outcome = None
         try:
-            try:
-                outcome = store.sync_source(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
-            except TypeError:
-                try:
-                    outcome = store.sync_source(cfg, conn, cancel_event=_sync_cancel_event)
-                except TypeError:
-                    outcome = store.sync_source(cfg, conn)
+            outcome = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress, cancel_event=_sync_cancel_event)
         finally:
             try:
                 _sync_status["running"] = False
@@ -1137,7 +1113,7 @@ def sync_all_submit(
         try:
             for rec in active_sources:
                 cfg = _record_to_config(rec)
-                results[cfg.name] = store.sync_source(cfg, conn, progress_cb=_on_sync_progress)
+                results[cfg.name] = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress)
         finally:
             try:
                 _sync_status["running"] = False

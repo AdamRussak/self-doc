@@ -272,10 +272,6 @@ def _sample_value(counter_or_family, source_name: str):
     return None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T0: admin-driven syncs never touch the Prometheus counters in main.py; /metrics reports zero samples",
-)
 def test_admin_driven_sync_should_record_prometheus_metrics(monkeypatch):
     """A sync driven through the ADMIN path (`admin.py`'s `_bg_sync_all` ->
     `store.sync_source`) must move the same Prometheus counters `/metrics`
@@ -315,3 +311,35 @@ def test_admin_driven_sync_should_record_prometheus_metrics(monkeypatch):
     assert _sample_value(main_module.CHUNKS_INDEXED, record.name) == 13
     assert _sample_value(main_module.SYNC_DURATION, record.name) is not None
     assert _sample_value(main_module.SYNC_LAST_SUCCESS, record.name) is not None
+
+
+def test_admin_driven_sync_exposes_pages_fetched_total_on_metrics_endpoint(monkeypatch):
+    """End-to-end check of the same fix at the `/metrics` exposition layer
+    (not just the in-process Counter object): a sync driven entirely through
+    the admin path must leave a `pages_fetched_total` sample for that source
+    in the text `generate_latest()` renders, exactly as `GET /metrics` would
+    return it."""
+    from prometheus_client import generate_latest
+
+    record = _make_record(name="metrics-endpoint-test-src")
+    canned_outcome = SourceOutcome(
+        name=record.name,
+        pages_fetched=4,
+        pages_skipped=0,
+        pages_not_modified=0,
+        pages_soft_failed=0,
+        pages_failed=0,
+        pages_removed=0,
+        chunks_indexed=9,
+        status="ok",
+    )
+
+    def fake_sync_source(cfg, conn, progress_cb=None):
+        return canned_outcome
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+
+    admin._bg_sync_all([record], conn_factory=lambda: object())
+
+    body = generate_latest().decode("utf-8")
+    assert f'pages_fetched_total{{source="{record.name}"}} 4.0' in body

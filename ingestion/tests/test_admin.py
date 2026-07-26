@@ -774,7 +774,12 @@ def test_sync_all_submit(client, csrf_token, monkeypatch):
         _make_record(id=2, name="src-b", status="active"),
     ]
     monkeypatch.setattr(admin.sources_repo, "list_sources", MagicMock(return_value=active_sources))
-    sync_mock = MagicMock()
+    # A real `SourceOutcome` (not a bare `MagicMock()`): `store.sync_source`'s
+    # return value now flows into `metrics.record_sync_outcome` via
+    # `store.sync_source_with_metrics`, which does real arithmetic
+    # (`.inc(outcome.pages_fetched)`, etc.) on the outcome's fields — a
+    # `MagicMock` return value fails that arithmetic with a `TypeError`.
+    sync_mock = MagicMock(return_value=SourceOutcome(name="src", status="ok"))
     monkeypatch.setattr(admin.store, "sync_source", sync_mock)
 
     resp = client.post("/admin/sync-all", data={"csrf_token": csrf_token}, follow_redirects=False)
