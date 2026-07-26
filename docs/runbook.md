@@ -1299,6 +1299,63 @@ for the exact rule order.
 3. Also rule out `SourceIndexedNothing`/sitemap issues (above) — a source
    trending toward zero pages will also trip this alert on its way down.
 
+**Special case: a deliberately-capped source (`max_pages`) that never
+resolves.** `sync_last_status` is a gauge, not a one-shot event — it holds
+whatever the most recent sync reported until the *next* sync changes it. A
+source whose real corpus is larger than its configured `max_pages` (this is
+now the default posture for any URL-only source: `DEFAULT_MAX_PAGES = 500`,
+see [Add a new doc source](#add-a-new-doc-source)) will hit `crawl_truncated` on
+*every* run, forever, and therefore report `status="partial"` on every run,
+forever — so this alert fires and never resolves on its own, with no
+operator action available that changes the outcome of the next sync. This
+is expected behavior for `max_pages`, not a regression, but it looks
+identical to a genuinely broken source in Alertmanager, which is exactly the
+alarm-fatigue trap this alert suite exists to avoid.
+
+Today `sync_last_status` carries no label distinguishing "partial because
+truncated by a configured cap" from "partial because of a hard pipeline
+failure / aborted crawl / purge-guard refusal" (all four collapse to the
+same `status="partial"` series — see `classify_sync` in
+`ingestion/app/store.py`). Until that distinction exists as a metric (tracked
+as a follow-up — see the recommendation below), confirm which case you're in
+via the logs, then resolve as follows:
+
+1. `docker compose logs ingestion | grep '"source": "<name>"' | grep '"event": "stale_page_purge_skipped"'`
+   — if the most recent line for this source has `"reason":
+   "crawl_truncated"`, the partial status is caused by hitting `max_pages`,
+   not a failure. (`"reason": "crawl_aborted_early"` or
+   `"completed_with_zero_pages_seen"` means it's a different case — go back
+   to the general triage steps above instead.)
+2. Decide, per source, which of these applies and act on it — do not just
+   leave the alert paging indefinitely with no plan:
+   - **The cap is too low for this source's real corpus and you want fuller
+     coverage.** Raise `max_pages` for the source (admin UI or `doc_sources`
+     row) to a value at or above its actual page count, then trigger a
+     manual sync to confirm it now completes untruncated (`status="ok"` and
+     `crawl_truncated: false` in the logs).
+   - **The cap is intentional and permanent** (e.g. the source is huge and
+     you only want the first N pages by design). This is a case where
+     "partial" alerting forever provides no value — silence this specific
+     alert/source pair in Alertmanager rather than leaving it paging, and
+     record *why* next to the silence so a future operator doesn't mistake
+     it for an unacknowledged incident, e.g.:
+     `amtool silence add alertname="SourceSyncDegraded" source="<name>" --comment "intentional max_pages cap, see doc_sources.max_pages; recorded <date>" --duration 8760h`
+     (re-add per Alertmanager restart/config reload if silences aren't
+     persisted in your deployment; a permanent inhibition rule scoped to
+     that source is the equivalent alternative if you'd rather not track an
+     expiring silence).
+3. **Recommendation for a future task** (out of scope for this fix — would
+   require changing `classify_sync`/`metrics.py`'s `SYNC_LAST_STATUS`
+   shape): give `crawl_truncated` its own distinguishable signal — either a
+   `reason` label on `sync_last_status` (so `SourceSyncDegraded`'s `expr` can
+   read `sync_last_status{status="partial", reason!="crawl_truncated"} ==
+   1`) or a separate gauge (e.g. `source_capped_at_max_pages{source}`) — so
+   this alert can stop firing on expected, un-actionable truncation while
+   still catching every other `partial` cause. Do not use `for:` duration or
+   severity tuning to paper over this — the underlying problem is that two
+   semantically different states currently share one series, and no amount
+   of alert-side tuning fixes a classification problem.
+
 ### Alert: SourceIndexedNothing
 
 Fires when a sync run completes (`sync_duration_seconds_count` increases in

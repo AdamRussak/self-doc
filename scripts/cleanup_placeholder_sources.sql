@@ -70,6 +70,13 @@ DELETE FROM doc_pages
 WHERE url = 'https://docs.company.com/api-reference';
 
 -- 3a. Report: example.com placeholder URLs from the extraction-failure set.
+--     Anchored on the HOST (scheme + optional subdomain + "example.com" +
+--     end-of-string or "/"), not an unanchored substring match — `ILIKE
+--     '%example.com%'` would also match a legitimate path like
+--     `https://real-docs.example.org/example.commands`, since "example.com"
+--     is a substring of "example.commands". `~*` (case-insensitive regex)
+--     with `^https?://([^/]*\.)?example\.com(/|$)` matches only
+--     `example.com` or `<anything>.example.com` as the actual host.
 SELECT
     p.id,
     p.url,
@@ -78,10 +85,10 @@ SELECT
     (SELECT count(*) FROM doc_chunks c WHERE c.page_id = p.id) AS chunk_count
 FROM doc_pages p
 JOIN doc_sources s ON s.id = p.source_id
-WHERE p.url ILIKE '%example.com%';
+WHERE p.url ~* '^https?://([^/]*\.)?example\.com(/|$)';
 
 -- 3b. Delete: cascades to doc_chunks via FK ON DELETE CASCADE.
 DELETE FROM doc_pages
-WHERE url ILIKE '%example.com%';
+WHERE url ~* '^https?://([^/]*\.)?example\.com(/|$)';
 
 COMMIT;

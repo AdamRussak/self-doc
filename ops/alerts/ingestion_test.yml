@@ -91,7 +91,10 @@ tests:
                 "partial" (a hard pipeline failure, an aborted crawl, a
                 refused purge, or an elevated soft-failure ratio — see
                 `classify_sync` in app/store.py). Check `GET /status` for this
-                source to see which condition applied.
+                source to see which condition applied. If this source has a
+                configured `max_pages` cap and this alert never clears, see
+                the runbook's "Special case: a deliberately-capped source"
+                section before assuming it's a live incident.
               runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
 
   # --- SourceSyncDegraded: does NOT fire for status="ok" -------------------
@@ -133,7 +136,10 @@ tests:
                 "partial" (a hard pipeline failure, an aborted crawl, a
                 refused purge, or an elevated soft-failure ratio — see
                 `classify_sync` in app/store.py). Check `GET /status` for this
-                source to see which condition applied.
+                source to see which condition applied. If this source has a
+                configured `max_pages` cap and this alert never clears, see
+                the runbook's "Special case: a deliberately-capped source"
+                section before assuming it's a live incident.
               runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
       - eval_time: 29h30m
         alertname: SourceSyncDegraded

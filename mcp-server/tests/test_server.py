@@ -15,6 +15,7 @@ since the guard only fires once, at first import, in this process.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
 import os
@@ -320,9 +321,14 @@ def test_propose_source_valid_inserts_exactly_one_pending_row(monkeypatch):
     assert params["name"] == "my-new-source"
 
 
-def test_propose_source_accepts_optional_max_pages_none(monkeypatch):
-    # max_pages is optional (None => no page limit): a proposal without it is
-    # valid and writes NULL for max_pages.
+def test_propose_source_omitted_max_pages_gets_the_derived_default(monkeypatch):
+    """CRITICAL-1/2 fix: `max_pages` has no supported "unlimited" opt-out.
+    Because `max_pages: int | None = None` makes an explicit `max_pages=None`
+    indistinguishable from omitting the argument, BOTH now always receive
+    `apply_creation_defaults`'s `DEFAULT_MAX_PAGES` ceiling — even for a
+    NAMED proposal (derivation is no longer gated on `name is None`). This
+    replaces the old (unsafe) expectation that `max_pages=None` was written
+    through as NULL/no-ceiling."""
     calls = []
 
     def on_execute(sql, params):
@@ -335,7 +341,7 @@ def test_propose_source_accepts_optional_max_pages_none(monkeypatch):
     assert source_id == 7
     assert len(calls) == 1
     _, params = calls[0]
-    assert params["max_pages"] is None
+    assert params["max_pages"] == source_defaults.DEFAULT_MAX_PAGES
 
 
 def test_propose_source_invalid_config_inserts_nothing(monkeypatch):
@@ -684,6 +690,34 @@ def test_propose_source_url_only_avoids_name_collision(monkeypatch):
     assert insert_params["name"] == "traefik-2"
 
 
+def test_propose_source_named_proposal_still_derives_prefixes_and_max_pages(monkeypatch):
+    """CRITICAL-1 regression: reviewer's own reproduction. A NAMED proposal
+    that omits `include_prefixes`/`max_pages` must still get derived,
+    scoped `include_prefixes` and the `DEFAULT_MAX_PAGES` ceiling — the
+    derivation must not be gated on `name is None`. Before the fix, this
+    produced `include_prefixes == []` and `max_pages is None` (crawl the
+    entire host, uncapped)."""
+    cursor = _NameQueryFakeCursor(existing_names=set(), insert_row={"id": 101})
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _NameQueryFakePool(cursor))
+
+    source_id = retrieval.propose_source(
+        name="traefik-hub",
+        base_url="https://doc.traefik.io/traefik-hub/",
+        proposed_by_token="super-secret-mcp-token",
+    )
+
+    assert source_id == 101
+    # Named proposals must NOT trigger the existing-names SELECT (name is
+    # already supplied) — exactly one INSERT round-trip, same as before.
+    assert len(cursor.executed) == 1
+    insert_sql, insert_params = cursor.executed[-1]
+    assert "'pending'" in insert_sql
+    assert insert_params["name"] == "traefik-hub"
+    assert insert_params["include_prefixes"] == ["/traefik-hub"]
+    assert insert_params["max_pages"] == source_defaults.DEFAULT_MAX_PAGES
+    assert insert_params["max_pages"] is not None
+
+
 def test_propose_source_explicit_name_skips_the_select_round_trip(monkeypatch):
     """Regression guard: supplying an explicit `name` must not trigger the
     existing-names SELECT at all — every pre-T11 call path (explicit name)
@@ -852,12 +886,62 @@ _DERIVE_NAME_FIXTURE_URLS = (
 )
 
 
+def _source_defaults_body_after_docstring(path: Path) -> str:
+    """Return the source text of `path` with its leading module docstring
+    (if any) stripped, using `ast` (not a fixed line count) so the
+    comparison is robust to the docstrings themselves legitimately differing
+    in wording (mcp-server's carries an extra MIRROR NOTE paragraph) while
+    everything that actually executes must not."""
+    src = path.read_text()
+    tree = ast.parse(src)
+    body = tree.body
+    has_docstring = (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    )
+    if has_docstring:
+        start_line = body[1].lineno if len(body) > 1 else len(src.splitlines()) + 1
+    else:
+        start_line = body[0].lineno if body else 1
+    lines = src.splitlines(keepends=True)
+    return "".join(lines[start_line - 1 :])
+
+
+def test_source_defaults_is_byte_identical_to_ingestion_copy_below_docstring():
+    """WARNING-7 fix: the primary drift guard. Rather than exercising only
+    `derive_name` over a handful of URLs (which would miss a change to
+    `derive_include_prefixes`, `apply_creation_defaults`'s absent-vs-empty-
+    vs-None blank detection, or `DEFAULT_MAX_PAGES` landing in only one of
+    the two deliberately-duplicated `source_defaults.py` copies — see the
+    MIRROR NOTE atop mcp-server/app/source_defaults.py), assert the two
+    files are identical for everything that actually executes (module
+    docstrings, which are allowed to differ in wording, are stripped via
+    `ast` before comparing)."""
+    mcp_path = Path(__file__).resolve().parents[1] / "app" / "source_defaults.py"
+    ingestion_path = Path(__file__).resolve().parents[2] / "ingestion" / "app" / "source_defaults.py"
+    assert mcp_path.is_file(), f"expected mcp-server source_defaults at {mcp_path}"
+    assert ingestion_path.is_file(), f"expected ingestion source_defaults at {ingestion_path}"
+
+    mcp_body = _source_defaults_body_after_docstring(mcp_path)
+    ingestion_body = _source_defaults_body_after_docstring(ingestion_path)
+
+    assert mcp_body == ingestion_body, (
+        "mcp-server/app/source_defaults.py has drifted from ingestion/app/source_defaults.py "
+        "below their module docstrings — DEFAULT_MAX_PAGES, derive_name, derive_include_prefixes, "
+        "and/or apply_creation_defaults no longer agree between the two deliberately-duplicated copies"
+    )
+
+
 def test_derive_name_stays_in_sync_with_ingestion_source_defaults():
-    """Drift guard for the deliberate source_defaults.py duplication (mcp-server
-    cannot import ingestion at runtime — see the module note atop
-    mcp-server/app/source_defaults.py): `derive_name` must produce identical
-    slugs in both copies for a shared fixture table of URLs, and the
-    collision-suffix behavior (against the same `taken` set) must agree too."""
+    """Readable behavioural supplement to the byte-identical check above:
+    drift guard for the deliberate source_defaults.py duplication
+    (mcp-server cannot import ingestion at runtime — see the module note
+    atop mcp-server/app/source_defaults.py): `derive_name` must produce
+    identical slugs in both copies for a shared fixture table of URLs, and
+    the collision-suffix behavior (against the same `taken` set) must agree
+    too."""
     ingestion_source_defaults = _load_ingestion_source_defaults()
 
     for url in _DERIVE_NAME_FIXTURE_URLS:
@@ -871,6 +955,48 @@ def test_derive_name_stays_in_sync_with_ingestion_source_defaults():
     assert source_defaults.derive_name(
         "https://doc.traefik.io/traefik/", taken
     ) == ingestion_source_defaults.derive_name("https://doc.traefik.io/traefik/", taken)
+
+
+def test_derive_include_prefixes_stays_in_sync_with_ingestion_source_defaults():
+    """Behavioural supplement: `derive_include_prefixes` (the field the
+    review flagged as highest-consequence alongside `max_pages`) must agree
+    between the two copies for both root and non-root `base_url`s."""
+    ingestion_source_defaults = _load_ingestion_source_defaults()
+
+    for url in _DERIVE_NAME_FIXTURE_URLS:
+        assert source_defaults.derive_include_prefixes(url) == ingestion_source_defaults.derive_include_prefixes(
+            url
+        ), f"derive_include_prefixes drifted for {url!r}"
+
+
+def test_default_max_pages_stays_in_sync_with_ingestion_source_defaults():
+    """Behavioural supplement: the reviewer called `DEFAULT_MAX_PAGES` the
+    highest-consequence field to leave unguarded — a change to the page
+    ceiling in only one copy must fail this test."""
+    ingestion_source_defaults = _load_ingestion_source_defaults()
+    assert source_defaults.DEFAULT_MAX_PAGES == ingestion_source_defaults.DEFAULT_MAX_PAGES
+
+
+def test_apply_creation_defaults_stays_in_sync_with_ingestion_source_defaults():
+    """Behavioural supplement: `apply_creation_defaults`'s absent-vs-empty-
+    vs-None blank detection (the subtlety the review specifically called
+    out) must agree between the two copies for every combination of
+    absent/explicit-empty/explicit-None `include_prefixes`/`max_pages`."""
+    ingestion_source_defaults = _load_ingestion_source_defaults()
+
+    base_url = "https://doc.traefik.io/traefik/"
+    field_variants = (
+        {"base_url": base_url},
+        {"base_url": base_url, "name": "custom-name"},
+        {"base_url": base_url, "include_prefixes": []},
+        {"base_url": base_url, "max_pages": None},
+        {"base_url": base_url, "include_prefixes": [], "max_pages": None},
+        {"base_url": base_url, "include_prefixes": ["/custom"], "max_pages": 42},
+    )
+    for fields in field_variants:
+        mcp_result = source_defaults.apply_creation_defaults(dict(fields), set())
+        ingestion_result = ingestion_source_defaults.apply_creation_defaults(dict(fields), set())
+        assert mcp_result == ingestion_result, f"apply_creation_defaults drifted for fields={fields!r}"
 
 
 def test_derive_proposed_by_never_contains_the_token(monkeypatch):

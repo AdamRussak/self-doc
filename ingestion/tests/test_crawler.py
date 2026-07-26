@@ -1,9 +1,17 @@
 import inspect
 import time
+from unittest.mock import patch
 
 import httpx
 from app.config import SourceConfig
-from app.crawler import RateLimiter, _is_private_ip_host, _validate_final_url, crawl, discover_sitemap_urls
+from app.crawler import (
+    MAX_RETRY_AFTER_SLEEP_S,
+    RateLimiter,
+    _is_private_ip_host,
+    _validate_final_url,
+    crawl,
+    discover_sitemap_urls,
+)
 from app.logging_config import get_logger
 
 ROBOTS_ALLOW_ALL = "User-agent: *\nAllow: /\n"
@@ -1721,4 +1729,129 @@ def test_crawl_google_search_console_shaped_truncation_reports_unprocessed_child
     assert summary[0]["truncated_at_cap"] is True
     # 100 pages / 10 per child = 10 children consumed, 30 unprocessed.
     assert summary[0]["unprocessed_child_sitemaps"] == 30
+
+
+def test_retry_after_sleep_is_clamped_to_ceiling():
+    """Review finding #4: a huge upstream `Retry-After` (e.g. 3600s) must
+    not stall the sync thread for anywhere close to that long -- the sleep
+    is clamped to `MAX_RETRY_AFTER_SLEEP_S` regardless of what the header
+    asks for."""
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        url = str(request.url)
+        if url.endswith("/robots.txt"):
+            return httpx.Response(200, text=ROBOTS_ALLOW_ALL)
+        if url == "https://docs-fixture.dev/":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(429, headers={"Retry-After": "3600"}, text="Too Many Requests")
+            return httpx.Response(200, text=PAGE_HTML)
+        return httpx.Response(404)
+
+    source = SourceConfig(
+        name="example",
+        base_url="https://docs-fixture.dev/",
+        max_pages=10,
+        rate_limit_rps=1000,
+        llms_txt="off",
+    )
+    client = make_client(handler)
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    with patch("app.crawler.time.sleep", side_effect=fake_sleep):
+        pages = list(crawl(source, client=client))
+
+    assert attempts == 2
+    assert len(pages) == 1
+    assert pages[0]["fetch_ok"] is True
+    # The header asked for 3600s; the actual sleep must be clamped.
+    assert sleep_calls, "expected the Retry-After sleep to have been invoked"
+    assert max(sleep_calls) == MAX_RETRY_AFTER_SLEEP_S
+    assert all(s <= MAX_RETRY_AFTER_SLEEP_S for s in sleep_calls)
+
+
+def test_discover_sitemap_urls_sitemapindex_children_order_is_deterministic():
+    """Review finding #8: the top-level cap over a <sitemapindex> must
+    select the SAME slice regardless of the order the index lists its
+    children in. Each child sitemap here has more in-scope pages than fit
+    in the shared budget once earlier children have consumed part of it, so
+    reordering the children changes which one gets cut off if the index's
+    own listing order (rather than a sort) drives iteration."""
+
+    def make_urlset(url_list):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + "".join(f"<url><loc>{u}</loc></url>" for u in url_list)
+            + "</urlset>"
+        )
+
+    def make_index(child_order):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            + "".join(f"<sitemap><loc>{c}</loc></sitemap>" for c in child_order)
+            + "</sitemapindex>"
+        )
+
+    children = {
+        "https://docs-fixture.dev/sitemaps/a.xml": [f"https://docs-fixture.dev/a/{i:03d}" for i in range(8)],
+        "https://docs-fixture.dev/sitemaps/b.xml": [f"https://docs-fixture.dev/b/{i:03d}" for i in range(8)],
+        "https://docs-fixture.dev/sitemaps/c.xml": [f"https://docs-fixture.dev/c/{i:03d}" for i in range(8)],
+    }
+
+    def handler_factory(child_order):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url == "https://docs-fixture.dev/sitemap.xml":
+                return httpx.Response(200, text=make_index(child_order))
+            if url in children:
+                return httpx.Response(200, text=make_urlset(children[url]))
+            return httpx.Response(404)
+
+        return handler
+
+    order_1 = [
+        "https://docs-fixture.dev/sitemaps/a.xml",
+        "https://docs-fixture.dev/sitemaps/b.xml",
+        "https://docs-fixture.dev/sitemaps/c.xml",
+    ]
+    order_2 = [
+        "https://docs-fixture.dev/sitemaps/c.xml",
+        "https://docs-fixture.dev/sitemaps/a.xml",
+        "https://docs-fixture.dev/sitemaps/b.xml",
+    ]
+    assert order_1 != order_2
+
+    result_1 = discover_sitemap_urls(
+        make_client(handler_factory(order_1)),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=15,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+    )
+    result_2 = discover_sitemap_urls(
+        make_client(handler_factory(order_2)),
+        "https://docs-fixture.dev/sitemap.xml",
+        max_pages=15,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://docs-fixture.dev/",
+        include_prefixes=[],
+        exclude_prefixes=[],
+    )
+    assert len(result_1) == 15
+    assert result_1 == result_2
+    # Children processed in sorted order: a.xml (8) then b.xml (7 of 8).
+    assert result_1 == sorted(children["https://docs-fixture.dev/sitemaps/a.xml"]) + sorted(
+        children["https://docs-fixture.dev/sitemaps/b.xml"]
+    )[:7]
 

@@ -310,7 +310,12 @@ def _discover_sitemap_urls_recursive(
             truncation["truncated"] = True
             truncation["unprocessed_child_sitemaps"] += len(child_sitemaps)
             return collected
-        for i, child_url in enumerate(child_sitemaps):
+        # Sort children before iterating: a <sitemapindex>'s own <loc> order
+        # is not guaranteed stable either, so without this the top-level cap
+        # still selects a different slice run-over-run whenever upstream
+        # reorders its index (review finding #8), even though child-level
+        # sorting already fixed intra-sitemap determinism.
+        for i, child_url in enumerate(sorted(child_sitemaps)):
             if len(collected) >= max_pages:
                 truncation["truncated"] = True
                 truncation["unprocessed_child_sitemaps"] += len(child_sitemaps) - i
@@ -426,6 +431,12 @@ def _llms_index_conditional_check(
             if text.strip():
                 return ("fetched", url, text)
         return None
+# Ceiling applied to an upstream Retry-After value before sleeping on it
+# (review finding #4): bounds worst-case per-attempt stall regardless of
+# what the upstream asks for.
+MAX_RETRY_AFTER_SLEEP_S = 60
+
+
 class TransientHTTPError(Exception):
     """Raised when an HTTP response status is 429, 502, or 503 to trigger a tenacity retry."""
 
@@ -450,7 +461,13 @@ def _fetch_page_with_retry(client: httpx.Client, target_url: str, headers: dict,
                 try:
                     delay = float(retry_after)
                     if delay > 0:
-                        time.sleep(delay)
+                        # Clamp: an upstream Retry-After can be arbitrarily
+                        # large (e.g. 3600s), and this sleep happens INSIDE a
+                        # tenacity retry that already backs off up to 30s on
+                        # its own, up to 3 attempts per page. Without a
+                        # ceiling a single misbehaving 429 response can stall
+                        # the whole sync thread for an hour per attempt.
+                        time.sleep(min(delay, MAX_RETRY_AFTER_SLEEP_S))
                 except ValueError:
                     pass
             raise TransientHTTPError(resp)

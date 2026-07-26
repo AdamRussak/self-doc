@@ -42,6 +42,7 @@ task description):
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import threading
 import time
@@ -161,6 +162,15 @@ SOFT_FAIL_PARTIAL_RATIO = 0.2
 # sit close to each other (e.g. 162 and 163, or 196 and 197 above) into a
 # false shell group.
 MIN_SHELL_SIBLING_COUNT = 3
+
+# Circuit breaker for the headless-render retry loop (review finding #9):
+# bail out of retrying further suspected shell pages once this many renders
+# in a row have come back `None` (renderer down/unreachable/timing out),
+# rather than paying the full RENDERER_CLIENT_TIMEOUT_S for every remaining
+# suspect. 3 mirrors the tenacity retry-attempt count used elsewhere in this
+# codebase (`_fetch_page_with_retry`) and is enough to distinguish "renderer
+# had one bad page" from "renderer is not answering at all".
+JS_RENDER_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
 def _detect_js_shell_pages(
@@ -864,14 +874,33 @@ def sync_source(
     # sync even if the renderer is stuck.
     if source.js_render and shell_suspected_urls:
         render_limiter = crawler.RateLimiter(source.rate_limit_rps)
-        for suspect_url in shell_suspected_urls:
+        consecutive_render_failures = 0
+        for render_idx, suspect_url in enumerate(shell_suspected_urls):
             # Honor the source's configured crawl politeness for the retry
             # pass too — the renderer must not become a way to bypass it.
             render_limiter.wait()
             rendered_html = renderer.render_page(suspect_url)
             if rendered_html is None:
                 log.info("js_render_retry_failed", url=suspect_url)
+                consecutive_render_failures += 1
+                if consecutive_render_failures >= JS_RENDER_CIRCUIT_BREAKER_THRESHOLD:
+                    # Circuit breaker (review finding #9): with the renderer
+                    # down (or unreachable), each suspected shell page costs
+                    # a full RENDERER_CLIENT_TIMEOUT_S plus the rate-limiter
+                    # wait for nothing. At real-world scale (upwards of a
+                    # hundred suspected shell pages) that is tens of minutes
+                    # of pure dead time appended to a sync. Soft-fail is
+                    # still correct for the remaining URLs; just stop paying
+                    # the per-URL renderer cost once it's clearly not
+                    # working.
+                    log.warning(
+                        "js_render_circuit_breaker_tripped",
+                        consecutive_failures=consecutive_render_failures,
+                        remaining_urls=len(shell_suspected_urls) - render_idx - 1,
+                    )
+                    break
                 continue
+            consecutive_render_failures = 0
 
             re_extraction = extract.extract(suspect_url, rendered_html)
             if re_extraction.status != "ok":
@@ -1042,18 +1071,27 @@ def sync_source_with_metrics(
     does not hardcode which underlying implementation runs.
 
     Tolerates a `sync_source` double with a narrower signature (no
-    `cancel_event`, or no `progress_cb`/`cancel_event` at all) via the same
-    `TypeError`-fallback tolerance pattern used elsewhere in this codebase
-    for exactly that reason.
+    `cancel_event`, or no `progress_cb`/`cancel_event` at all), e.g. a test
+    monkeypatch. This is done by inspecting `sync_source`'s signature ONCE
+    up front and only passing the keyword arguments it actually accepts,
+    rather than calling it and catching `TypeError` -- a `TypeError` raised
+    from deep inside a real `sync_source` body (extract/chunk/embed) is
+    indistinguishable from a signature mismatch, so a catch-and-retry ladder
+    here would silently re-run the ENTIRE sync (a second full crawl, then a
+    third) before finally propagating the error (review finding #5).
     """
     start = time.monotonic()
+    kwargs: dict[str, Any] = {}
     try:
-        outcome = sync_source(source, conn, progress_cb=progress_cb, cancel_event=cancel_event)
-    except TypeError:
-        try:
-            outcome = sync_source(source, conn, cancel_event=cancel_event)
-        except TypeError:
-            outcome = sync_source(source, conn)
+        sig_params = inspect.signature(sync_source).parameters
+    except (TypeError, ValueError):
+        sig_params = {}
+    accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+    if accepts_var_kwargs or "progress_cb" in sig_params:
+        kwargs["progress_cb"] = progress_cb
+    if accepts_var_kwargs or "cancel_event" in sig_params:
+        kwargs["cancel_event"] = cancel_event
+    outcome = sync_source(source, conn, **kwargs)
     duration = time.monotonic() - start
     metrics.record_sync_outcome(source.name, outcome, duration)
     return outcome

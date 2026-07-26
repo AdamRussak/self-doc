@@ -99,16 +99,18 @@ def propose_doc_source(
     live source: it queues a `status='pending'` row that a HUMAN must review
     and approve in the admin UI before anything is ever crawled. Do not tell
     the user their docs are "being indexed" — tell them the proposal is
-    queued for human approval. `base_url` is the only REQUIRED input — a
-    unique name, scoped `include_prefixes`, and a real `max_pages` ceiling
-    are all derived from it when omitted, so a bare URL can never crawl an
-    entire shared docs host uncapped. `name`, if given, must match
-    ^[a-z0-9-]+$ and be unique. `base_url`/`sitemap` must be valid http(s)
-    URLs; `rate_limit_rps` must be positive. `max_pages`, if given, must be
-    positive; pass it explicitly as null to opt out of the derived cap and
-    crawl all in-scope pages with no page limit. Rejected (with a clear
-    reason) on invalid input or a name that is already taken, pending or
-    not."""
+    queued for human approval. `base_url` is the only REQUIRED input.
+    Whichever of `name`, `include_prefixes`, and `max_pages` you OMIT is
+    derived from `base_url` — independently of whether you supplied the
+    others — so leaving any of them out never crawls an entire shared docs
+    host uncapped, even if you do supply a `name`. `name`, if given, must
+    match ^[a-z0-9-]+$ and be unique. `base_url`/`sitemap` must be valid
+    http(s) URLs; `rate_limit_rps` must be positive. `max_pages`, if given,
+    must be positive; there is no way to pass an "unlimited" `max_pages` —
+    omitting it (or passing null, which is treated the same as omitting it)
+    always applies the derived cap, so to crawl more pages pass an explicit,
+    larger `max_pages`. Rejected (with a clear reason) on invalid input or a
+    name that is already taken, pending or not."""
     token = get_access_token()
     if token is None:
         # Should not happen in practice: every /mcp request is already

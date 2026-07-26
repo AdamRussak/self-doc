@@ -21,6 +21,7 @@ import ipaddress
 import os
 import socket
 import time
+from collections.abc import Collection
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -558,17 +559,27 @@ def propose_source(
     """Validate a proposed source via `ProposedSourceConfig` and insert a
     `status='pending'` `doc_sources` row, returning its id.
 
-    `name` is OPTIONAL. When omitted (`None`), `base_url` is the sole
-    required input: a unique `^[a-z0-9-]+$` slug is derived from it (see
-    `source_defaults.derive_name`, made unique against every existing
-    `doc_sources.name` regardless of status), and any of `include_prefixes`/
-    `max_pages` not also supplied are derived too
-    (`source_defaults.apply_creation_defaults`). This derivation is what
-    makes a URL-only proposal safe: an empty `include_prefixes` allows the
-    ENTIRE host and a `None` `max_pages` means no page ceiling at all (see
-    `source_defaults` module docstring) — leaving only same-host as a bound
-    would let a URL-only proposal on a shared docs host crawl an entire
-    unrelated product's documentation.
+    `name` is OPTIONAL. Whichever of `name`/`include_prefixes`/`max_pages`
+    is OMITTED (not supplied as an argument, i.e. left at its `None`
+    default) is derived from `base_url`, independent of whether the other
+    two were supplied: a unique `^[a-z0-9-]+$` slug when `name` is omitted
+    (see `source_defaults.derive_name`, made unique against every existing
+    `doc_sources.name` regardless of status, via one extra `SELECT` only
+    run in that case), and/or scoped `include_prefixes`/a `DEFAULT_MAX_PAGES`
+    ceiling when those are omitted (`source_defaults.apply_creation_defaults`).
+    This derivation is what makes an under-specified proposal safe: an empty
+    `include_prefixes` allows the ENTIRE host and a `None` `max_pages` means
+    no page ceiling at all (see `source_defaults` module docstring) —
+    leaving only same-host as a bound would let a proposal on a shared docs
+    host crawl an entire unrelated product's documentation, whether or not
+    a `name` was supplied.
+
+    `max_pages` has no supported "unlimited" opt-out: because its default is
+    `None`, an explicit `max_pages=None` is indistinguishable from omitting
+    the argument, so BOTH always receive the derived `DEFAULT_MAX_PAGES`
+    ceiling. To propose an uncapped crawl, pass an explicit positive
+    `max_pages` large enough for your use case — there is no way to request
+    a literal `None`/no-ceiling `max_pages` through this function.
 
     Raises `ProposalError` (never a raw exception) on:
       - invalid configuration (bad name/URL/max_pages/rate_limit_rps, the
@@ -586,24 +597,33 @@ def propose_source(
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                effective_include_prefixes = include_prefixes
-                effective_max_pages = max_pages
-
                 if name is None:
                     # Only queried in URL-only mode: every other test/call
                     # path supplies an explicit name and must keep making
                     # exactly one INSERT round-trip.
                     cur.execute("SELECT name FROM doc_sources;", None)
-                    taken = {row["name"] for row in cur.fetchall()}
-                    fields: dict[str, Any] = {"base_url": base_url, "name": None}
-                    if include_prefixes is not None:
-                        fields["include_prefixes"] = include_prefixes
-                    if max_pages is not None:
-                        fields["max_pages"] = max_pages
-                    fields = apply_creation_defaults(fields, taken)
-                    effective_name = fields["name"]
-                    effective_include_prefixes = fields["include_prefixes"]
-                    effective_max_pages = fields["max_pages"]
+                    taken: Collection[str] = {row["name"] for row in cur.fetchall()}
+                else:
+                    taken = ()
+
+                # Build `fields` from whichever of name/include_prefixes/
+                # max_pages are actually absent, independent of one another —
+                # a caller who supplies `name` but omits `include_prefixes`/
+                # `max_pages` must still get derived scoping/cap (see
+                # `apply_creation_defaults`'s absent-vs-empty-vs-None
+                # semantics). `derive_name` is only invoked when `name` is
+                # missing, since `taken` above is only populated in that case.
+                fields: dict[str, Any] = {"base_url": base_url}
+                if name is not None:
+                    fields["name"] = name
+                if include_prefixes is not None:
+                    fields["include_prefixes"] = include_prefixes
+                if max_pages is not None:
+                    fields["max_pages"] = max_pages
+                fields = apply_creation_defaults(fields, taken)
+                effective_name = fields["name"]
+                effective_include_prefixes = fields["include_prefixes"]
+                effective_max_pages = fields["max_pages"]
 
                 try:
                     cfg = ProposedSourceConfig(

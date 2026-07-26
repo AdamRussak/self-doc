@@ -115,6 +115,23 @@ groups:
       # `for: 15m` still applies so a single evaluation right at the
       # instant a gauge flips (mid-scrape-interval jitter) doesn't page
       # before the next scrape confirms it's holding.
+      #
+      # KNOWN GAP — deliberately-capped sources page forever: one of the
+      # four causes `classify_sync` folds into "partial" is `crawl_truncated`
+      # (sitemap discovery hit the source's configured `max_pages`, now
+      # DEFAULT_MAX_PAGES=500 for any URL-only source by default). A source
+      # whose real corpus legitimately exceeds its cap hits this EVERY run,
+      # so this alert fires and never self-resolves — with no operator
+      # action available that changes that outcome, since the cap itself is
+      # the (working-as-designed) cause. `sync_last_status` has no label
+      # today distinguishing that case from an actual hard failure/aborted
+      # crawl/purge-guard refusal, so the expr below cannot exclude it
+      # without a metrics change (tracked as a follow-up, not done here —
+      # see docs/runbook.md's SourceSyncDegraded "Special case" section).
+      # Until then: triage via the `stale_page_purge_skipped` log event's
+      # `reason` field, then either raise `max_pages` or accept-and-silence
+      # per source — full remediation steps are in the runbook, not
+      # repeated here.
       - alert: SourceSyncDegraded
         expr: sync_last_status{status="partial"} == 1
         for: 15m
@@ -127,7 +144,10 @@ groups:
             status "partial" (a hard pipeline failure, an aborted crawl, a
             refused purge, or an elevated soft-failure ratio — see
             `classify_sync` in app/store.py). Check `GET /status` for this
-            source to see which condition applied.
+            source to see which condition applied. If this source has a
+            configured `max_pages` cap and this alert never clears, see the
+            runbook's "Special case: a deliberately-capped source" section
+            before assuming it's a live incident.
           runbook: 'docs/runbook.md#alert-sourcesyncdegraded'
 
       # ----------------------------------------------------------------

@@ -2,12 +2,9 @@
 of the 40 doc sources reported `last_status='ok'` — including 6 that hold
 zero pages — and `/metrics` emitted zero application samples.
 
-These tests deliberately assert the CORRECT (currently absent) behavior and
-are marked `xfail(strict=True)`: they must fail against today's code and
-will start passing (and need their xfail markers removed) once the
-corresponding fix lands. Keeping them `strict=True` means an unexpected pass
-also fails the suite, so nobody can quietly "fix" only three of the four
-cases and have this file go green by accident.
+These tests assert the CORRECT behavior for each of the incident's cases and
+now pass against the fixed code (the earlier `xfail(strict=True)` markers
+have been removed now that the corresponding fixes have landed).
 
 (a)/(b)/(c) reuse the live-DB `conn`/`second_conn` harness and monkeypatch
 patterns from `test_store.py` (crawler.crawl / extract.extract doubles) —

@@ -1939,3 +1939,145 @@ def test_sync_source_js_render_honors_source_rate_limit(conn, monkeypatch):
     assert 5.0 in seen_rps
 
 
+def test_sync_source_js_render_circuit_breaker_stops_after_consecutive_failures(conn, monkeypatch):
+    """Review finding #9: with the renderer down (every call returns `None`,
+    its documented soft-fail contract), the retry loop must not pay the full
+    per-URL renderer cost for every suspected shell page -- it must bail out
+    after `JS_RENDER_CIRCUIT_BREAKER_THRESHOLD` consecutive `None` returns,
+    leaving the rest soft-failed exactly as before (soft-fail is still
+    correct; this only bounds how much dead time is spent getting there)."""
+    source = _make_shell_source(js_render=True)
+    total_shell_pages = 10
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(total_shell_pages)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+
+    render_calls: list[str] = []
+
+    def _dead_renderer(url):
+        render_calls.append(url)
+        return None
+
+    monkeypatch.setattr(store.renderer, "render_page", _dead_renderer)
+
+    outcome = store.sync_source(source, conn)
+
+    # The renderer must be called at most the threshold number of times --
+    # NOT once per suspected shell page (which would be 10 here).
+    assert len(render_calls) == store.JS_RENDER_CIRCUIT_BREAKER_THRESHOLD
+    assert outcome.pages_js_rendered == 0
+    assert outcome.pages_soft_failed == total_shell_pages
+    assert outcome.shell_suspected_count == total_shell_pages
+    assert outcome.status == "failed"
+
+
+def test_sync_source_js_render_circuit_breaker_resets_on_success(conn, monkeypatch):
+    """A single successful render in between failures must reset the
+    consecutive-failure counter -- the breaker only trips on a genuinely
+    unbroken run of failures, not merely `>= N` failures scattered across
+    the retry pass."""
+    source = _make_shell_source(js_render=True)
+    total_shell_pages = 8
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(total_shell_pages)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+
+    render_calls: list[str] = []
+
+    def _mostly_dead_renderer(url):
+        render_calls.append(url)
+        # Every 2nd call (0-indexed odd positions) succeeds -- never two
+        # failures in a row, so the breaker (threshold 3) must never trip.
+        if len(render_calls) % 2 == 0:
+            return PAGE_MD
+        return None
+
+    monkeypatch.setattr(store.renderer, "render_page", _mostly_dead_renderer)
+
+    store.sync_source(source, conn)
+
+    # All 8 suspected shell pages were retried -- the interleaved successes
+    # kept resetting the consecutive-failure count below the threshold.
+    assert len(render_calls) == total_shell_pages
+
+
+# --- sync_source_with_metrics's signature-tolerance wrapper (review #5) ----
+
+
+def test_sync_source_with_metrics_propagates_type_error_without_retrying(monkeypatch):
+    """Review finding #5: a genuine `TypeError` raised from deep inside
+    `sync_source`'s body (e.g. extract/chunk/embed) must propagate as-is --
+    the wrapper must NOT silently reinterpret it as a signature mismatch and
+    re-invoke the whole sync a second (or third) time."""
+    call_count = 0
+
+    def fake_sync_source(source, conn, progress_cb=None, cancel_event=None):
+        nonlocal call_count
+        call_count += 1
+        raise TypeError("boom: a real bug deep in chunk/embed, not a signature mismatch")
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+    source = make_source()
+
+    with pytest.raises(TypeError, match="boom"):
+        store.sync_source_with_metrics(source, conn=object())
+
+    # Exactly one invocation -- no second or third full-sync retry.
+    assert call_count == 1
+
+
+def test_sync_source_with_metrics_tolerates_narrower_signature_without_extra_calls(monkeypatch):
+    """A `sync_source` double with a narrower signature (no `cancel_event`)
+    must still be called successfully -- and, since the wrapper now detects
+    this via `inspect.signature` up front rather than trial-and-error, it
+    must be called exactly once."""
+    call_count = 0
+
+    def fake_sync_source(source, conn, progress_cb=None):
+        nonlocal call_count
+        call_count += 1
+        return store.SourceOutcome(name=source.name, status="ok")
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+    source = make_source()
+
+    outcome = store.sync_source_with_metrics(
+        source, conn=object(), progress_cb=None, cancel_event=threading.Event()
+    )
+
+    assert outcome.status == "ok"
+    assert call_count == 1
+
+
+def test_sync_source_with_metrics_tolerates_bare_signature_without_extra_calls(monkeypatch):
+    """A `sync_source` double accepting only `(source, conn)` (no
+    `progress_cb`/`cancel_event` at all) must still be called exactly
+    once."""
+    call_count = 0
+
+    def fake_sync_source(source, conn):
+        nonlocal call_count
+        call_count += 1
+        return store.SourceOutcome(name=source.name, status="ok")
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+    source = make_source()
+
+    outcome = store.sync_source_with_metrics(
+        source, conn=object(), progress_cb=None, cancel_event=threading.Event()
+    )
+
+    assert outcome.status == "ok"
+    assert call_count == 1
+
+

@@ -65,8 +65,14 @@ services:
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 4
       # Embedding model config — resolved by `make configure` into .env from
-      # config/models.yaml. The defaults below mirror the registry default
-      # (mixedbread-ai/mxbai-embed-large-v1) so `make up` works unconfigured.
+      # config/models.yaml. The `:-mixedbread-ai/mxbai-embed-large-v1`
+      # fallback below is a hardcoded compose-level default so `make up`
+      # works even if .env was never written by `make configure` — it does
+      # NOT track config/models.yaml's `default:` row and can drift from it
+      # (e.g. config/models.yaml currently marks `BAAI/bge-small-en-v1.5` as
+      # `default: true`, not mxbai). Always run `make configure` (or set
+      # EMBEDDING_MODEL_NAME/EMBEDDING_DIM in .env yourself) rather than
+      # relying on this fallback to reflect the registry's current default.
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT:-}"
@@ -116,11 +122,13 @@ services:
   # existing ~820 MiB of a 1.5 GiB limit, which would risk an OOM ingestion
   # does not have today. Behind its own `render` profile so a default
   # `make up`/`docker compose --profile full up` NEVER builds or starts this
-  # image — ingestion's behavior and image size with this profile disabled
-  # are byte-identical to before T7 (verified: `docker inspect` reports the
-  # same `ingestion` image size with or without this service ever having
-  # existed, since nothing here touches ingestion/Dockerfile or
-  # ingestion/pyproject.toml).
+  # image — starting/not-starting this service never changes whether
+  # `ingestion` gets built or what's in it, since nothing here touches
+  # ingestion/Dockerfile. (`ingestion/pyproject.toml` DOES gain a new
+  # dependency, `tenacity>=8.2`, used by `crawler.py` — unrelated to this
+  # `render` profile and present whether or not the profile is ever
+  # enabled, so the ingestion image is not byte-identical to pre-T7, just
+  # unaffected by this service's profile toggle.)
   #
   # Bring up alongside `full`: `docker compose --profile full --profile render up -d`.
   renderer:
@@ -194,8 +202,12 @@ services:
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 4
       # Must match the ingestion service's model for vectors to be comparable;
-      # `make configure` keeps both in sync via .env. Defaults mirror the
-      # registry default (config/models.yaml).
+      # `make configure` keeps both in sync via .env. The
+      # `:-mixedbread-ai/mxbai-embed-large-v1` fallback below is a hardcoded
+      # compose-level default, not a live read of config/models.yaml's
+      # `default:` row, so it can drift from the registry's current default
+      # (see the same note on the ingestion service above) — run `make
+      # configure` rather than relying on it.
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
       EMBEDDING_QUERY_PROMPT: "${EMBEDDING_QUERY_PROMPT:-Represent this sentence for searching relevant passages: }"
     ports:
