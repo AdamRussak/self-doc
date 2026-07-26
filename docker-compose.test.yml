@@ -22,10 +22,14 @@ services:
       # os.environ.setdefault(...) fallbacks (POSTGRES_USER=self_docs,
       # POSTGRES_PASSWORD=testpass123, POSTGRES_DB=self_docs) so `make test`
       # works unconfigured. This is a disposable local test database; these
-      # credentials are never used against a real deployment.
-      POSTGRES_USER: self_docs
-      POSTGRES_PASSWORD: testpass123
-      POSTGRES_DB: self_docs
+      # credentials are never used against a real deployment. Sourced from
+      # the SAME TEST_POSTGRES_* variables the Makefile `test` target exports
+      # to pytest (see Makefile `test` target) — one source of truth, so the
+      # container and the test suites' connection settings can never drift
+      # apart.
+      POSTGRES_USER: ${TEST_POSTGRES_USER:-self_docs}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-testpass123}
+      POSTGRES_DB: ${TEST_POSTGRES_DB:-self_docs}
     volumes:
       # Own volume — never the production `pgdata` volume — so purge/delete
       # test paths can never touch real rows, and so `make test-db-reset` can
@@ -34,11 +38,11 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d:ro
     ports:
       # Loopback-only, matching the rest of this project's binding policy.
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:${TEST_POSTGRES_PORT:-5433}:5432"
     networks:
       - default
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U self_docs -d self_docs"]
+      test: ["CMD-SHELL", "pg_isready -U ${TEST_POSTGRES_USER:-self_docs} -d ${TEST_POSTGRES_DB:-self_docs}"]
       interval: 5s
       timeout: 5s
       retries: 10

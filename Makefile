@@ -3,6 +3,19 @@ export
 
 PREFIX ?= $(HOME)/.local
 
+# Single source of truth for the isolated `db-test` service's connection
+# settings. `export` above pushes these into every recipe's environment, so
+# BOTH docker-compose.test.yml (which reads ${TEST_POSTGRES_USER:-...} etc.,
+# falling back to the same defaults) and the `test` target's pytest
+# invocations resolve them identically — the container and the test suites
+# cannot drift apart. Override on the command line (e.g.
+# `make test TEST_POSTGRES_PORT=5434`) if 5433 is already in use locally.
+TEST_POSTGRES_HOST ?= 127.0.0.1
+TEST_POSTGRES_PORT ?= 5433
+TEST_POSTGRES_USER ?= self_docs
+TEST_POSTGRES_PASSWORD ?= testpass123
+TEST_POSTGRES_DB ?= self_docs
+
 .PHONY: up down up-prod down-prod sync test test-db-up test-db-down test-db-reset build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
 
 # Select the embedding model from config/models.yaml. Resolves the model's
@@ -94,6 +107,17 @@ stop:
 # production `db` service/volume — see docker-compose.test.yml and
 # docs/runbook.md, "Isolated test database (db-test)".
 test-db-up:
+	@# The container_name below (self-docs-db-test) is fixed, so a db-test
+	@# left running by a DIFFERENT worktree/checkout (different
+	@# working_dir label, same fixed name) collides on `docker compose up`.
+	@# Detect that case and remove the stale container so this target stays
+	@# re-runnable without a manual `docker rm` — never touch it if it
+	@# belongs to THIS worktree (that one gets reused as intended).
+	@owner="$$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' self-docs-db-test 2>/dev/null || true)"; \
+	if [ -n "$$owner" ] && [ "$$owner" != "$(CURDIR)" ]; then \
+		echo "Stale self-docs-db-test container from another worktree ($$owner) detected — removing it so this worktree can start its own."; \
+		docker rm -f self-docs-db-test >/dev/null 2>&1 || true; \
+	fi
 	docker compose -f docker-compose.yml -f docker-compose.test.yml up -d db-test
 	@echo "Waiting for db-test to become healthy..."
 	@for i in $$(seq 1 30); do \
@@ -120,34 +144,55 @@ test-db-reset:
 # Runs the full suite for BOTH packages (ingestion, mcp-server), doc-cli Go suite, plus the
 # cross-package e2e test, as the single `make test` entrypoint from repo root.
 # Brings up the isolated db-test service first (never the production `db`),
-# and pins EMBEDDING_DIM/EMBEDDING_MODEL_NAME to the deployed default
+# points every DB-backed suite at it via TEST_POSTGRES_* (see top of this
+# file — the SAME variables docker-compose.test.yml reads), and pins
+# EMBEDDING_DIM/EMBEDDING_MODEL_NAME to the deployed default
 # (BAAI/bge-small-en-v1.5, dim 384 — matching db/init/01_schema.sql's
 # vector(384)) so DB-backed tests don't fail on the stale 1024-dim mxbai
 # fallback constants baked into the app code.
+#
+# Two tests are KNOWN-RED and left that way on purpose (user-approved,
+# out of scope to fix here — the mxbai-vs-registry embedding-default
+# mismatch): mcp-server/tests/test_registry_defaults.py::
+# test_retrieval_defaults_match_registry_default and tests/
+# test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default.
+# Every suite below therefore runs to completion regardless of earlier
+# failures (`|| SUITE_FAIL=1`, no suite short-circuits the next), and the
+# target still exits non-zero overall so a real regression can't hide behind
+# the two expected failures.
 test: test-db-up
-	@echo "=== doc-cli Go test suite ==="
-	cd cli && go test -v ./...
-	@echo "=== ensuring ingestion/.venv ==="
-	@test -d ingestion/.venv || python3 -m venv ingestion/.venv
-	@ingestion/.venv/bin/pip install -q -U pip
-	@ingestion/.venv/bin/pip install -q -e ingestion
-	@ingestion/.venv/bin/pip install -q pytest
-	@echo "=== ensuring mcp-server/.venv ==="
-	@test -d mcp-server/.venv || python3 -m venv mcp-server/.venv
-	@mcp-server/.venv/bin/pip install -q -U pip
-	@mcp-server/.venv/bin/pip install -q -e mcp-server
-	@mcp-server/.venv/bin/pip install -q pytest pyyaml defusedxml
-	@ingestion/.venv/bin/pip install -q pytest-cov
-	@mcp-server/.venv/bin/pip install -q pytest-cov
-	@echo "=== ingestion test suite ==="
-	cd ingestion && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
-	@echo "=== mcp-server test suite ==="
-	cd mcp-server && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../mcp-server/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered
-	@echo "=== e2e (cross-package) test suite ==="
-	cd tests && EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/python -m pytest -q
-	@echo "make test: all suites green. DB-backed tests ran against the isolated"
-	@echo "db-test service on 127.0.0.1:5433 (own container, own pgdata_test volume) —"
-	@echo "the production db/pgdata volume was never touched."
+	@SUITE_FAIL=0; \
+	echo "=== doc-cli Go test suite ==="; \
+	(cd cli && go test -v ./...) || SUITE_FAIL=1; \
+	echo "=== ensuring ingestion/.venv ==="; \
+	test -d ingestion/.venv || python3 -m venv ingestion/.venv; \
+	ingestion/.venv/bin/pip install -q -U pip; \
+	ingestion/.venv/bin/pip install -q -e ingestion; \
+	ingestion/.venv/bin/pip install -q pytest pytest-cov; \
+	echo "=== ensuring mcp-server/.venv ==="; \
+	test -d mcp-server/.venv || python3 -m venv mcp-server/.venv; \
+	mcp-server/.venv/bin/pip install -q -U pip; \
+	mcp-server/.venv/bin/pip install -q -e mcp-server; \
+	mcp-server/.venv/bin/pip install -q pytest pytest-cov pyyaml defusedxml; \
+	echo "=== ingestion test suite ==="; \
+	(cd ingestion && POSTGRES_HOST=$(TEST_POSTGRES_HOST) POSTGRES_PORT=$(TEST_POSTGRES_PORT) POSTGRES_USER=$(TEST_POSTGRES_USER) POSTGRES_PASSWORD=$(TEST_POSTGRES_PASSWORD) POSTGRES_DB=$(TEST_POSTGRES_DB) EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered) || SUITE_FAIL=1; \
+	echo "=== mcp-server test suite ==="; \
+	(cd mcp-server && POSTGRES_HOST=$(TEST_POSTGRES_HOST) POSTGRES_PORT=$(TEST_POSTGRES_PORT) POSTGRES_USER=$(TEST_POSTGRES_USER) POSTGRES_PASSWORD=$(TEST_POSTGRES_PASSWORD) POSTGRES_DB=$(TEST_POSTGRES_DB) EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../mcp-server/.venv/bin/pytest -q --cov=app --cov-report=term-missing:skip-covered) || SUITE_FAIL=1; \
+	echo "=== e2e (cross-package) test suite ==="; \
+	(cd tests && POSTGRES_HOST=$(TEST_POSTGRES_HOST) POSTGRES_PORT=$(TEST_POSTGRES_PORT) POSTGRES_USER=$(TEST_POSTGRES_USER) POSTGRES_PASSWORD=$(TEST_POSTGRES_PASSWORD) POSTGRES_DB=$(TEST_POSTGRES_DB) EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/python -m pytest -q) || SUITE_FAIL=1; \
+	if [ "$$SUITE_FAIL" -ne 0 ]; then \
+		echo "make test: FAILURES present (expected: the 2 documented known-red"; \
+		echo "registry-default-mismatch tests — see the comment above this target;"; \
+		echo "anything else here is a real regression). DB-backed tests ran against"; \
+		echo "the isolated db-test service on $(TEST_POSTGRES_HOST):$(TEST_POSTGRES_PORT)"; \
+		echo "(own container, own pgdata_test volume) — the production db/pgdata"; \
+		echo "volume was never touched."; \
+		exit 1; \
+	else \
+		echo "make test: all suites green. DB-backed tests ran against the isolated"; \
+		echo "db-test service on $(TEST_POSTGRES_HOST):$(TEST_POSTGRES_PORT) (own container,"; \
+		echo "own pgdata_test volume) — the production db/pgdata volume was never touched."; \
+	fi
 
 
 # Run retrieval quality evaluation against a synced database.
