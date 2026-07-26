@@ -33,6 +33,14 @@
       <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">Errors / Skipped</div>
       <div style="font-size: 1.25rem; font-weight: 700; color: {% if sync_status.get('pages_failed', 0) > 0 %}var(--color-error){% else %}var(--color-text-muted){% endif %}">{{ sync_status.get('pages_failed', 0) }}</div>
     </div>
+    <div>
+      <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">JS Shell Suspected</div>
+      <div style="font-size: 1.25rem; font-weight: 700; color: {% if sync_status.get('shell_suspected_count', 0) > 0 %}var(--color-warning, #f5a623){% else %}var(--color-text-muted){% endif %}">{{ sync_status.get('shell_suspected_count', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">JS Rendered Recovered</div>
+      <div style="font-size: 1.25rem; font-weight: 700; color: var(--color-text);">{{ sync_status.get('pages_js_rendered', 0) }}</div>
+    </div>
   </div>
   {% if sync_status.get('last_url') %}
   <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--color-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
@@ -75,6 +83,14 @@
     <div>
       <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">Errors / Skipped</div>
       <div style="font-size: 1.25rem; font-weight: 700; color: {% if summary.get('pages_failed', 0) > 0 %}var(--color-error){% else %}var(--color-text-muted){% endif %}">{{ summary.get('pages_failed', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">JS Shell Suspected</div>
+      <div style="font-size: 1.25rem; font-weight: 700; color: {% if summary.get('shell_suspected_count', 0) > 0 %}var(--color-warning, #f5a623){% else %}var(--color-text-muted){% endif %}">{{ summary.get('shell_suspected_count', 0) }}</div>
+    </div>
+    <div>
+      <div style="font-size: 0.7rem; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.04em;">JS Rendered Recovered</div>
+      <div style="font-size: 1.25rem; font-weight: 700; color: var(--color-text);">{{ summary.get('pages_js_rendered', 0) }}</div>
     </div>
   </div>
   {% if summary.get('error') %}

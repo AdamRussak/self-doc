@@ -93,6 +93,13 @@ PAGES_SOFT_FAILED = Counter(
 PAGES_FAILED = Counter(
     "pages_failed_total", "Pages that hard-failed during extract/chunk/embed/store (drives status=partial/failed)", ["source"]
 )
+PAGES_SHELL_SUSPECTED = Counter(
+    "pages_shell_suspected_total",
+    "Pages flagged by T6's cross-page JS-shell detector (short/duplicate-length extraction "
+    "siblings suspected of being a client-side-rendered stub) — a subset of pages_soft_failed_total; "
+    "some of these may go on to be recovered via the headless renderer (T7), see app/store.py",
+    ["source"],
+)
 CHUNKS_INDEXED = Counter("chunks_indexed_total", "Chunks written to doc_chunks", ["source"])
 SYNC_DURATION = Histogram("sync_duration_seconds", "Duration of a full sync run for one source", ["source"])
 SYNC_LAST_SUCCESS = Gauge(
@@ -120,6 +127,7 @@ class _SyncOutcomeLike(Protocol):
     pages_soft_failed: int
     pages_failed: int
     chunks_indexed: int
+    shell_suspected_count: int
     status: str
 
 
@@ -140,6 +148,7 @@ def record_sync_outcome(source_name: str, outcome: _SyncOutcomeLike, duration_se
     PAGES_NOT_MODIFIED.labels(source=source_name).inc(outcome.pages_not_modified)
     PAGES_SOFT_FAILED.labels(source=source_name).inc(outcome.pages_soft_failed)
     PAGES_FAILED.labels(source=source_name).inc(outcome.pages_failed)
+    PAGES_SHELL_SUSPECTED.labels(source=source_name).inc(outcome.shell_suspected_count)
     CHUNKS_INDEXED.labels(source=source_name).inc(outcome.chunks_indexed)
     SYNC_DURATION.labels(source=source_name).observe(duration_seconds)
     if outcome.status in ("ok", "partial"):

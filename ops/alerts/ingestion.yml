@@ -12,6 +12,14 @@
 #   pages_soft_failed_total{source}        (Counter)
 #   pages_failed_total{source}             (Counter — hard pipeline failures;
 #                                            drives status=partial/failed)
+#   pages_shell_suspected_total{source}    (Counter — T6's cross-page JS-shell
+#                                            detector count; a subset of
+#                                            pages_soft_failed_total. Added by
+#                                            T28 so a source silently losing
+#                                            content to client-side rendering
+#                                            is visible on its own, not only
+#                                            folded into the generic soft-fail
+#                                            ratio)
 #   chunks_indexed_total{source}           (Counter)
 #   sync_duration_seconds{source}          (Histogram — _count increases once
 #                                            per completed sync regardless of
@@ -190,6 +198,51 @@ groups:
             reports "ok" by design, but this share is high enough to warrant a
             look — check for a moved/renamed sitemap or a bulk link rot event.
           runbook: 'docs/runbook.md#alert-softfailratiohigh'
+
+      # ----------------------------------------------------------------
+      # ShellSuspectedRatioHigh
+      #
+      # Complements SoftFailRatioHigh above with a JS-shell-SPECIFIC signal:
+      # a source can be losing a large share of its content to client-side
+      # rendering (T6's cross-page JS-shell detector,
+      # `pages_shell_suspected_total`) while its overall soft-fail ratio
+      # still looks like ordinary site friction (dead links, stub pages) --
+      # `pages_shell_suspected_total` is a SUBSET of
+      # `pages_soft_failed_total`, so a source could sit comfortably under
+      # SoftFailRatioHigh's 20% threshold on total soft-fails while still
+      # having most of THAT slice be undetected JS shells, or (for a source
+      # with `js_render` off) simply never recovering them at all. This is
+      # exactly the traefik incident this whole alert suite exists to catch
+      # (117 of 280 pages, 41.8%, silently client-side-rendered) made
+      # visible on its own axis rather than folded into the generic
+      # soft-fail bucket.
+      #
+      # Same shape as SoftFailRatioHigh: 20% of total page volume, `> 20`
+      # total-page floor to avoid alerting on statistically meaningless
+      # ratios from tiny sources, `clamp_min(..., 1)` divide-by-zero guard.
+      - alert: ShellSuspectedRatioHigh
+        expr: |-
+          (
+            increase(pages_shell_suspected_total[30h])
+            /
+            clamp_min(increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]) + increase(pages_soft_failed_total[30h]), 1)
+          ) > 0.20
+          and
+          (increase(pages_fetched_total[30h]) + increase(pages_skipped_unchanged_total[30h]) + increase(pages_not_modified_total[30h]) + increase(pages_soft_failed_total[30h])) > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Source "{{ $labels.source }}" is losing over 20% of its pages to suspected JS-shell content in the last run.'
+          description: >-
+            {{ $labels.source }}: {{ $value | humanizePercentage }} of pages in
+            the last ~30h were flagged as suspected JS-shell stubs (T6's
+            cross-page detector) — client-side-rendered content the crawler
+            cannot see without headless rendering. Check `GET /status` for
+            `shell_suspected_count`/`pages_js_rendered` on this source, and
+            consider opting it into `js_render` (see
+            docs/runbook.md#headless-render-retry-t7) if it isn't already.
+          runbook: 'docs/runbook.md#alert-shellsuspectedratiohigh'
 
       # ----------------------------------------------------------------
       # NoSyncMetricsAtAll — meta-alert, high severity

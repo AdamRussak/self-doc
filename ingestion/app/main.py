@@ -54,6 +54,7 @@ from .metrics import (
     PAGES_FAILED,
     PAGES_FETCHED,
     PAGES_NOT_MODIFIED,
+    PAGES_SHELL_SUSPECTED,
     PAGES_SKIPPED,
     PAGES_SOFT_FAILED,
     SYNC_DURATION,
@@ -425,6 +426,8 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                     "pages_not_modified": 0,
                     "pages_failed": 0,
                     "pages_soft_failed": 0,
+                    "shell_suspected_count": 0,
+                    "pages_js_rendered": 0,
                     "pages_removed": 0,
                     "chunks_indexed": 0,
                     "last_status": "failed",
@@ -480,6 +483,8 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                 "pages_not_modified": outcome.pages_not_modified,
                 "pages_failed": outcome.pages_failed,
                 "pages_soft_failed": outcome.pages_soft_failed,
+                "shell_suspected_count": outcome.shell_suspected_count,
+                "pages_js_rendered": outcome.pages_js_rendered,
                 "pages_removed": outcome.pages_removed,
                 "chunks_indexed": outcome.chunks_indexed,
                 "last_status": outcome.status,
@@ -498,6 +503,8 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
         total_skipped = sum(r.get("pages_skipped", 0) for r in _state["results"].values())
         total_not_modified = sum(r.get("pages_not_modified", 0) for r in _state["results"].values())
         total_failed = sum(r.get("pages_failed", 0) + r.get("pages_soft_failed", 0) for r in _state["results"].values())
+        total_shell_suspected = sum(r.get("shell_suspected_count", 0) for r in _state["results"].values())
+        total_js_rendered = sum(r.get("pages_js_rendered", 0) for r in _state["results"].values())
         any_failed = any(r.get("last_status") == "failed" for r in _state["results"].values())
         errors = [str(r["error"]) for r in _state["results"].values() if r.get("error")]
         admin._sync_status["last_completed_summary"] = {
@@ -508,6 +515,8 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             "pages_skipped": total_skipped,
             "pages_not_modified": total_not_modified,
             "pages_failed": total_failed,
+            "shell_suspected_count": total_shell_suspected,
+            "pages_js_rendered": total_js_rendered,
             "error": "; ".join(errors) if errors else None,
             "finished_at": time.time(),
         }

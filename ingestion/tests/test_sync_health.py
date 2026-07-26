@@ -358,6 +358,38 @@ def test_admin_driven_sync_records_pages_failed_and_last_status(monkeypatch):
     assert _status_sample_value(record.name, "partial") == 1
     assert _status_sample_value(record.name, "ok") is None
     assert _status_sample_value(record.name, "failed") is None
+
+
+def test_admin_driven_sync_records_pages_shell_suspected(monkeypatch):
+    """T28: `pages_shell_suspected_total` (T6's cross-page JS-shell detector
+    count) must move via the same admin-path sync the other counters in
+    this file cover — mirroring T24's fix for the original "admin path never
+    reaches /metrics" bug, applied to the metric this task adds."""
+    from app import main as main_module
+
+    record = _make_record(name="metrics-shell-suspected-test-src")
+    canned_outcome = SourceOutcome(
+        name=record.name,
+        pages_fetched=4,
+        pages_skipped=0,
+        pages_not_modified=0,
+        pages_soft_failed=2,
+        pages_failed=0,
+        pages_removed=0,
+        chunks_indexed=4,
+        shell_suspected_count=5,
+        pages_js_rendered=3,
+        status="ok",
+    )
+
+    def fake_sync_source(cfg, conn, progress_cb=None):
+        return canned_outcome
+
+    monkeypatch.setattr(store, "sync_source", fake_sync_source)
+
+    admin._bg_sync_all([record], conn_factory=lambda: object())
+
+    assert _sample_value(main_module.PAGES_SHELL_SUSPECTED, record.name) == 5
     # "partial" still moves the last-success timestamp -- unchanged contract.
     assert _sample_value(main_module.SYNC_LAST_SUCCESS, record.name) is not None
 

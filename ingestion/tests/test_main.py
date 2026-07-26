@@ -486,6 +486,45 @@ def test_run_sync_blocking_records_pages_soft_failed(app_module, monkeypatch):
     assert after_count - before_count == 3
 
 
+def test_run_sync_blocking_surfaces_js_shell_counts_in_status(app_module, monkeypatch):
+    """T28: `shell_suspected_count`/`pages_js_rendered` (T6/T7) must reach
+    `GET /status`'s per-source payload, not just the structured logs —
+    otherwise an operator has no way to notice a source silently losing
+    content to client-side rendering (the traefik incident)."""
+    from app import store
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(
+        store,
+        "sync_source",
+        lambda source, conn: store.SourceOutcome(
+            name=source.name,
+            pages_soft_failed=2,
+            shell_suspected_count=5,
+            pages_js_rendered=3,
+            status="ok",
+        ),
+    )
+
+    sources_by_name = app_module.get_sources_by_name()
+    name = next(iter(sources_by_name))
+    app_module._run_sync_blocking([name], sources_by_name)
+
+    assert app_module._state["results"][name]["shell_suspected_count"] == 5
+    assert app_module._state["results"][name]["pages_js_rendered"] == 3
+
+    client = TestClient(app_module.app)
+    resp = client.get("/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[name]["shell_suspected_count"] == 5
+    assert body[name]["pages_js_rendered"] == 3
+
+
 def test_get_sources_by_name_reflects_latest_db_read(app_module, monkeypatch):
     """A running service must pick up doc_sources edits without a restart:
     get_sources()/get_sources_by_name() re-read the database on every call

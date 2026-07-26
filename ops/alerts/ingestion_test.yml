@@ -165,3 +165,53 @@ tests:
                 reports "ok" by design, but this share is high enough to warrant a
                 look — check for a moved/renamed sitemap or a bulk link rot event.
               runbook: 'docs/runbook.md#alert-softfailratiohigh'
+
+  # --- ShellSuspectedRatioHigh: 117/280 shell-suspected (41.8%) ----------
+  - interval: 30m
+    input_series:
+      - series: 'pages_fetched_total{source="traefik"}'
+        values: '0+0x9 163+0x50'
+      - series: 'pages_skipped_unchanged_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_not_modified_total{source="traefik"}'
+        values: '0x60'
+      - series: 'pages_soft_failed_total{source="traefik"}'
+        values: '0+0x9 117+0x50'
+      - series: 'pages_shell_suspected_total{source="traefik"}'
+        values: '0+0x9 117+0x50'
+    alert_rule_test:
+      - eval_time: 29h30m
+        alertname: ShellSuspectedRatioHigh
+        exp_alerts:
+          - exp_labels:
+              source: traefik
+              severity: warning
+            exp_annotations:
+              summary: 'Source "traefik" is losing over 20% of its pages to suspected JS-shell content in the last run.'
+              description: >-
+                traefik: 41.79% of pages in
+                the last ~30h were flagged as suspected JS-shell stubs (T6's
+                cross-page detector) — client-side-rendered content the crawler
+                cannot see without headless rendering. Check `GET /status` for
+                `shell_suspected_count`/`pages_js_rendered` on this source, and
+                consider opting it into `js_render` (see
+                docs/runbook.md#headless-render-retry-t7) if it isn't already.
+              runbook: 'docs/runbook.md#alert-shellsuspectedratiohigh'
+
+  # --- ShellSuspectedRatioHigh: does NOT fire under the 20% floor --------
+  - interval: 30m
+    input_series:
+      - series: 'pages_fetched_total{source="fastapi"}'
+        values: '0+0x9 280+0x50'
+      - series: 'pages_skipped_unchanged_total{source="fastapi"}'
+        values: '0x60'
+      - series: 'pages_not_modified_total{source="fastapi"}'
+        values: '0x60'
+      - series: 'pages_soft_failed_total{source="fastapi"}'
+        values: '0x60'
+      - series: 'pages_shell_suspected_total{source="fastapi"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 29h30m
+        alertname: ShellSuspectedRatioHigh
+        exp_alerts: []

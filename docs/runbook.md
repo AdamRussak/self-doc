@@ -1039,6 +1039,8 @@ Example output for a healthy source with a few transient broken links/stubs (`pa
   "pages_skipped": 0,
   "pages_failed": 0,
   "pages_soft_failed": 5,
+  "shell_suspected_count": 0,
+  "pages_js_rendered": 0,
   "pages_removed": 0,
   "chunks_indexed": 1504,
   "last_status": "ok",
@@ -1046,11 +1048,22 @@ Example output for a healthy source with a few transient broken links/stubs (`pa
   "error": null
 }
 ```
+`shell_suspected_count` (T6) is how many of `pages_soft_failed` were flagged
+by the cross-page JS-shell detector (same-source pages sharing a
+suspiciously short, duplicate extraction length); `pages_js_rendered` (T7)
+is how many of those were subsequently recovered via the headless renderer
+(only nonzero for sources with `js_render` opted in — see [Headless-render
+retry (T7)](#headless-render-retry-t7)). A source with a large
+`shell_suspected_count` and `pages_js_rendered == 0` is silently losing that
+content — this is the exact traefik incident (117 of 280 pages, 42%) that
+motivated adding both fields to this payload; also surfaced in the admin
+UI's sync-status widget and via `pages_shell_suspected_total` on `/metrics`
+(see [ShellSuspectedRatioHigh](#alert-shellsuspectedratiohigh) below).
 
 #### 2. Checking Prometheus Metrics
 The `/metrics` endpoint exposes counters/gauges for each outcome tier (`ingestion/app/metrics.py` is the single definition point for all of these):
 ```bash
-curl -sS http://localhost:8080/metrics | grep -E "^(pages_(fetched|skipped_unchanged|not_modified|soft_failed|failed)_total|sync_last_status|sync_last_success_timestamp)"
+curl -sS http://localhost:8080/metrics | grep -E "^(pages_(fetched|skipped_unchanged|not_modified|soft_failed|failed|shell_suspected)_total|sync_last_status|sync_last_success_timestamp)"
 ```
 Relevant series:
 - `pages_fetched_total{source="..."}`
@@ -1058,6 +1071,7 @@ Relevant series:
 - `pages_not_modified_total{source="..."}`
 - `pages_soft_failed_total{source="..."}`
 - `pages_failed_total{source="..."}` — hard pipeline failures; the counter that drives `partial`/`failed` alongside the soft-fail ratio.
+- `pages_shell_suspected_total{source="..."}` — T6's cross-page JS-shell detector count; a subset of `pages_soft_failed_total`. See [ShellSuspectedRatioHigh](#alert-shellsuspectedratiohigh).
 - `chunks_indexed_total{source="..."}`
 - `sync_duration_seconds{source="..."}` (histogram)
 - `sync_last_success_timestamp{source="..."}` — set to "now" for BOTH `ok` and `partial` (only `failed` leaves it stale; see [Alerting](#alerting--prometheus-rules-opsalertsingestionyml) below).
@@ -1220,12 +1234,12 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
 
 ## Alerting — Prometheus rules (`ops/alerts/ingestion.yml`)
 
-Five alerting rules over the `/metrics` series from
+Six alerting rules over the `/metrics` series from
 `ingestion/app/metrics.py` (`pages_fetched_total`,
 `pages_skipped_unchanged_total`, `pages_not_modified_total`,
-`pages_soft_failed_total`, `pages_failed_total`, `chunks_indexed_total`,
-`sync_duration_seconds`, `sync_last_success_timestamp`, and
-`sync_last_status` — the last one labelled `source` + `status`, the rest
+`pages_soft_failed_total`, `pages_failed_total`, `pages_shell_suspected_total`,
+`chunks_indexed_total`, `sync_duration_seconds`, `sync_last_success_timestamp`,
+and `sync_last_status` — the last one labelled `source` + `status`, the rest
 labelled `source` only). Load them into
 Prometheus via the usual `rule_files:` entry in `prometheus.yml` (not wired
 into this repo's compose files yet — add
@@ -1316,6 +1330,30 @@ ingestion | grep '"source": "<name>"' | grep -E '"event": "page_(content|fetch)_
 to see which URLs are soft-failing and why (dead link vs. stub content) —
 same as the general soft-failure guidance under [Page Classification & Source
 Status Semantics](#page-classification--source-status-semantics).
+
+### Alert: ShellSuspectedRatioHigh
+
+Fires when `pages_shell_suspected_total` (T6's cross-page JS-shell detector —
+groups of same-source pages sharing a suspiciously short extraction length,
+logged as `js_shell_suspected`) exceeds **20%** of a source's total page
+volume in its last run, on a run with at least 20 total pages (`for: 15m`).
+`shell_suspected_count`/`pages_js_rendered` (T6/T7) previously reached only
+the `js_shell_suspected` log event and the `source_sync_complete` log line —
+no operator-facing surface exposed them, which is exactly how traefik's 42%
+loss to client-side rendering (117 of 280 pages) went unnoticed. This rule
+complements `SoftFailRatioHigh` above: `pages_shell_suspected_total` is a
+*subset* of `pages_soft_failed_total`, so a source can be losing a large
+share of its content specifically to JS shells while its overall soft-fail
+ratio still looks like ordinary site friction.
+
+**Triage:** `curl -sS http://localhost:8080/status | jq '."<name>"'` to see
+`shell_suspected_count` and `pages_js_rendered` alongside the other
+page-outcome counters — a large `shell_suspected_count` with `pages_js_rendered
+== 0` means the source is losing content to JS shells and NOT recovering any
+of it (either `js_render` isn't opted in for this source, or the renderer is
+failing/timing out — check `docker compose logs ingestion | grep
+js_render_retry_failed`). See [Headless-render retry
+(T7)](#headless-render-retry-t7) to opt the source into `js_render`.
 
 ### Alert: NoSyncMetricsAtAll
 
