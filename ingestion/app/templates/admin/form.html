@@ -12,32 +12,30 @@
     <div class="form-group">
       <label for="base_url" style="margin-top: 0;">Documentation URL</label>
       <input type="url" id="base_url" name="base_url" required value="{{ values.base_url or '' }}">
-      <p class="hint">The only thing we need. Name and crawl scope are derived from it.</p>
+      <p class="hint">The root URL of the documentation site to index.</p>
+    </div>
+
+    <div class="form-group">
+      <label for="name">Source Name</label>
+      {% if record %}
+      <input type="text" id="name" value="{{ values.name }}" disabled>
+      <p class="hint">Name is immutable after creation.</p>
+      {% else %}
+      <input type="text" id="name" name="name" required pattern="^[a-z0-9-]+$" value="{{ values.name or '' }}">
+      <p class="hint">Lowercase letters, digits, hyphens only (e.g. <code>fastapi</code>).</p>
+      {% endif %}
     </div>
 
     <details class="form-advanced" {% if record %}open{% endif %}>
       <summary class="form-advanced-toggle">
         <span class="form-advanced-marker" aria-hidden="true"></span>
-        Advanced settings<span class="muted"> — name, scope, limits, language</span>
+        Advanced settings<span class="muted"> — sitemap, scope, limits, language</span>
       </summary>
       <div class="form-advanced-body">
         <div class="form-section">
-          <div class="form-section-title">Identity</div>
-          <label for="name" style="margin-top: 0;">name</label>
-          {% if record %}
-          <input type="text" id="name" value="{{ values.name }}" disabled>
-          <p class="hint">name is immutable after creation.</p>
-          {% else %}
-          <input type="text" id="name" name="name" pattern="^[a-z0-9-]+$" value="{{ values.name or '' }}">
-          <p class="hint">lowercase letters, digits, hyphens only (e.g. <code>fastapi</code>). Leave blank to derive from the URL.</p>
-          {% endif %}
-
-          <label for="sitemap">sitemap (optional)</label>
-          <input type="url" id="sitemap" name="sitemap" value="{{ values.sitemap or '' }}">
-        </div>
-
-        <div class="form-section">
           <div class="form-section-title">Crawl Scope & Processing</div>
+          <label for="sitemap" style="margin-top: 0;">sitemap (optional)</label>
+          <input type="url" id="sitemap" name="sitemap" value="{{ values.sitemap or '' }}">
           <label for="include_prefixes" style="margin-top: 0;">include_prefixes (one per line, optional &mdash; empty allows everything)</label>
           <textarea id="include_prefixes" name="include_prefixes" rows="3">{{ values.include_prefixes or '' }}</textarea>
 

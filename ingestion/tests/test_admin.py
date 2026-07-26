@@ -457,28 +457,43 @@ def test_create_valid_input_calls_create_source_and_redirects(client, csrf_token
     assert create_mock.call_args.kwargs["proposed_by"] is None
 
 
-def test_create_url_only_derives_name_prefixes_and_max_pages(client, csrf_token, monkeypatch):
-    """POST of only {csrf_token, base_url} — the URL-first happy path —
-    must land as an active source with a derived name, derived
-    include_prefixes, and a real max_pages ceiling (never an empty
-    allow-whole-host list or an unbounded crawl)."""
+def test_create_without_name_returns_422(client, csrf_token, monkeypatch):
+    """POST without a name field must be rejected with 422 unprocessable entity,
+    as name and base_url are both required fields."""
     _login(client)
-    create_mock = MagicMock(return_value=42)
+    create_mock = MagicMock()
     monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
-    monkeypatch.setattr(admin.sources_repo, "list_sources", MagicMock(return_value=[]))
 
     resp = client.post(
         "/admin/sources/new",
         data={"csrf_token": csrf_token, "base_url": "https://docs.widget.example.com/guide/"},
         follow_redirects=False,
     )
+    assert resp.status_code == 422
+    create_mock.assert_not_called()
+
+
+def test_create_name_and_base_url_only_succeeds(client, csrf_token, monkeypatch):
+    """POST with only name and base_url — the primary fields — must succeed
+    and create an active source."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={
+            "csrf_token": csrf_token,
+            "name": "widget-docs",
+            "base_url": "https://docs.widget.example.com/guide/",
+        },
+        follow_redirects=False,
+    )
     assert resp.status_code == 303
     create_mock.assert_called_once()
     _conn, cfg = create_mock.call_args.args
     assert isinstance(cfg, SourceConfig)
-    assert cfg.name  # derived, non-empty
-    assert cfg.include_prefixes == ["/guide"]
-    assert cfg.max_pages == 500
+    assert cfg.name == "widget-docs"
 
 
 def test_create_duplicate_name_returns_400_not_500(client, csrf_token, monkeypatch):

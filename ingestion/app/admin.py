@@ -694,7 +694,7 @@ def new_source_form(request: Request, _auth=Depends(require_session)):
 @router.post("/sources/new", response_class=HTMLResponse)
 def create_source_submit(
     request: Request,
-    name: str = Form(default=""),
+    name: str = Form(...),
     base_url: str = Form(...),
     sitemap: str = Form(default=""),
     include_prefixes: str = Form(default=""),
@@ -719,13 +719,7 @@ def create_source_submit(
         "llms_txt": llms_txt,
         "js_render": bool(js_render),
     }
-    # `taken` must include names from EVERY status (a `rejected` row still
-    # holds its name — see `derive_name`'s docstring), so this reads all
-    # sources unfiltered. Only fetched when `name` is blank: an
-    # explicitly-supplied name never needs collision resolution, and this
-    # keeps the common "name already chosen" path from paying for a query
-    # it doesn't need.
-    taken: Collection[str] = set() if name.strip() else {r.name for r in sources_repo.list_sources(conn)}
+    taken: Collection[str] = set()
     cfg, error = _build_source_config(
         name=name,
         base_url=base_url,
