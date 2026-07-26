@@ -23,10 +23,15 @@ Two knowledge stores. Never mix them.
    data when a live doc source exists.
 2. **Never store project state in the docs index.** The docs pipeline
    ingests upstream documentation sites via sources configured in the
-   `doc_sources` table (Postgres, not `ingestion/config/sources.yaml` — that
-   file is only a one-way seed, imported once when
-   `IMPORT_SOURCES_YAML_ON_BOOT=1`) + `/sync`. Do not propose writing
-   decisions, task notes, or project-specific config into
+   `doc_sources` table in Postgres — the sole source of truth for crawl
+   config, populated via the admin UI, the MCP `propose_doc_source` tool
+   (which writes a `pending` row for human approval), or
+   `scripts/push_sources.py`, then run with `/sync`. `ingestion/config/` no
+   longer ships a `sources.yaml` seed file (it holds only a `.gitkeep` so the
+   Docker build has a directory to bind-mount); `sources_repo.import_from_yaml`
+   still exists and is still tested, but nothing in the codebase calls it —
+   it is a programmatic-only helper, not a wired-up boot path. Do not
+   propose writing decisions, task notes, or project-specific config into
    `doc_chunks`/`doc_sources` — that belongs in Mem0.
 3. **Never store framework/library syntax in Mem0.** If you learn a fact
    about how a library's API works, that fact belongs in the docs index
@@ -53,6 +58,10 @@ Two knowledge stores. Never mix them.
 
 ## Endpoint
 
-Remote MCP server (streamable HTTP), one shared instance for the whole LAN —
-see `docs/client-setup.md` for per-client config and `docs/runbook.md` for
-operations.
+Remote MCP server (streamable HTTP), one shared instance — LAN-wide reach
+depends on deployment: the base `docker-compose.yml` alone only publishes
+`mcp-server` on the host's loopback (`127.0.0.1:${DOCS_MCP_HOST_PORT:-8081}`);
+LAN-wide access requires the `docker-compose.prod.yml` Traefik overlay, which
+attaches `mcp-server` to the Traefik network and routes it by hostname
+(`DOCS_MCP_HOSTNAME`) with TLS termination. See `docs/client-setup.md` for
+per-client config and `docs/runbook.md` for operations.

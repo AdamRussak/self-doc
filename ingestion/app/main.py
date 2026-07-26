@@ -21,11 +21,16 @@ also not be a known placeholder/shipped-default value when any listener is
 non-loopback (see `app.security` and `SELF_DOCS_LISTENERS`); on a
 loopback-only deployment a placeholder warns instead of refusing.
 
-`doc_sources` (the database) is the source of truth for crawl config, NOT
-`sources.yaml` — see `app.sources_repo`. `sources.yaml` survives only as a
-one-way, opt-in seed/migration path (`_maybe_import_sources_yaml_on_boot`,
-gated by `IMPORT_SOURCES_YAML_ON_BOOT`); it is never read on any request
-path.
+`doc_sources` (the database) is the sole source of truth for crawl config —
+see `app.sources_repo`. There is no `sources.yaml` seed file anymore
+(`ingestion/config/` holds only a `.gitkeep` so the Docker build has a
+directory to bind-mount) and no boot-time import path: `sources_repo.
+import_from_yaml` still exists and is still exercised by
+`ingestion/tests/test_sources_repo.py`, but nothing in this module (or
+anywhere else) calls it — it is a programmatic-only helper, not wired into
+startup. Sources land in `doc_sources` via the admin UI, the MCP
+`propose_doc_source` tool (pending-row human approval), or
+`scripts/push_sources.py`.
 """
 
 from __future__ import annotations
