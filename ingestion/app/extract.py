@@ -28,6 +28,11 @@ class ExtractionResult:
     markdown: str | None
     status: str  # "ok" | "skipped" | "failed"
     reason: str | None = None
+    length: int = 0  # extracted-text length in chars, even when status != "ok"
+    # (used by store.sync_source to accumulate cross-page length-repetition
+    # evidence of a JS-rendered shell — see store.py's JS-shell-detection
+    # block. A single page's length says nothing on its own; extract.py just
+    # needs to hand the number up rather than recompute it.)
 
 
 def _bs4_fallback_text(html: str) -> str:
@@ -70,8 +75,15 @@ def extract(url: str, html: str, min_length: int = MIN_EXTRACTED_LENGTH) -> Extr
             used_fallback = True
 
     if not markdown or len(markdown.strip()) < min_length:
-        log.warning("extraction_too_short", length=len(markdown.strip()) if markdown else 0, used_fallback=used_fallback)
-        return ExtractionResult(url=url, markdown=None, status="skipped", reason="extracted content below minimum length")
+        final_length = len(markdown.strip()) if markdown else 0
+        log.warning("extraction_too_short", length=final_length, used_fallback=used_fallback)
+        return ExtractionResult(
+            url=url,
+            markdown=None,
+            status="skipped",
+            reason="extracted content below minimum length",
+            length=final_length,
+        )
 
     log.info("extraction_ok", length=len(markdown.strip()), used_fallback=used_fallback)
-    return ExtractionResult(url=url, markdown=markdown.strip(), status="ok")
+    return ExtractionResult(url=url, markdown=markdown.strip(), status="ok", length=len(markdown.strip()))

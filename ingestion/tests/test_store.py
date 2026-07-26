@@ -1594,3 +1594,161 @@ def test_sitemap_truncation_absent_summary_still_purges_normally(conn, second_co
     assert _existing_urls(second_conn, source.name) == set(existing_urls[:4])
 
 
+# --- T6: JS-shell detection --------------------------------------------------
+#
+# `_detect_js_shell_pages` is a pure function, so most of its behavior is
+# tested directly (no DB needed). `test_sync_source_flags_traefik_shaped_js_shell`
+# and `test_sync_source_does_not_flag_a_genuinely_short_page` below are the
+# DB-backed integration checks proving it's actually wired into `sync_source`.
+
+def test_detect_js_shell_pages_flags_traefik_shaped_repetition():
+    # Real traefik-run distribution: 115 pages @ 61 chars (the JS-shell
+    # stub), 2 pages @ 45 chars (must NOT be flagged -- below
+    # MIN_SHELL_SIBLING_COUNT), and a long tail of unique genuinely-short
+    # lengths that must also not be flagged.
+    short_extractions = [(f"https://doc.traefik.io/shell-{i}", 61) for i in range(115)]
+    short_extractions += [(f"https://doc.traefik.io/coincidence-{i}", 45) for i in range(2)]
+    for i, length in enumerate([140, 142, 142, 152, 162, 162, 163, 163, 167, 179, 179, 180, 183, 185, 196, 196, 197]):
+        short_extractions.append((f"https://doc.traefik.io/short-{i}", length))
+
+    groups = store._detect_js_shell_pages(short_extractions)
+
+    assert set(groups.keys()) == {61}
+    assert len(groups[61]) == 115
+
+
+def test_detect_js_shell_pages_requires_min_sibling_count():
+    # Exactly at the threshold - 1 (2 siblings) must not be flagged; the
+    # traefik run's own real "45 x 2" pair sits here.
+    short_extractions = [("https://x/a", 45), ("https://x/b", 45)]
+    assert store._detect_js_shell_pages(short_extractions) == {}
+
+    # Exactly at the threshold (3 siblings) must be flagged.
+    short_extractions.append(("https://x/c", 45))
+    groups = store._detect_js_shell_pages(short_extractions)
+    assert groups == {45: ["https://x/a", "https://x/b", "https://x/c"]}
+
+
+def test_detect_js_shell_pages_does_not_flag_single_genuinely_short_page():
+    short_extractions = [("https://x/lonely", 140)]
+    assert store._detect_js_shell_pages(short_extractions) == {}
+
+
+def test_detect_js_shell_pages_exact_length_match_no_tolerance():
+    # Near-but-not-identical lengths (162/163, 196/197 in the real
+    # distribution) must be treated as separate groups, not merged by a
+    # fuzzy tolerance window -- see the MIN_SHELL_SIBLING_COUNT module
+    # comment for why tolerance is deliberately 0.
+    short_extractions = [
+        ("https://x/a", 162), ("https://x/b", 162), ("https://x/c", 162),
+        ("https://x/d", 163), ("https://x/e", 163), ("https://x/f", 163),
+    ]
+    groups = store._detect_js_shell_pages(short_extractions)
+    assert set(groups.keys()) == {162, 163}
+    assert len(groups[162]) == 3
+    assert len(groups[163]) == 3
+
+
+def test_sync_source_flags_traefik_shaped_js_shell(conn, monkeypatch):
+    """Integration: a source where 5 pages extract to the identical 61-char
+    JS-shell stub length gets `shell_suspected_count` set on the outcome
+    (MIN_SHELL_SIBLING_COUNT=3 is used here, not the real run's 115, to keep
+    the fixture small -- the grouping logic is length-count agnostic above
+    the threshold, exercised at full scale by the unit test above)."""
+    source = make_source()
+
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(5)]
+    good_url = "https://docs-fixture.dev/real-page"
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html><body><div id='app'></div></body></html>"}
+        yield {"url": good_url, "html": PAGE_MD}
+
+    from app.extract import ExtractionResult
+
+    def fake_extract(url, html):
+        if url in shell_urls:
+            # Same static JS-shell stub template on every route -> identical length.
+            return ExtractionResult(
+                url=url, markdown=None, status="skipped",
+                reason="extracted content below minimum length", length=61,
+            )
+        return ExtractionResult(url=url, markdown=html, status="ok", length=len(html))
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.pages_soft_failed == 5
+    assert outcome.shell_suspected_count == 5
+    assert outcome.status == "partial"
+
+
+def test_sync_source_does_not_flag_a_genuinely_short_page(conn, monkeypatch):
+    """A single genuinely-short 140-char page (below MIN_SHELL_SIBLING_COUNT,
+    no siblings at all) must NOT be counted as shell-suspected."""
+    source = make_source()
+
+    def fake_crawl(source, client=None):
+        yield {"url": "https://docs-fixture.dev/short-real", "html": "<html><body><p>short</p></body></html>"}
+        yield {"url": "https://docs-fixture.dev/real-page", "html": PAGE_MD}
+
+    from app.extract import ExtractionResult
+
+    def fake_extract(url, html):
+        if url == "https://docs-fixture.dev/short-real":
+            return ExtractionResult(
+                url=url, markdown=None, status="skipped",
+                reason="extracted content below minimum length", length=140,
+            )
+        return ExtractionResult(url=url, markdown=html, status="ok", length=len(html))
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.pages_soft_failed == 1
+    assert outcome.shell_suspected_count == 0
+
+
+def test_sync_source_js_shell_emits_distinct_warning_event(conn, monkeypatch):
+    """`js_shell_suspected` must be emitted (at warning level) as its own
+    event, distinct from -- not a replacement for -- `page_content_skipped`,
+    and must carry the repeated length and sibling count."""
+    import structlog.testing
+
+    source = make_source()
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(4)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html><body><div id='app'></div></body></html>"}
+
+    from app.extract import ExtractionResult
+
+    def fake_extract(url, html):
+        return ExtractionResult(
+            url=url, markdown=None, status="skipped",
+            reason="extracted content below minimum length", length=61,
+        )
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    with structlog.testing.capture_logs() as logs:
+        store.sync_source(source, conn)
+
+    shell_events = [e for e in logs if e.get("event") == "js_shell_suspected"]
+    assert len(shell_events) == 4
+    for e in shell_events:
+        assert e["log_level"] == "warning"
+        assert e["length"] == 61
+        assert e["sibling_count"] == 4
+
+    content_skipped_events = [e for e in logs if e.get("event") == "page_content_skipped"]
+    assert len(content_skipped_events) == 4
+
+

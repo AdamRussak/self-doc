@@ -123,6 +123,64 @@ PURGE_RATIO_GUARD_MIN_EXISTING_PAGES = 20
 # all counts".
 SOFT_FAIL_PARTIAL_RATIO = 0.2
 
+# --- JS-shell detection (T6) -------------------------------------------------
+#
+# Same traefik incident, a level deeper: `extraction_too_short` already
+# reported all 117 soft failures, but flattened two very different failure
+# modes into one bucket. 115 of those 117 extracted to EXACTLY 61 characters
+# — an identical byte length recurring across unrelated URLs, which is not
+# a property genuinely-short-but-real pages have (their lengths scatter:
+# 140, 142, 152, 162, 163, 167, 179, 180, 183, 185, 196, 197 in the same
+# run). An identical length across many pages is the fingerprint of a
+# client-side-rendered shell: the server returns the same static
+# HTML/noscript template for every route, so trafilatura/BS4 extract
+# byte-for-byte the same stub text no matter which URL was requested.
+#
+# The signal is inherently CROSS-PAGE — a single 61-char page is
+# indistinguishable from a genuinely tiny page (see the "45 x 2" pair below,
+# which must NOT be flagged). It only becomes conclusive once enough *other*
+# pages in the SAME source land on the exact same length, so detection has
+# to accumulate every soft-failed page's length across the whole crawl and
+# only classify at the end of `sync_source`'s per-source loop — it cannot
+# live in `extract.py`, which only ever sees one page at a time.
+#
+# MIN_SHELL_SIBLING_COUNT = 3: the real run's own false-candidate — 45 chars
+# recurring on exactly 2 pages — is *not* a shell (two unrelated pages can
+# coincidentally land on the same short length), so the threshold must
+# clear 2. Requiring 3 does that with a full page of margin while still
+# catching the real incident (61 chars x 115) by nearly two orders of
+# magnitude, and it comfortably ignores the singleton lengths (140 x 1, 152
+# x 1, ...) in the long tail of genuinely-short pages.
+#
+# Length-match tolerance = 0 (exact match, not a +/- N window): a shell page
+# is the literal same static template re-served for every route, so
+# extraction produces a byte-identical length every time — there is no
+# reason for two real shell pages to differ even by one character. Grouping
+# by exact length (rather than a fuzzy window) also avoids accidentally
+# lumping together unrelated genuinely-short pages that merely happen to
+# sit close to each other (e.g. 162 and 163, or 196 and 197 above) into a
+# false shell group.
+MIN_SHELL_SIBLING_COUNT = 3
+
+
+def _detect_js_shell_pages(
+    short_extractions: list[tuple[str, int]],
+    *,
+    min_sibling_count: int = MIN_SHELL_SIBLING_COUNT,
+) -> dict[int, list[str]]:
+    """Group `short_extractions` — `(url, length)` pairs for every page that
+    soft-failed this sync's extraction as too-short — by their EXACT
+    extracted length, and return only the length groups that meet
+    `min_sibling_count` (see the module-level comment above for why exact
+    length-matching and this threshold were chosen). A length appearing on
+    fewer than `min_sibling_count` pages is left out entirely — it's treated
+    as an ordinary genuinely-short page, not shell evidence.
+    """
+    by_length: dict[int, list[str]] = {}
+    for url, length in short_extractions:
+        by_length.setdefault(length, []).append(url)
+    return {length: urls for length, urls in by_length.items() if len(urls) >= min_sibling_count}
+
 
 def get_dsn() -> str:
     """Build a libpq keyword/value DSN from the standard Postgres env vars."""
@@ -175,6 +233,7 @@ class SourceOutcome:
     pages_soft_failed: int = 0  # pages skipped due to expected site quirks (e.g. 404/503 fetch, stub/placeholder content)
     pages_removed: int = 0  # pages deleted because absent from this crawl
     chunks_indexed: int = 0
+    shell_suspected_count: int = 0  # of pages_soft_failed, how many are suspected JS-shell stubs (T6)
     status: str = "ok"  # ok | partial | failed
     error: str | None = None
 
@@ -626,6 +685,11 @@ def sync_source(
     llms_unchanged = False
     crawl_truncated = False
     unprocessed_child_sitemaps = 0
+    # (url, extracted length) for every page soft-failed this run as
+    # too-short — accumulated across the whole crawl so it can be examined
+    # for cross-page length repetition (JS-shell detection, T6) once the
+    # loop below finishes. See the `MIN_SHELL_SIBLING_COUNT` comment.
+    short_extraction_lengths: list[tuple[str, int]] = []
 
     try:
         # `crawl()` is a generator: pages are pulled and committed one at a
@@ -704,6 +768,7 @@ def sync_source(
                     extraction = extract.extract(url, html)
                     if extraction.status != "ok":
                         outcome.pages_soft_failed += 1
+                        short_extraction_lengths.append((url, extraction.length))
                         log.warning("page_content_skipped", url=url, reason=extraction.reason)
                         if progress_cb:
                             progress_cb(outcome, url)
@@ -759,6 +824,22 @@ def sync_source(
         close = getattr(page_iter, "close", None)
         if close is not None:
             close()
+
+    # JS-shell detection (T6): only possible now, with every page's
+    # extraction outcome for this source in hand — see
+    # `_detect_js_shell_pages`'s docstring and the `MIN_SHELL_SIBLING_COUNT`
+    # comment above for why this can't run per-page. Runs unconditionally
+    # (including the `llms_unchanged` early-return path below) since
+    # `short_extraction_lengths` is simply empty when no pages were
+    # extracted this run.
+    for length, urls in _detect_js_shell_pages(short_extraction_lengths).items():
+        for suspect_url in urls:
+            log.bind(url=suspect_url).warning(
+                "js_shell_suspected",
+                length=length,
+                sibling_count=len(urls),
+            )
+        outcome.shell_suspected_count += len(urls)
 
     if llms_unchanged:
         # The llms-index 304'd as a whole: nothing about the source changed,
@@ -855,6 +936,7 @@ def sync_source(
         pages_soft_failed=outcome.pages_soft_failed,
         pages_removed=outcome.pages_removed,
         chunks_indexed=outcome.chunks_indexed,
+        shell_suspected_count=outcome.shell_suspected_count,
         crawl_truncated=crawl_truncated,
     )
     return outcome
