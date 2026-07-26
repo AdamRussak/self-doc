@@ -1397,4 +1397,50 @@ def test_pages_not_modified_appears_in_sync_complete_log(conn, monkeypatch):
     assert complete_events[0]["pages_not_modified"] == 1
 
 
+def test_page_unchanged_skip_is_not_logged_at_info(conn, monkeypatch):
+    """`page_unchanged_skip` fires on every hash-unchanged page (4,006 times
+    in a real 40-source sync — 32% of total log volume) and its per-source
+    rollup already appears in `source_sync_complete.pages_skipped`. It must
+    log at `debug`, not `info`, so it doesn't bury genuine failures."""
+    source = make_source()
+
+    class _LeveledRecordingLog:
+        def __init__(self):
+            self.events: list[tuple[str, str, dict]] = []  # (level, event, fields)
+
+        def _record(self, level, event, **kwargs):
+            self.events.append((level, event, kwargs))
+
+        def info(self, event, **kwargs):
+            self._record("info", event, **kwargs)
+
+        def warning(self, event, **kwargs):
+            self._record("warning", event, **kwargs)
+
+        def debug(self, event, **kwargs):
+            self._record("debug", event, **kwargs)
+
+        def error(self, event, **kwargs):
+            self._record("error", event, **kwargs)
+
+        def bind(self, **kwargs):
+            return self
+
+    log_stub = _LeveledRecordingLog()
+    monkeypatch.setattr(store, "logger", log_stub)
+
+    _fake_crawl_extract(monkeypatch, {"https://example.com/a": PAGE_MD})
+    outcome1 = store.sync_source(source, conn)
+    assert outcome1.pages_fetched == 1
+
+    # Second sync of identical content triggers the hash-unchanged skip path.
+    outcome2 = store.sync_source(source, conn)
+    assert outcome2.pages_skipped == 1
+
+    unchanged_events = [(level, kw) for level, evt, kw in log_stub.events if evt == "page_unchanged_skip"]
+    assert len(unchanged_events) == 1
+    level, _ = unchanged_events[0]
+    assert level == "debug"
+    assert level != "info"
+
 

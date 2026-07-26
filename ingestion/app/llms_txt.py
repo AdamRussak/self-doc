@@ -82,7 +82,7 @@ def _fetch_body(client, url: str, log) -> str | None:
         log.info("llms_txt_fetch_failed", url=url, error=str(e))
         return None
     if resp.status_code != 200:
-        log.info("llms_txt_non_200", url=url, status=resp.status_code)
+        log.debug("llms_txt_non_200", url=url, status=resp.status_code)
         return None
     text = resp.text
     if not text.strip():

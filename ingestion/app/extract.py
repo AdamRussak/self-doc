@@ -70,7 +70,7 @@ def extract(url: str, html: str, min_length: int = MIN_EXTRACTED_LENGTH) -> Extr
             used_fallback = True
 
     if not markdown or len(markdown.strip()) < min_length:
-        log.info("extraction_too_short", length=len(markdown.strip()) if markdown else 0, used_fallback=used_fallback)
+        log.warning("extraction_too_short", length=len(markdown.strip()) if markdown else 0, used_fallback=used_fallback)
         return ExtractionResult(url=url, markdown=None, status="skipped", reason="extracted content below minimum length")
 
     log.info("extraction_ok", length=len(markdown.strip()), used_fallback=used_fallback)

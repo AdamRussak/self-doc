@@ -208,7 +208,7 @@ def discover_sitemap_urls(
         truncation=truncation,
     )
     if truncation["truncated"]:
-        log.info(
+        log.warning(
             "sitemap_truncated_at_cap",
             cap=max_pages,
             collected=len(collected),
@@ -304,7 +304,7 @@ def _discover_sitemap_urls_recursive(
                     truncation=truncation,
                 )
             except (httpx.HTTPError, ValueError, ElementTree.ParseError) as e:
-                log.info("child_sitemap_failed", sitemap_url=child_url, error=str(e))
+                log.warning("child_sitemap_failed", sitemap_url=child_url, error=str(e))
                 continue
             for u in child_urls:
                 if u not in collected:
@@ -540,11 +540,11 @@ def crawl(
                 discovered = llms_txt.discover(client, base_url)
 
             if discovered is not None and not _looks_like_llms_txt(discovered[1]):
-                log.info("llms_txt_content_sanity_check_failed", url=discovered[0])
+                log.warning("llms_txt_content_sanity_check_failed", url=discovered[0])
                 if discovered[0].endswith("/llms-full.txt"):
                     discovered = llms_txt.discover(client, base_url, prefer_full=False)
                     if discovered is not None and not _looks_like_llms_txt(discovered[1]):
-                        log.info("llms_txt_content_sanity_check_failed", url=discovered[0])
+                        log.warning("llms_txt_content_sanity_check_failed", url=discovered[0])
                         discovered = None
                 else:
                     discovered = None
@@ -627,7 +627,7 @@ def crawl(
                 )
                 log.info("sitemap_discovered", count=len(candidate_urls))
             except (httpx.HTTPError, ElementTree.ParseError, ValueError) as e:
-                log.info("sitemap_failed_fallback_bfs", error=str(e))
+                log.warning("sitemap_failed_fallback_bfs", error=str(e))
                 candidate_urls = None
 
         def _visit(url: str) -> dict | None:
@@ -671,7 +671,7 @@ def crawl(
                     break
                 location = resp.headers.get("location", "").strip()
                 if not location:
-                    log.info("redirect_rejected", url=url, final_url=current_url, reason="no_location")
+                    log.warning("redirect_rejected", url=url, final_url=current_url, reason="no_location")
                     return {"url": url, "html": None, "fetch_ok": False}
                 next_url = _strip_fragment(urljoin(current_url, location))
                 if not _validate_final_url(
@@ -682,15 +682,15 @@ def crawl(
                 ):
                     # Refused BEFORE issuing the hop, so the request to a
                     # private/off-host target is never sent at all.
-                    log.info("redirect_rejected", url=url, final_url=next_url)
+                    log.warning("redirect_rejected", url=url, final_url=next_url)
                     return {"url": url, "html": None, "fetch_ok": False}
                 current_url = next_url
             else:
-                log.info("redirect_rejected", url=url, final_url=current_url, reason="too_many_redirects")
+                log.warning("redirect_rejected", url=url, final_url=current_url, reason="too_many_redirects")
                 return {"url": url, "html": None, "fetch_ok": False}
             duration_ms = round((time.monotonic() - start) * 1000, 1)
             if resp.status_code != 200:
-                log.info("page_fetch_non_200", url=url, status=resp.status_code, duration_ms=duration_ms)
+                log.warning("page_fetch_non_200", url=url, status=resp.status_code, duration_ms=duration_ms)
                 return {"url": url, "html": None, "fetch_ok": False}
             final_url = str(resp.url)
             if not _validate_final_url(
@@ -699,7 +699,7 @@ def crawl(
                 source.include_prefixes,
                 source.exclude_prefixes,
             ):
-                log.info("redirect_rejected", url=url, final_url=final_url)
+                log.warning("redirect_rejected", url=url, final_url=final_url)
                 return {"url": url, "html": None, "fetch_ok": False}
             log.info("page_fetched", url=url, duration_ms=duration_ms)
             item = {"url": url, "html": resp.text, "fetch_ok": True}

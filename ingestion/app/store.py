@@ -633,7 +633,7 @@ def sync_source(
             if not page.get("fetch_ok", True):
                 fetch_failed_urls.add(url)
                 outcome.pages_soft_failed += 1
-                log.info("page_fetch_skipped", url=url)
+                log.warning("page_fetch_skipped", url=url)
                 if progress_cb:
                     progress_cb(outcome, url)
                 continue
@@ -655,7 +655,7 @@ def sync_source(
                     extraction = extract.extract(url, html)
                     if extraction.status != "ok":
                         outcome.pages_soft_failed += 1
-                        log.info("page_content_skipped", url=url, reason=extraction.reason)
+                        log.warning("page_content_skipped", url=url, reason=extraction.reason)
                         if progress_cb:
                             progress_cb(outcome, url)
                         continue
@@ -667,7 +667,7 @@ def sync_source(
                 existing_hash = get_existing_page_hash(conn, url)
                 if existing_hash == content_hash:
                     outcome.pages_skipped += 1
-                    log.info("page_unchanged_skip", url=url)
+                    log.debug("page_unchanged_skip", url=url)
                     if page.get("etag") or page.get("last_modified"):
                         # Refresh validators even though the content itself
                         # didn't change, so a future sync can issue a

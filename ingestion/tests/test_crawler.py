@@ -776,14 +776,26 @@ def _test_log():
 
 class _RecordingLog:
     """Minimal structlog-shaped stub that records `.info(event, **fields)`
-    calls so tests can assert on which log events fired without depending
-    on stdout capture."""
+    (and `.warning`/`.debug`) calls so tests can assert on which log events
+    fired without depending on stdout capture."""
 
     def __init__(self):
         self.events: list[tuple[str, dict]] = []
 
-    def info(self, event, **kwargs):
+    def _record(self, event, **kwargs):
         self.events.append((event, kwargs))
+
+    def info(self, event, **kwargs):
+        self._record(event, **kwargs)
+
+    def warning(self, event, **kwargs):
+        self._record(event, **kwargs)
+
+    def debug(self, event, **kwargs):
+        self._record(event, **kwargs)
+
+    def error(self, event, **kwargs):
+        self._record(event, **kwargs)
 
     def bind(self, **kwargs):
         return self

@@ -15,8 +15,18 @@ import logging
 import sys
 
 import structlog
+from structlog.tracebacks import ExceptionDictTransformer
 
 _CONFIGURED = False
+
+# `show_locals=False`: dict_tracebacks' default (True) would dump every stack
+# frame's local variables into the JSON payload. In this codebase that can
+# include request objects carrying SYNC_TOKEN/Authorization headers or raw
+# page bodies — logging locals would violate the "never log secrets or PII"
+# rule above. Frame/file/line/exception type+message are still captured.
+_structured_traceback = structlog.processors.ExceptionRenderer(
+    ExceptionDictTransformer(show_locals=False)
+)
 
 
 def configure_logging(service: str = "ingestion", level: int = logging.INFO) -> None:
@@ -40,7 +50,7 @@ def configure_logging(service: str = "ingestion", level: int = logging.INFO) -> 
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", key="ts"),
             structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
+            _structured_traceback,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
