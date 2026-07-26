@@ -36,6 +36,22 @@ DEFAULT_PASSAGE_PROMPT = ""
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", str(DEFAULT_EMBEDDING_DIM)))
 PASSAGE_PROMPT = os.environ.get("EMBEDDING_PASSAGE_PROMPT", DEFAULT_PASSAGE_PROMPT)
+# ORT_NUM_THREADS caps ONNX Runtime's intra-op/inter-op thread pools. FastEmbed's
+# TextEmbedding forwards a `threads` kwarg (when given) straight into
+# onnxruntime.SessionOptions.intra_op_num_threads / inter_op_num_threads before
+# creating the InferenceSession (see fastembed.common.onnx_model.OnnxModel.
+# _load_onnx_model). Without it, ORT sizes its intra-op pool to every logical
+# CPU the process can see, ignoring cgroup CPU quota — which is what made the
+# docker-compose ORT_NUM_THREADS env var silently ineffective (it isn't a real
+# ORT env var; only SessionOptions set in code has any effect). Default of 4
+# matches the docker-compose value. 4 is a measured tradeoff, not a guess:
+# benchmarked on mxbai-large over 80 x ~300-word chunks at batch_size 8,
+# throughput was 1.37 chunks/s unbounded, 0.95 at threads=4 (1.44x slower),
+# and 0.59 at threads=2 (2.3x slower). Against a ~3.5h full-sync baseline
+# that is roughly 5.0h at 4 and 8.1h at 2 — do not lower this without
+# re-benchmarking.
+DEFAULT_ORT_THREADS = 4
+ORT_NUM_THREADS = int(os.environ.get("ORT_NUM_THREADS", str(DEFAULT_ORT_THREADS)))
 # Batch size for ONNX inference. mxbai-large (1024-dim) allocates substantial ONNX
 # workspace memory per chunk; batch_size=8 keeps peak RAM usage safely under 1.5GB
 # during multi-chunk page embedding, preventing cgroup OOM kills on 2GB limits.
@@ -52,8 +68,8 @@ def get_model() -> TextEmbedding:
     global _model
     with _model_lock:
         if _model is None:
-            logger.info("loading_embedding_model", model=MODEL_NAME)
-            _model = TextEmbedding(model_name=MODEL_NAME)
+            logger.info("loading_embedding_model", model=MODEL_NAME, threads=ORT_NUM_THREADS)
+            _model = TextEmbedding(model_name=MODEL_NAME, threads=ORT_NUM_THREADS)
         return _model
 
 

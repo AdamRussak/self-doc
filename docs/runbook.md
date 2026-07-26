@@ -185,6 +185,174 @@ checklist that prevents the failure mode in the first place).
 
 ---
 
+## Rotate `SYNC_TOKEN`
+
+`SYNC_TOKEN` is **one shared bearer secret guarding every privileged surface
+on the `ingestion` service**:
+
+| Surface | Effect if the token leaks |
+| --- | --- |
+| `POST /sync`, `POST /refresh` | Attacker triggers arbitrary crawls (CPU, bandwidth, upstream rate-limit bans) |
+| `POST /purge` | **Destructive** — deletes indexed pages |
+| `GET/POST /admin/*` (login) | Full CRUD over `doc_sources`, including `POST /admin/sources/{id}/delete` |
+
+Rotate it when: it was ever set to a placeholder (`change-me` and friends —
+see below); it was pasted into a chat/issue/log/screenshot; a laptop or
+`.env` backup with it went missing; an admin **session cookie** may have
+leaked (the cookie is a deterministic function of `SYNC_TOKEN`, so rotation is
+the *only* revocation mechanism — see "Admin UI" below); or an operator with
+access left. Otherwise, on a routine schedule.
+
+### Is my token a placeholder?
+
+Since the boot-time check landed, `ingestion` inspects `SYNC_TOKEN` at import
+time, before uvicorn binds a socket:
+
+- **Any non-loopback listener declared in `SELF_DOCS_LISTENERS` + a
+  placeholder token → the container refuses to start**, printing a `FATAL`
+  line to stderr that names the offending listener and the fix. This is the
+  production case: `docker-compose.prod.yml` sets `SELF_DOCS_LISTENERS` to its
+  Traefik hostname, so a Traefik-exposed deployment cannot boot on `change-me`.
+- **Loopback-only + a placeholder token → it boots but prints a `WARNING`**,
+  so a working local `make up` is never broken by this check. Find it with:
+
+  ```bash
+  docker compose logs ingestion | grep -i 'placeholder'
+  ```
+
+The placeholder list lives in `ingestion/app/security.py`
+(`_PLACEHOLDER_TOKENS` / `_PLACEHOLDER_PREFIXES`) and covers `change-me`,
+`changeme`, `REPLACE_ME_*`, `secret`, `password`, quoting/case/underscore
+variants, and similar. It is an exact/prefix match list, **not** an entropy
+check: a short-but-real token is accepted, so passing the check is not the
+same as having a *strong* token. Always generate.
+
+### Procedure
+
+Budget a short window: steps 3–4 break every client that still sends the old
+token, and step 5 logs every admin session out.
+
+1. **Generate a strong token.** 32 bytes of CSPRNG output, hex-encoded:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+   Equivalent if `openssl` is unavailable:
+
+   ```bash
+   python3 -c 'import secrets; print(secrets.token_hex(32))'
+   ```
+
+   Do not hand-write one, do not reuse `MCP_TOKEN`, and do not reuse a token
+   from another service. Keep it out of shell history — on `zsh`/`bash`, a
+   leading space with `HIST_IGNORE_SPACE`/`HISTCONTROL=ignorespace` set, or
+   pipe it straight into your password manager.
+
+2. **Update `.env` on the Docker host** (the only authoritative copy;
+   `.env` is gitignored and must stay that way):
+
+   ```
+   SYNC_TOKEN=<the generated value>
+   ```
+
+   Nothing else in the repo needs editing — `docker-compose.yml` interpolates
+   `SYNC_TOKEN: ${SYNC_TOKEN}` from `.env`.
+
+3. **Update every consumer that stores the value.** `SYNC_TOKEN` is the
+   *ingestion/admin* token, so its blast radius is narrower than `MCP_TOKEN`,
+   but check all of these:
+
+   - **Humans logging into `/admin`** — the login form takes the raw
+     `SYNC_TOKEN`. Tell whoever uses it; a stale value just fails to log in.
+   - **`doc-cli`** — reads `API_TOKEN` / `SYNC_TOKEN` / `MCP_TOKEN` from the
+     environment or `--token` (`cli/cmd/root.go`). Update whatever exports it
+     (shell profile, direnv `.envrc`, systemd unit, CI secret).
+   - **`scripts/push_sources.py`** — takes `--token` or `$SYNC_TOKEN`.
+   - **`make sync`** — reads `SYNC_TOKEN` from `.env` automatically, so it
+     picks up the new value with no extra action.
+   - **Any cron/CI job or monitoring probe** that curls `/sync`, `/refresh`,
+     `/purge`, or `/status` with an `Authorization: Bearer` header.
+   - **MCP client configs (`docs/client-setup.md`)** — these send
+     **`MCP_TOKEN`**, not `SYNC_TOKEN`, and are therefore *unaffected* by this
+     rotation. If you are rotating `MCP_TOKEN` instead (or both), every client
+     in `docs/client-setup.md` (Claude Code, Cursor, Antigravity, …) must have
+     its `Authorization: Bearer <MCP_TOKEN>` header updated, and they should be
+     updated **before** the container restart to avoid a window of `401`s.
+
+4. **Restart `ingestion` to pick up the new environment.** A restart is
+   required — the value is read once at import time, so `docker compose
+   restart` on a container whose env was changed in `.env` is not enough;
+   recreate it:
+
+   ```bash
+   docker compose up -d ingestion
+   # production (Traefik overlay):
+   # docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile full up -d ingestion
+   ```
+
+5. **Know that rotation invalidates every existing admin session.** The
+   `/admin` session cookie and the CSRF token are
+   `HMAC-SHA256(SYNC_TOKEN, "session-v1")` / `…"csrf-v1"` — deterministic
+   functions of the token, with no server-side session store. Changing
+   `SYNC_TOKEN` changes both, so:
+
+   - Every logged-in browser is logged out at the next request and must
+     re-login at `/admin/login` with the **new** token.
+   - Any in-flight admin form POST will fail CSRF validation; redo it after
+     re-login.
+   - This is exactly why rotation is the remediation for a leaked admin
+     cookie: there is no other revocation path.
+
+6. **Verify.** The old token must be rejected and the new one accepted:
+
+   ```bash
+   # expect 401
+   curl -s -o /dev/null -w '%{http_code}\n' \
+     -H "Authorization: Bearer <the OLD value>" \
+     http://127.0.0.1:8080/sync -X POST
+
+   # expect 200/202/409 (409 = a sync is already running; still proves auth passed)
+   curl -s -o /dev/null -w '%{http_code}\n' \
+     -H "Authorization: Bearer $SYNC_TOKEN" \
+     http://127.0.0.1:8080/sync -X POST
+   ```
+
+   And confirm the container came up clean, with no placeholder warning:
+
+   ```bash
+   docker compose ps ingestion
+   docker compose logs --tail=50 ingestion | grep -iE 'FATAL|WARNING|placeholder'
+   ```
+
+7. **Destroy the old value.** Delete it from your password manager's active
+   entry (keep it only in that entry's history if you need an audit trail),
+   from shell history, and from any scratch file. If it was ever committed to
+   git, rotating is necessary but **not sufficient** — the value stays in the
+   history for anyone with a clone; treat that as a separate incident.
+
+### `SELF_DOCS_LISTENERS`
+
+The boot check cannot see its own exposure — inside the container uvicorn
+always binds `0.0.0.0:8080`, and reachability is decided by the compose
+`ports:` mapping and by any reverse proxy. So the compose layer declares it:
+
+| File | Value | Placeholder token behavior |
+| --- | --- | --- |
+| `docker-compose.yml` | `127.0.0.1:8080` | warn, boots |
+| `docker-compose.prod.yml` | `127.0.0.1:8080,https://${DOCS_MCP_HOSTNAME}/api/v1` | **refuses to boot** |
+| unset | defaults to `127.0.0.1` | warn, boots |
+
+**If you expose `ingestion` by any means other than the prod overlay** — your
+own nginx/caddy, an extra published port, a VPN interface — add that address
+to `SELF_DOCS_LISTENERS` in `.env`, or the check will keep only warning while
+the service is in fact reachable. The unset default is permissive on purpose
+(it must not break existing loopback-only installs), which means this check is
+**advisory for hand-rolled ingress and enforcing only where exposure is
+declared**.
+
+---
+
 ## Add a new doc source
 
 **`doc_sources` in Postgres is the source of truth for crawl config —
@@ -292,17 +460,28 @@ human-in-the-loop admin-UI step.
 Server-rendered CRUD UI over `doc_sources`, mounted at `/admin` on the
 `ingestion` service.
 
-**Exposure: loopback only, by design.** `docker-compose.yml` publishes
-`ingestion` as `127.0.0.1:8080:8080` — bound to the Docker host's loopback
-interface, not `0.0.0.0` — and there is **no Traefik router for
-`ingestion`** (only `mcp-server` gets a Traefik label; see
-`docker-compose.prod.yml`). This is a **deliberate security property, not an
-oversight**: the admin UI can create/edit/delete crawl targets and trigger
-crawls, so it is reachable only from the Docker host itself (SSH tunnel or
-sitting at the box), never from the LAN or the internet through Traefik. Do
-not add a Traefik router for it as a "convenience" without re-running the
-security review — that would turn a host-local admin surface into a
-network-reachable one.
+**Exposure: loopback only on the base compose file, by design.**
+`docker-compose.yml` publishes `ingestion` as `127.0.0.1:8080:8080` — bound to
+the Docker host's loopback interface, not `0.0.0.0`. This is a **deliberate
+security property, not an oversight**: the admin UI can create/edit/delete
+crawl targets and trigger crawls, so on `make up` it is reachable only from
+the Docker host itself (SSH tunnel or sitting at the box). Do not publish it
+on `0.0.0.0` as a "convenience" without re-running the security review.
+
+> **Open discrepancy — verify on your own deployment before trusting the
+> paragraph above.** This section previously claimed there is "no Traefik
+> router for `ingestion`". That is **not true of `docker-compose.prod.yml`**,
+> which attaches `ingestion` to the external Traefik network and declares
+> `Host(${DOCS_MCP_HOSTNAME}) && PathPrefix(/api/v1)` with rate-limit
+> middleware. Today no application route lives under `/api/v1` (the app serves
+> `/sync`, `/admin`, … at the root), so `/admin` is not believed to be
+> reachable through that router — but that is an accident of path prefixes,
+> not an enforced boundary, and it would silently stop holding the moment
+> anyone mounts the app under `/api/v1`, adds a `stripprefix` middleware, or
+> broadens the rule. If you run the prod overlay, confirm from **off-box**
+> that `https://<DOCS_MCP_HOSTNAME>/admin/login` and
+> `https://<DOCS_MCP_HOSTNAME>/api/v1/purge` are not served, and treat this as
+> an open item rather than a settled one.
 
 **Auth.** `GET /admin/login` renders a form; paste `SYNC_TOKEN` (the same
 token `POST /sync` already requires) into it. On success you get an
@@ -330,7 +509,8 @@ server-side session store. This means:
   (browser history, a shared log line, XSS on some other page sharing the
   browser profile), it remains valid indefinitely until you rotate the
   token. Treat a suspected admin-cookie leak exactly like a suspected
-  `SYNC_TOKEN` leak: rotate `SYNC_TOKEN` in `.env` and restart `ingestion`.
+  `SYNC_TOKEN` leak: rotate `SYNC_TOKEN` in `.env` and restart `ingestion` —
+  full procedure in "Rotate `SYNC_TOKEN`" above.
 
 ---
 

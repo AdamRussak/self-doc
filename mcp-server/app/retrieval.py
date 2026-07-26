@@ -32,6 +32,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
+from app.source_defaults import apply_creation_defaults
+
 logger = structlog.get_logger(__name__)
 
 # Model, and the per-model QUERY prompt, are env-driven (set by `make configure`
@@ -505,7 +507,7 @@ RETURNING id;
 
 def propose_source(
     *,
-    name: str,
+    name: str | None = None,
     base_url: str,
     max_pages: int | None = None,
     sitemap: str | None = None,
@@ -518,6 +520,18 @@ def propose_source(
     """Validate a proposed source via `ProposedSourceConfig` and insert a
     `status='pending'` `doc_sources` row, returning its id.
 
+    `name` is OPTIONAL. When omitted (`None`), `base_url` is the sole
+    required input: a unique `^[a-z0-9-]+$` slug is derived from it (see
+    `source_defaults.derive_name`, made unique against every existing
+    `doc_sources.name` regardless of status), and any of `include_prefixes`/
+    `max_pages` not also supplied are derived too
+    (`source_defaults.apply_creation_defaults`). This derivation is what
+    makes a URL-only proposal safe: an empty `include_prefixes` allows the
+    ENTIRE host and a `None` `max_pages` means no page ceiling at all (see
+    `source_defaults` module docstring) — leaving only same-host as a bound
+    would let a URL-only proposal on a shared docs host crawl an entire
+    unrelated product's documentation.
+
     Raises `ProposalError` (never a raw exception) on:
       - invalid configuration (bad name/URL/max_pages/rate_limit_rps, the
         BFS-seed prefix-filter check, or an unknown field), or
@@ -528,41 +542,61 @@ def propose_source(
     SQL literal (see `PROPOSE_SOURCE_SQL`), so no argument combination can
     make this function write anything but 'pending'.
     """
-    try:
-        cfg = ProposedSourceConfig(
-            name=name,
-            base_url=base_url,
-            sitemap=sitemap,
-            include_prefixes=include_prefixes or [],
-            exclude_prefixes=exclude_prefixes or [],
-            max_pages=max_pages,
-            language=language,
-            rate_limit_rps=rate_limit_rps,
-        )
-    except ValidationError as e:
-        raise ProposalError(f"invalid source configuration: {e}") from e
-
-    params = {
-        "name": cfg.name,
-        "base_url": str(cfg.base_url),
-        "sitemap": str(cfg.sitemap) if cfg.sitemap is not None else None,
-        "include_prefixes": list(cfg.include_prefixes),
-        "exclude_prefixes": list(cfg.exclude_prefixes),
-        "max_pages": cfg.max_pages,
-        "language": cfg.language,
-        "rate_limit_rps": cfg.rate_limit_rps,
-        "proposed_by": derive_proposed_by(proposed_by_token),
-    }
-
     pool = get_pool()
+    effective_name = name
+
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                effective_include_prefixes = include_prefixes
+                effective_max_pages = max_pages
+
+                if name is None:
+                    # Only queried in URL-only mode: every other test/call
+                    # path supplies an explicit name and must keep making
+                    # exactly one INSERT round-trip.
+                    cur.execute("SELECT name FROM doc_sources;", None)
+                    taken = {row["name"] for row in cur.fetchall()}
+                    fields: dict[str, Any] = {"base_url": base_url, "name": None}
+                    if include_prefixes is not None:
+                        fields["include_prefixes"] = include_prefixes
+                    if max_pages is not None:
+                        fields["max_pages"] = max_pages
+                    fields = apply_creation_defaults(fields, taken)
+                    effective_name = fields["name"]
+                    effective_include_prefixes = fields["include_prefixes"]
+                    effective_max_pages = fields["max_pages"]
+
+                try:
+                    cfg = ProposedSourceConfig(
+                        name=effective_name,
+                        base_url=base_url,
+                        sitemap=sitemap,
+                        include_prefixes=effective_include_prefixes or [],
+                        exclude_prefixes=exclude_prefixes or [],
+                        max_pages=effective_max_pages,
+                        language=language,
+                        rate_limit_rps=rate_limit_rps,
+                    )
+                except ValidationError as e:
+                    raise ProposalError(f"invalid source configuration: {e}") from e
+
+                params = {
+                    "name": cfg.name,
+                    "base_url": str(cfg.base_url),
+                    "sitemap": str(cfg.sitemap) if cfg.sitemap is not None else None,
+                    "include_prefixes": list(cfg.include_prefixes),
+                    "exclude_prefixes": list(cfg.exclude_prefixes),
+                    "max_pages": cfg.max_pages,
+                    "language": cfg.language,
+                    "rate_limit_rps": cfg.rate_limit_rps,
+                    "proposed_by": derive_proposed_by(proposed_by_token),
+                }
                 cur.execute(PROPOSE_SOURCE_SQL, params)
                 row = cur.fetchone()
     except psycopg.errors.UniqueViolation as e:
         raise ProposalError(
-            f"a source named '{cfg.name}' already exists (pending, active, or "
+            f"a source named '{effective_name}' already exists (pending, active, or "
             "rejected) — choose a different name, or ask a human to review the "
             "existing entry in the admin UI"
         ) from e

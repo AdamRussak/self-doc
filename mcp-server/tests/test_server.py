@@ -30,7 +30,7 @@ import app.server as server
 import httpx
 import psycopg
 import pytest
-from app import retrieval
+from app import retrieval, source_defaults
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.auth import AccessToken
@@ -493,6 +493,145 @@ def test_propose_source_fails_closed_when_dns_resolution_fails(monkeypatch):
     assert calls == []
 
 
+# ---------------------------------------------------------------------------
+# T11: propose_source(name=None) — URL-only mode. `name` is queried/derived
+# via a SELECT-existing-names round-trip only when omitted, so these tests
+# use a small dedicated fake pool/cursor that supports both `fetchall`
+# (existing names) and `fetchone` (the INSERT's RETURNING id), unlike
+# `_FakeCursor` above which only ever backs a single INSERT round-trip.
+# ---------------------------------------------------------------------------
+
+
+class _NameQueryFakeCursor:
+    def __init__(self, existing_names, insert_row):
+        self._existing_names = existing_names
+        self._insert_row = insert_row
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params):
+        self.executed.append((sql, params))
+
+    def fetchall(self):
+        return [{"name": n} for n in self._existing_names]
+
+    def fetchone(self):
+        return self._insert_row
+
+
+class _NameQueryFakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def cursor(self):
+        return self._cursor
+
+
+class _NameQueryFakePool:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @contextmanager
+    def connection(self):
+        yield _NameQueryFakeConnection(self._cursor)
+
+
+def test_propose_source_url_only_derives_name_prefixes_and_max_pages(monkeypatch):
+    """T11 acceptance: propose_source(base_url=...) alone (name omitted)
+    writes exactly one pending row with a derived name, derived
+    include_prefixes, and a real (non-None) max_pages — never the
+    empty-prefixes/unlimited-pages combination that would allow crawling an
+    entire shared docs host (see source_defaults module docstring)."""
+    cursor = _NameQueryFakeCursor(existing_names=set(), insert_row={"id": 99})
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _NameQueryFakePool(cursor))
+
+    source_id = retrieval.propose_source(
+        base_url="https://doc.traefik.io/traefik/",
+        proposed_by_token="super-secret-mcp-token",
+    )
+
+    assert source_id == 99
+    # SELECT (existing names) + INSERT — exactly two round-trips in URL-only mode.
+    assert len(cursor.executed) == 2
+    insert_sql, insert_params = cursor.executed[-1]
+    assert "'pending'" in insert_sql
+    assert insert_params["name"] == "traefik"
+    assert insert_params["include_prefixes"] == ["/traefik"]
+    assert insert_params["max_pages"] == source_defaults.DEFAULT_MAX_PAGES
+    assert insert_params["max_pages"] is not None
+
+
+def test_propose_source_url_only_avoids_name_collision(monkeypatch):
+    """`taken` passed to `derive_name` must include every existing name
+    (any status), so a second URL-only proposal against the same host gets
+    a `-2` suffix instead of colliding."""
+    cursor = _NameQueryFakeCursor(existing_names={"traefik"}, insert_row={"id": 100})
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _NameQueryFakePool(cursor))
+
+    retrieval.propose_source(
+        base_url="https://doc.traefik.io/traefik/",
+        proposed_by_token="super-secret-mcp-token",
+    )
+
+    _, insert_params = cursor.executed[-1]
+    assert insert_params["name"] == "traefik-2"
+
+
+def test_propose_source_explicit_name_skips_the_select_round_trip(monkeypatch):
+    """Regression guard: supplying an explicit `name` must not trigger the
+    existing-names SELECT at all — every pre-T11 call path (explicit name)
+    keeps making exactly one INSERT round-trip."""
+    calls = []
+
+    def on_execute(sql, params):
+        calls.append((sql, params))
+        return {"id": 1}
+
+    _install_fake_pool(monkeypatch, on_execute)
+
+    retrieval.propose_source(**_valid_kwargs())
+
+    assert len(calls) == 1
+
+
+def test_propose_doc_source_tool_url_only_still_derives_via_propose_source(monkeypatch):
+    """The MCP tool itself accepts a bare base_url (name now optional) and
+    forwards name=None through to retrieval.propose_source, which does the
+    actual derivation — this only re-checks the tool's own signature/plumbing,
+    not the derivation logic itself (covered above)."""
+    monkeypatch.setattr(
+        server,
+        "get_access_token",
+        lambda: AccessToken(token="a-real-mcp-token", client_id="c", scopes=[]),
+    )
+
+    captured = {}
+
+    def fake_propose_source(**kwargs):
+        captured.update(kwargs)
+        return 55
+
+    monkeypatch.setattr(server.retrieval, "propose_source", fake_propose_source)
+
+    result = server.propose_doc_source(base_url="https://doc.traefik.io/traefik/")
+
+    assert captured["name"] is None
+    assert captured["base_url"] == "https://doc.traefik.io/traefik/"
+    assert "pending" in result.lower()
+    assert "auto-derived" in result.lower()
+
+
 def _load_ingestion_source_config():
     """Load ingestion/app/config.py's `SourceConfig` directly from disk via
     importlib, bypassing the fact that mcp-server cannot *import* the
@@ -570,6 +709,72 @@ def test_proposed_source_config_stays_in_sync_with_ingestion_source_config():
             f"field {field_name!r} default drifted: "
             f"ProposedSourceConfig={p_field.default!r} vs SourceConfig={i_field.default!r}"
         )
+
+
+def _load_ingestion_source_defaults():
+    """Load ingestion/app/source_defaults.py directly from disk via the same
+    importlib cross-import trick as `_load_ingestion_source_config` above
+    (mcp-server cannot import the ingestion package at runtime, but a test
+    runner can still reach the file on disk). Registered under the same
+    synthetic `_ingestion_app_for_parity_test` package so `source_defaults`'s
+    own `from __future__ import annotations`-only, import-free body loads
+    without needing `config.py`'s relative import of `urlscope`."""
+    ingestion_app_dir = Path(__file__).resolve().parents[2] / "ingestion" / "app"
+    source_defaults_path = ingestion_app_dir / "source_defaults.py"
+    assert source_defaults_path.is_file(), f"expected ingestion source_defaults at {source_defaults_path}"
+
+    package_name = "_ingestion_app_for_parity_test"
+    if package_name not in sys.modules:
+        pkg_spec = importlib.util.spec_from_file_location(
+            package_name,
+            ingestion_app_dir / "__init__.py",
+            submodule_search_locations=[str(ingestion_app_dir)],
+        )
+        package = importlib.util.module_from_spec(pkg_spec)
+        sys.modules[package_name] = package
+        pkg_spec.loader.exec_module(package)
+
+    module_name = f"{package_name}.source_defaults"
+    if module_name not in sys.modules:
+        mod_spec = importlib.util.spec_from_file_location(module_name, source_defaults_path)
+        mod = importlib.util.module_from_spec(mod_spec)
+        mod.__package__ = package_name
+        sys.modules[module_name] = mod
+        mod_spec.loader.exec_module(mod)
+    return sys.modules[module_name]
+
+
+# Shared fixture table of URLs (mirrors ingestion/tests/test_source_defaults.py's
+# own derive_name cases) exercised against BOTH copies of derive_name below —
+# the drift guard for the deliberate ingestion/mcp-server duplication.
+_DERIVE_NAME_FIXTURE_URLS = (
+    "https://doc.traefik.io/traefik/",
+    "https://developers.google.com/maps/documentation",
+    "https://fastapi.tiangolo.com/",
+    "https://docs.docker.com/compose/",
+    "https://api.example.com/v2/widgets",
+)
+
+
+def test_derive_name_stays_in_sync_with_ingestion_source_defaults():
+    """Drift guard for the deliberate source_defaults.py duplication (mcp-server
+    cannot import ingestion at runtime — see the module note atop
+    mcp-server/app/source_defaults.py): `derive_name` must produce identical
+    slugs in both copies for a shared fixture table of URLs, and the
+    collision-suffix behavior (against the same `taken` set) must agree too."""
+    ingestion_source_defaults = _load_ingestion_source_defaults()
+
+    for url in _DERIVE_NAME_FIXTURE_URLS:
+        mcp_name = source_defaults.derive_name(url, set())
+        ingestion_name = ingestion_source_defaults.derive_name(url, set())
+        assert mcp_name == ingestion_name, (
+            f"derive_name drifted for {url!r}: mcp-server={mcp_name!r} vs ingestion={ingestion_name!r}"
+        )
+
+    taken = {"traefik"}
+    assert source_defaults.derive_name(
+        "https://doc.traefik.io/traefik/", taken
+    ) == ingestion_source_defaults.derive_name("https://doc.traefik.io/traefik/", taken)
 
 
 def test_derive_proposed_by_never_contains_the_token(monkeypatch):

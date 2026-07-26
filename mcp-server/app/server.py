@@ -86,8 +86,8 @@ def list_doc_sources() -> str:
 
 @mcp.tool
 def propose_doc_source(
-    name: str,
     base_url: str,
+    name: str | None = None,
     max_pages: int | None = None,
     sitemap: str | None = None,
     include_prefixes: list[str] | None = None,
@@ -99,12 +99,16 @@ def propose_doc_source(
     live source: it queues a `status='pending'` row that a HUMAN must review
     and approve in the admin UI before anything is ever crawled. Do not tell
     the user their docs are "being indexed" — tell them the proposal is
-    queued for human approval. `name` must match ^[a-z0-9-]+$ and be unique;
-    `base_url`/`sitemap` must be valid http(s) URLs; `rate_limit_rps` must be
-    positive. `max_pages` is OPTIONAL — omit it (or pass null) to crawl all
-    in-scope pages with no page limit; if given it must be positive. Rejected
-    (with a clear reason) on invalid input or a name that is already taken,
-    pending or not."""
+    queued for human approval. `base_url` is the only REQUIRED input — a
+    unique name, scoped `include_prefixes`, and a real `max_pages` ceiling
+    are all derived from it when omitted, so a bare URL can never crawl an
+    entire shared docs host uncapped. `name`, if given, must match
+    ^[a-z0-9-]+$ and be unique. `base_url`/`sitemap` must be valid http(s)
+    URLs; `rate_limit_rps` must be positive. `max_pages`, if given, must be
+    positive; pass it explicitly as null to opt out of the derived cap and
+    crawl all in-scope pages with no page limit. Rejected (with a clear
+    reason) on invalid input or a name that is already taken, pending or
+    not."""
     token = get_access_token()
     if token is None:
         # Should not happen in practice: every /mcp request is already
@@ -131,8 +135,13 @@ def propose_doc_source(
     except retrieval.ProposalError as e:
         return f"Rejected: {e}"
 
+    # `name` may be None here (URL-only call) — the actual derived name was
+    # computed inside retrieval.propose_source and isn't returned (the
+    # function's return type stays a plain int id), so a URL-only proposal's
+    # message reports that the name was auto-derived rather than guessing it.
+    name_label = f"name='{name}'" if name is not None else "name=<auto-derived from base_url>"
     return (
-        f"Proposal queued (id={source_id}, name='{name}', status=pending). "
+        f"Proposal queued (id={source_id}, {name_label}, status=pending). "
         "This source has NOT been crawled and will NOT be indexed until a "
         "human approves it in the admin UI."
     )

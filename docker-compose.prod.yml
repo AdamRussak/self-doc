@@ -54,6 +54,16 @@ services:
   ingestion:
     networks:
       - traefik
+    environment:
+      # This overlay attaches `ingestion` to the external Traefik network and
+      # publishes a router for it (labels below) — i.e. this service IS
+      # network-reachable in production, unlike the loopback-only base file.
+      # Declaring that here is what arms the boot-time refusal in
+      # ingestion/app/security.py: with a placeholder SYNC_TOKEN, this
+      # deployment will refuse to start instead of serving a credential
+      # that is published in this repository on a LAN-reachable API that can
+      # trigger crawls, purge the index, and administer doc_sources.
+      SELF_DOCS_LISTENERS: "127.0.0.1:8080,https://${DOCS_MCP_HOSTNAME}/api/v1"
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}"

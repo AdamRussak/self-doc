@@ -45,13 +45,23 @@ services:
     environment:
       TZ: ${TZ:-Asia/Jerusalem}
       SYNC_TOKEN: ${SYNC_TOKEN}
+      # Declares where this deployment is ACTUALLY reachable, for the
+      # boot-time placeholder-token check in ingestion/app/security.py. The
+      # process cannot work this out for itself: uvicorn always binds
+      # 0.0.0.0:8080 inside the container, and reachability is decided out
+      # here by the `ports:` mapping below and by any reverse-proxy overlay.
+      # Base file = loopback only, matching `127.0.0.1:8080:8080`.
+      # docker-compose.prod.yml OVERRIDES this with its Traefik hostname —
+      # if you expose this service by some other means, add that address here
+      # too, or the check will keep warning instead of refusing.
+      SELF_DOCS_LISTENERS: ${SELF_DOCS_LISTENERS:-127.0.0.1:8080}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
-      ORT_NUM_THREADS: 2
+      ORT_NUM_THREADS: 4
       # Embedding model config — resolved by `make configure` into .env from
       # config/models.yaml. The defaults below mirror the registry default
       # (mixedbread-ai/mxbai-embed-large-v1) so `make up` works unconfigured.
@@ -107,7 +117,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       OMP_NUM_THREADS: 1
-      ORT_NUM_THREADS: 2
+      ORT_NUM_THREADS: 4
       # Must match the ingestion service's model for vectors to be comparable;
       # `make configure` keeps both in sync via .env. Defaults mirror the
       # registry default (config/models.yaml).

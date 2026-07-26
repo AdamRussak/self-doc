@@ -16,7 +16,10 @@ Endpoints (per IMPLEMENTATION_PLAN.md §2 and the T4/B1 task descriptions):
   - GET  /metrics prometheus-client exposition.
 
 `SYNC_TOKEN` is REQUIRED: the process refuses to start (exits non-zero) if
-it is unset, at import time — before uvicorn ever binds a socket.
+it is unset, at import time — before uvicorn ever binds a socket. It must
+also not be a known placeholder/shipped-default value when any listener is
+non-loopback (see `app.security` and `SELF_DOCS_LISTENERS`); on a
+loopback-only deployment a placeholder warns instead of refusing.
 
 `doc_sources` (the database) is the source of truth for crawl config, NOT
 `sources.yaml` — see `app.sources_repo`. `sources.yaml` survives only as a
@@ -39,7 +42,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel
 
-from . import admin, scheduler, sources_repo, store
+from . import admin, scheduler, security, sources_repo, store
 from .logging_config import get_logger
 from .sources_repo import SourceRecord
 
@@ -53,6 +56,21 @@ if not SYNC_TOKEN:
         file=sys.stderr,
     )
     raise SystemExit(1)
+
+# --- Fail fast: a placeholder SYNC_TOKEN must never guard a reachable listener ----------
+# Two-branch by design (see app/security.py for the full rationale):
+#   loopback-only  + placeholder -> warn loudly, keep booting (don't break local setups)
+#   non-loopback   + placeholder -> refuse, before uvicorn binds a socket
+# Exposure is declared by the compose layer via SELF_DOCS_LISTENERS, because the
+# process itself always binds 0.0.0.0 inside the container and cannot see the
+# published-port / Traefik reality. The message never contains the token value.
+_token_policy = security.check_shared_token(SYNC_TOKEN, var_name="SYNC_TOKEN")
+if _token_policy.should_refuse:
+    print(_token_policy.message, file=sys.stderr)
+    raise SystemExit(1)
+if _token_policy.verdict == "warn":
+    print(_token_policy.message, file=sys.stderr)
+    logger.warning("sync_token_is_placeholder", listeners_are_loopback_only=True)
 
 # --- Scheduler enable flag ---------------------------------------------------------------
 #
