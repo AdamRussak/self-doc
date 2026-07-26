@@ -86,7 +86,7 @@ def second_conn():
 
 def make_source(name: str = "sync-health-test-src", max_pages: int = 500) -> SourceConfig:
     return SourceConfig.model_validate(
-        {"name": name, "base_url": "https://example.com/", "max_pages": max_pages}
+        {"name": name, "base_url": "https://docs-fixture.dev/", "max_pages": max_pages}
     )
 
 
@@ -152,7 +152,7 @@ def test_all_pages_soft_failed_should_be_failed_not_ok(conn, monkeypatch):
 
     def fake_crawl(source, client=None):
         for i in range(40):
-            yield {"url": f"https://example.com/broken-{i}", "html": None, "fetch_ok": False}
+            yield {"url": f"https://docs-fixture.dev/broken-{i}", "html": None, "fetch_ok": False}
 
     monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
 
@@ -179,9 +179,9 @@ def test_partial_soft_failure_ratio_should_be_partial_not_ok(conn, monkeypatch):
 
     def fake_crawl(source, client=None):
         for i in range(ok_count):
-            yield {"url": f"https://example.com/ok-{i}", "html": PAGE_MD}
+            yield {"url": f"https://docs-fixture.dev/ok-{i}", "html": PAGE_MD}
         for i in range(soft_failed_count):
-            yield {"url": f"https://example.com/broken-{i}", "html": None, "fetch_ok": False}
+            yield {"url": f"https://docs-fixture.dev/broken-{i}", "html": None, "fetch_ok": False}
 
     def fake_extract(url, html):
         from app.extract import ExtractionResult
@@ -213,7 +213,7 @@ def test_purge_guard_refused_should_be_partial_not_ok(conn, second_conn, monkeyp
     source = make_source(max_pages=500)
     _use_fast_chunk_and_embed(monkeypatch)
 
-    existing_urls = [f"https://example.com/page-{i}" for i in range(150)]
+    existing_urls = [f"https://docs-fixture.dev/page-{i}" for i in range(150)]
     _seed_pages(conn, monkeypatch, source, existing_urls)
 
     # BFS collapse: only one page is reached this run.
