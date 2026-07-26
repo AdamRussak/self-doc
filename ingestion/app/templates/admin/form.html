@@ -61,6 +61,17 @@
             <option value="only" {% if values.llms_txt == 'only' %}selected{% endif %}>only</option>
           </select>
           <p class="hint">auto = try llms.txt/llms-full.txt then fall back to HTML crawl; off = HTML only; only = llms.txt or nothing.</p>
+
+          <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 1.25rem;">
+            <input type="checkbox" id="js_render" name="js_render" value="yes" {% if values.js_render %}checked{% endif %}>
+            <label for="js_render" style="margin: 0; cursor: pointer; font-weight: 500;">
+              Retry JS-shell pages through the headless renderer
+            </label>
+          </div>
+          <p class="hint">Requires the <code>renderer</code> service to be running (compose <code>render</code> profile). Only
+            pages this source's crawl flags as a suspected client-side-rendered shell (see <code>js_shell_suspected</code>
+            in the logs) are retried — every other page is unaffected. No effect if the renderer isn't running: a retry
+            simply fails soft and the page stays skipped, same as before.</p>
         </div>
 
         <div class="form-section">

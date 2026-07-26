@@ -1752,3 +1752,190 @@ def test_sync_source_js_shell_emits_distinct_warning_event(conn, monkeypatch):
     assert len(content_skipped_events) == 4
 
 
+# --- T7: headless-render retry, gated on source.js_render + T6's shell flag -
+
+
+def _make_shell_source(js_render: bool) -> SourceConfig:
+    return SourceConfig.model_validate(
+        {
+            "name": "test-src",
+            "base_url": "https://docs-fixture.dev/",
+            "max_pages": 10,
+            "js_render": js_render,
+            # High rate limit -- keeps this test fast; the dedicated
+            # rate-limit test below uses a distinctive value to prove the
+            # limiter is actually wired up, not to slow every other test.
+            "rate_limit_rps": 50.0,
+        }
+    )
+
+
+def _shell_fake_extract(url, html):
+    """Shared fake `extract.extract`: the static shell stub (marked by the
+    sentinel `SHELL-STUB` in the fixture HTML) always extracts too-short;
+    anything else extracts fine using its own length as the markdown."""
+    from app.extract import ExtractionResult
+
+    if "SHELL-STUB" in html:
+        return ExtractionResult(
+            url=url, markdown=None, status="skipped",
+            reason="extracted content below minimum length", length=61,
+        )
+    return ExtractionResult(url=url, markdown=html, status="ok", length=len(html))
+
+
+def test_sync_source_js_render_disabled_never_calls_renderer(conn, monkeypatch):
+    """A source that hasn't opted in must be byte-for-byte unaffected: the
+    renderer is never even called, regardless of how many shell pages T6
+    flags."""
+    source = _make_shell_source(js_render=False)
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(4)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+
+    def _boom(url):
+        raise AssertionError("renderer must never be called for a source with js_render=False")
+
+    monkeypatch.setattr(store.renderer, "render_page", _boom)
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.shell_suspected_count == 4
+    assert outcome.pages_soft_failed == 4
+    assert outcome.pages_js_rendered == 0
+
+
+def test_sync_source_js_render_recovers_flagged_shell_pages(conn, monkeypatch):
+    """T7's happy path: a `js_render=True` source's shell-flagged pages are
+    retried through the renderer after T6's detector runs, and a page whose
+    RENDERED content clears the length floor gets indexed for real."""
+    source = _make_shell_source(js_render=True)
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(3)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+
+    rendered_calls: list[str] = []
+
+    def fake_render_page(url):
+        rendered_calls.append(url)
+        return PAGE_MD  # real-looking rendered content -> clears the floor
+
+    monkeypatch.setattr(store.renderer, "render_page", fake_render_page)
+
+    outcome = store.sync_source(source, conn)
+
+    assert sorted(rendered_calls) == sorted(shell_urls)
+    assert outcome.shell_suspected_count == 3
+    assert outcome.pages_js_rendered == 3
+    assert outcome.pages_soft_failed == 0
+    assert outcome.pages_fetched == 3
+    assert outcome.chunks_indexed > 0
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM doc_pages WHERE url = ANY(%s)", (shell_urls,))
+        (count,) = cur.fetchone()
+    assert count == 3
+
+
+def test_sync_source_js_render_still_short_stays_soft_failed(conn, monkeypatch):
+    """If the RENDERED content is still below the length floor (a genuinely
+    broken/blank page, not just a JS shell), the page stays soft-failed
+    exactly as before -- the renderer retry is not a guarantee of recovery."""
+    source = _make_shell_source(js_render=True)
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(3)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+    # Still a stub even after "rendering" -- e.g. a page that's broken, not
+    # just client-side-rendered.
+    monkeypatch.setattr(store.renderer, "render_page", lambda url: "<html>SHELL-STUB</html>")
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.shell_suspected_count == 3
+    assert outcome.pages_js_rendered == 0
+    assert outcome.pages_soft_failed == 3
+    # Every page in this fixture soft-failed and nothing else was seen this
+    # run -- `classify_sync`'s "nothing indexed or confirmed" rule (see
+    # store.py) correctly reports "failed" here, same as it would pre-T7 for
+    # an all-soft-failed source. A source with at least one other successful
+    # page would classify as "partial" instead (see the mixed-source tests
+    # above this one).
+    assert outcome.status == "failed"
+
+
+def test_sync_source_js_render_unreachable_degrades_to_soft_fail(conn, monkeypatch):
+    """An unreachable/erroring renderer (`render_page` returning `None`,
+    exactly like `app.renderer.render_page`'s documented soft-fail contract)
+    must degrade to today's soft-fail behavior, never raise, and never hang
+    the sync."""
+    source = _make_shell_source(js_render=True)
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(3)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+    monkeypatch.setattr(store.renderer, "render_page", lambda url: None)
+
+    outcome = store.sync_source(source, conn)
+
+    assert outcome.pages_js_rendered == 0
+    assert outcome.pages_soft_failed == 3
+    assert outcome.status == "failed"  # same "nothing confirmed this run" rule as above
+
+
+def test_sync_source_js_render_honors_source_rate_limit(conn, monkeypatch):
+    """The retry pass must rate-limit itself with the SAME `rate_limit_rps`
+    as the rest of the source's crawl -- the renderer must not become a way
+    to bypass crawl politeness."""
+    source = SourceConfig.model_validate(
+        {
+            "name": "test-src",
+            "base_url": "https://docs-fixture.dev/",
+            "max_pages": 10,
+            "js_render": True,
+            "rate_limit_rps": 5.0,
+        }
+    )
+    shell_urls = [f"https://docs-fixture.dev/shell-{i}" for i in range(3)]
+
+    def fake_crawl(source, client=None):
+        for u in shell_urls:
+            yield {"url": u, "html": "<html>SHELL-STUB</html>"}
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", _shell_fake_extract)
+    monkeypatch.setattr(store.renderer, "render_page", lambda url: PAGE_MD)
+
+    seen_rps: list[float] = []
+    real_rate_limiter = store.crawler.RateLimiter
+
+    class _RecordingRateLimiter(real_rate_limiter):
+        def __init__(self, rps):
+            seen_rps.append(rps)
+            super().__init__(rps)
+
+    monkeypatch.setattr(store.crawler, "RateLimiter", _RecordingRateLimiter)
+
+    store.sync_source(source, conn)
+
+    assert 5.0 in seen_rps
+
+

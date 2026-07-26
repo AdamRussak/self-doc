@@ -374,3 +374,22 @@ def test_subdomain_of_placeholder_host_is_not_rejected(tmp_path):
 def test_legitimate_host_is_not_rejected_by_placeholder_check(tmp_path):
     p = write_yaml(tmp_path, _yaml_source(base_url="https://docs-fixture.dev/"))
     assert load_sources(p)[0].name == "widget"
+
+
+def test_js_render_defaults_false(tmp_path):
+    """T7: a source that doesn't mention `js_render` must behave exactly as
+    before — no renderer call is ever made for it."""
+    p = write_yaml(
+        tmp_path,
+        "sources:\n  - name: fastapi\n    base_url: https://fastapi.tiangolo.com/\n    max_pages: 10\n",
+    )
+    assert load_sources(p)[0].js_render is False
+
+
+def test_js_render_can_be_opted_in(tmp_path):
+    p = write_yaml(
+        tmp_path,
+        "sources:\n  - name: fastapi\n    base_url: https://fastapi.tiangolo.com/\n"
+        "    max_pages: 10\n    js_render: true\n",
+    )
+    assert load_sources(p)[0].js_render is True

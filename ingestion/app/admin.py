@@ -516,6 +516,7 @@ def _build_source_config(
     language: str,
     rate_limit_rps: str,
     llms_txt: str = "auto",
+    js_render: bool = False,
     taken: Collection[str] | None = None,
 ) -> tuple[SourceConfig | None, str | None]:
     """Validate raw form strings into a `SourceConfig`. Returns
@@ -564,6 +565,7 @@ def _build_source_config(
             language=language.strip() or "english",
             rate_limit_rps=rate_limit_rps_value,
             llms_txt=(llms_txt.strip() or "auto"),
+            js_render=js_render,
         )
         return cfg, None
     except ValidationError as e:
@@ -588,6 +590,7 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
         language=record.language or "english",
         rate_limit_rps=record.rate_limit_rps if (record.rate_limit_rps is not None and record.rate_limit_rps > 0) else 1.0,
         llms_txt=record.llms_txt or "auto",
+        js_render=record.js_render,
     )
 
 
@@ -682,6 +685,7 @@ def create_source_submit(
     language: str = Form(default="english"),
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
+    js_render: str = Form(default=""),
     _auth=Depends(require_csrf),
     conn=Depends(get_conn),
 ):
@@ -695,6 +699,7 @@ def create_source_submit(
         "language": language,
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
+        "js_render": bool(js_render),
     }
     # `taken` must include names from EVERY status (a `rejected` row still
     # holds its name — see `derive_name`'s docstring), so this reads all
@@ -713,6 +718,7 @@ def create_source_submit(
         language=language,
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
+        js_render=bool(js_render),
         taken=taken,
     )
     if cfg is None:
@@ -776,6 +782,7 @@ def edit_source_form(source_id: int, request: Request, _auth=Depends(require_ses
         "language": record.language,
         "rate_limit_rps": str(record.rate_limit_rps),
         "llms_txt": record.llms_txt or "auto",
+        "js_render": record.js_render,
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
@@ -794,6 +801,7 @@ def update_source_submit(
     language: str = Form(default="english"),
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
+    js_render: str = Form(default=""),
     schedule_cron: str = Form(default=""),
     enabled: str = Form(default=""),
     _auth=Depends(require_csrf),
@@ -813,6 +821,7 @@ def update_source_submit(
         "language": language,
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
+        "js_render": bool(js_render),
         "schedule_cron": schedule_cron,
         "enabled": bool(enabled),
     }
@@ -830,6 +839,7 @@ def update_source_submit(
         language=language,
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
+        js_render=bool(js_render),
     )
     if cfg is None:
         return templates.TemplateResponse(

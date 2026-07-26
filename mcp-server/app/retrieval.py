@@ -421,6 +421,7 @@ class ProposedSourceConfig(BaseModel):
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"
+    js_render: bool = False
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod

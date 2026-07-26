@@ -11,6 +11,7 @@ Schema (per IMPLEMENTATION_PLAN.md §2 `sources.yaml` schema):
         max_pages: 500              # optional — omit for no page limit (crawl all in-scope pages)
         language: english           # optional, default english
         rate_limit_rps: 1.0         # optional, default 1.0
+        js_render: false            # optional, default false — see T7 below
 
 Validation fails fast (raises `ConfigError`) on:
   - duplicate `name` values
@@ -20,6 +21,17 @@ Validation fails fast (raises `ConfigError`) on:
   - a sitemap-less source whose `base_url` path is excluded by its own
     `include_prefixes`/`exclude_prefixes` (the BFS crawl seed would never
     pass its own filters, so the source would index 0 pages)
+
+`js_render` (T7): per-source opt-in for the headless-render retry path (see
+`app.renderer` + `docker-compose.yml`'s `render`-profile `renderer` service).
+When true, pages this source's crawl skipped for extracting to near-nothing
+(a client-side-rendered "JS shell") are retried through the renderer AFTER
+the normal crawl finishes — never at first-extraction time, since that
+determination is inherently cross-page (see `store.sync_source`). A source
+that leaves this false (the default) is completely unaffected: no renderer
+call is ever made for it, matching pre-T7 behavior exactly. No extra
+validation needed here — the renderer re-fetches URLs already constrained to
+this same, already-validated `base_url` host.
 """
 
 from __future__ import annotations
@@ -119,6 +131,7 @@ class SourceConfig(BaseModel):
     language: str = "english"
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"
+    js_render: bool = False
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod

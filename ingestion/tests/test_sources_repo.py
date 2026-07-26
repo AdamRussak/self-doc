@@ -65,6 +65,7 @@ def _row_from_cfg(
     enabled: bool = True,
     schedule_cron: str | None = None,
     llms_txt: str | None = None,
+    js_render: bool | None = None,
     created_at: datetime = datetime(2026, 1, 1, 0, 0, 0),
     last_synced: datetime | None = None,
     last_status: str | None = None,
@@ -83,6 +84,7 @@ def _row_from_cfg(
         "language": cfg.language,
         "rate_limit_rps": cfg.rate_limit_rps,
         "llms_txt": llms_txt if llms_txt is not None else str(cfg.llms_txt),
+        "js_render": js_render if js_render is not None else bool(cfg.js_render),
         "schedule_cron": schedule_cron,
         "enabled": enabled,
         "status": status,
@@ -137,7 +139,7 @@ def test_cfg_to_write_values_matches_row_mapping() -> None:
     SourceConfig's fields map to plain values — this is the fidelity the
     round-trip test above exercises end to end."""
     cfg = _make_cfg()
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
         _cfg_to_write_values(cfg)
     )
     row = _row_from_cfg(cfg, id_=1)
@@ -150,6 +152,7 @@ def test_cfg_to_write_values_matches_row_mapping() -> None:
     assert record.language == language
     assert record.rate_limit_rps == pytest.approx(rate_limit_rps)
     assert record.llms_txt == llms_txt
+    assert record.js_render == js_render
 
 
 def test_cfg_to_write_values_sitemap_none_stays_none() -> None:
@@ -192,6 +195,24 @@ def test_cfg_matches_record_true_when_llms_txt_also_matches() -> None:
     cfg = _make_cfg(llms_txt="only")
     record = _row_to_record(_row_from_cfg(cfg))
     assert _cfg_matches_record(cfg, record) is True
+
+
+def test_cfg_matches_record_false_when_only_js_render_differs() -> None:
+    cfg = _make_cfg()
+    record = _row_to_record(_row_from_cfg(cfg))
+    changed_cfg = _make_cfg(js_render=True)
+    assert _cfg_matches_record(changed_cfg, record) is False
+
+
+def test_js_render_defaults_false_and_round_trips() -> None:
+    cfg = _make_cfg()
+    assert cfg.js_render is False
+    record = _row_to_record(_row_from_cfg(cfg))
+    assert record.js_render is False
+
+    enabled_cfg = _make_cfg(js_render=True)
+    enabled_record = _row_to_record(_row_from_cfg(enabled_cfg))
+    assert enabled_record.js_render is True
 
 
 # --- SourceConfig rejects invalid input on both create and update paths ----

@@ -103,6 +103,7 @@ SOURCE_COLUMNS: tuple[str, ...] = (
     "language",
     "rate_limit_rps",
     "llms_txt",
+    "js_render",
     "schedule_cron",
     "enabled",
     "status",
@@ -133,6 +134,7 @@ class SourceRecord:
     language: str
     rate_limit_rps: float
     llms_txt: str
+    js_render: bool
     schedule_cron: str | None
     enabled: bool
     status: str
@@ -174,6 +176,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         language,
         rate_limit_rps,
         llms_txt,
+        js_render,
         schedule_cron,
         enabled,
         status,
@@ -193,6 +196,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         language=language or "english",
         rate_limit_rps=rate_limit_rps if (rate_limit_rps is not None and rate_limit_rps > 0) else 1.0,
         llms_txt=llms_txt if llms_txt else "auto",
+        js_render=bool(js_render),
         schedule_cron=schedule_cron,
         enabled=bool(enabled),
         status=status,
@@ -206,7 +210,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
 def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
     """`SourceConfig` -> the plain-value tuple shared by every write path:
     `(base_url, sitemap, include_prefixes, exclude_prefixes, max_pages,
-    language, rate_limit_rps, llms_txt)`. Pure — no DB, no I/O.
+    language, rate_limit_rps, llms_txt, js_render)`. Pure — no DB, no I/O.
 
     `name` is deliberately excluded: `create_source` writes it once at
     insert time (a source's `name` is its stable identity, see
@@ -222,6 +226,7 @@ def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
         cfg.language,
         cfg.rate_limit_rps,
         str(cfg.llms_txt),
+        bool(cfg.js_render),
     )
 
 
@@ -238,6 +243,7 @@ def _cfg_matches_record(cfg: SourceConfig, record: SourceRecord) -> bool:
         and cfg.language == record.language
         and abs(cfg.rate_limit_rps - record.rate_limit_rps) < 1e-9
         and cfg.llms_txt == record.llms_txt
+        and bool(cfg.js_render) == record.js_render
     )
 
 
@@ -432,7 +438,7 @@ def create_source(
     if status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status!r}: must be one of {VALID_STATUSES}")
 
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -440,8 +446,8 @@ def create_source(
             """
             INSERT INTO doc_sources
                 (name, base_url, sitemap, include_prefixes, exclude_prefixes,
-                 max_pages, language, rate_limit_rps, llms_txt, status, proposed_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 max_pages, language, rate_limit_rps, llms_txt, js_render, status, proposed_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -454,6 +460,7 @@ def create_source(
                 language,
                 rate_limit_rps,
                 llms_txt,
+                js_render,
                 status,
                 proposed_by,
             ),
@@ -472,7 +479,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
     (`name` is immutable via this function; `source_id` is the identity) and
     does not touch `status`/`enabled`/`schedule_cron`/`proposed_by` — use
     `set_status` for status changes. DB-dependent."""
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -481,7 +488,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
             UPDATE doc_sources
             SET base_url = %s, sitemap = %s, include_prefixes = %s,
                 exclude_prefixes = %s, max_pages = %s, language = %s,
-                rate_limit_rps = %s, llms_txt = %s
+                rate_limit_rps = %s, llms_txt = %s, js_render = %s
             WHERE id = %s
             """,
             (
@@ -493,6 +500,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
                 language,
                 rate_limit_rps,
                 llms_txt,
+                js_render,
                 source_id,
             ),
         )

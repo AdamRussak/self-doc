@@ -53,7 +53,7 @@ from urllib.parse import urlparse
 
 import psycopg
 
-from . import chunker, crawler, embedder, extract, metrics
+from . import chunker, crawler, embedder, extract, metrics, renderer
 from .config import SourceConfig
 from .logging_config import get_logger
 
@@ -234,6 +234,7 @@ class SourceOutcome:
     pages_removed: int = 0  # pages deleted because absent from this crawl
     chunks_indexed: int = 0
     shell_suspected_count: int = 0  # of pages_soft_failed, how many are suspected JS-shell stubs (T6)
+    pages_js_rendered: int = 0  # of shell_suspected_count, how many were recovered via the renderer (T7)
     status: str = "ok"  # ok | partial | failed
     error: str | None = None
 
@@ -832,6 +833,7 @@ def sync_source(
     # (including the `llms_unchanged` early-return path below) since
     # `short_extraction_lengths` is simply empty when no pages were
     # extracted this run.
+    shell_suspected_urls: list[str] = []
     for length, urls in _detect_js_shell_pages(short_extraction_lengths).items():
         for suspect_url in urls:
             log.bind(url=suspect_url).warning(
@@ -840,6 +842,82 @@ def sync_source(
                 sibling_count=len(urls),
             )
         outcome.shell_suspected_count += len(urls)
+        shell_suspected_urls.extend(urls)
+
+    # Headless-render retry (T7), gated on the source's `js_render` opt-in:
+    # only pages T6 just flagged above — never the whole
+    # `short_extraction_lengths` set, and never at first-extraction time,
+    # since the detector above is what makes that distinction possible in
+    # the first place (a single too-short page is not evidence on its own;
+    # see `_detect_js_shell_pages`). A source that hasn't set `js_render` is
+    # completely unaffected: no renderer call is ever made for it.
+    #
+    # The renderer re-navigates to each URL itself (a real browser fetch),
+    # so the original static HTML this sync already fetched is irrelevant
+    # here — there is nothing to reuse from `short_extraction_lengths`
+    # beyond the URL.
+    #
+    # Every failure mode (renderer disabled/unreachable/slow/erroring, or
+    # the re-render still extracting too short) is a no-op: the page stays
+    # exactly as soft-failed as it already was above. `renderer.render_page`
+    # itself never raises and is time-bounded, so this loop can't hang a
+    # sync even if the renderer is stuck.
+    if source.js_render and shell_suspected_urls:
+        render_limiter = crawler.RateLimiter(source.rate_limit_rps)
+        for suspect_url in shell_suspected_urls:
+            # Honor the source's configured crawl politeness for the retry
+            # pass too — the renderer must not become a way to bypass it.
+            render_limiter.wait()
+            rendered_html = renderer.render_page(suspect_url)
+            if rendered_html is None:
+                log.info("js_render_retry_failed", url=suspect_url)
+                continue
+
+            re_extraction = extract.extract(suspect_url, rendered_html)
+            if re_extraction.status != "ok":
+                log.info(
+                    "js_render_retry_still_short",
+                    url=suspect_url,
+                    length=re_extraction.length,
+                )
+                continue
+
+            try:
+                markdown = re_extraction.markdown
+                assert markdown is not None
+                content_hash = hash_markdown(markdown)
+                existing_hash = get_existing_page_hash(conn, suspect_url)
+                if existing_hash == content_hash:
+                    outcome.pages_soft_failed -= 1
+                    outcome.pages_skipped += 1
+                    outcome.pages_js_rendered += 1
+                    log.info("js_render_retry_unchanged", url=suspect_url)
+                    continue
+
+                chunks = chunker.chunk_markdown(suspect_url, markdown)
+                chunks = embedder.embed_chunks(chunks)
+                n = replace_page(
+                    conn,
+                    source_id,
+                    suspect_url,
+                    content_hash,
+                    chunks,
+                    fts_config=source.language,
+                    # No etag/last_modified: this content came from a
+                    # headless render, not the HTTP response that was
+                    # actually soft-failed, so there is no real validator
+                    # to persist. The next normal sync just re-fetches in
+                    # full, same as any page with no stored validators.
+                )
+                outcome.pages_soft_failed -= 1
+                outcome.pages_fetched += 1
+                outcome.pages_js_rendered += 1
+                outcome.chunks_indexed += n
+                log.info("js_render_retry_indexed", url=suspect_url, chunks=n)
+            except Exception as e:  # noqa: BLE001 - isolate per-page failures, mirrors the main loop
+                if not conn.autocommit:
+                    conn.rollback()
+                log.error("js_render_retry_index_failed", url=suspect_url, error=str(e))
 
     if llms_unchanged:
         # The llms-index 304'd as a whole: nothing about the source changed,
@@ -937,6 +1015,7 @@ def sync_source(
         pages_removed=outcome.pages_removed,
         chunks_indexed=outcome.chunks_indexed,
         shell_suspected_count=outcome.shell_suspected_count,
+        pages_js_rendered=outcome.pages_js_rendered,
         crawl_truncated=crawl_truncated,
     )
     return outcome

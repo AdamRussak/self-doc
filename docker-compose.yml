@@ -70,6 +70,17 @@ services:
       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT:-}"
+      # T7 (headless-render retry): only ever used for a source that has
+      # explicitly set `js_render: true` AND whose crawl this run flagged a
+      # JS-shell (see app/store.py's `_detect_js_shell_pages`). With the
+      # `render` profile not enabled (the default — see the `renderer`
+      # service below), these calls simply fail to connect and
+      # `app/renderer.py::render_page` returns `None`, which `store.py`
+      # treats exactly like today's soft-fail — this variable existing costs
+      # nothing when the profile is off.
+      RENDERER_URL: ${RENDERER_URL:-http://renderer:8090}
+      RENDER_TOKEN: ${RENDER_TOKEN:-}
+      RENDERER_CLIENT_TIMEOUT_S: ${RENDERER_CLIENT_TIMEOUT_S:-25}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -97,6 +108,68 @@ services:
       # a shorter start_period would flap the container mid-startup.
       start_period: 120s
     # No Traefik exposure — reachable inside the compose network.
+
+  # T7: opt-in headless-render retry for JS-rendered "shell" pages (see
+  # ingestion/app/store.py's `_detect_js_shell_pages` / T6). Deliberately a
+  # SEPARATE service/image from `ingestion`, never merged into it: Chromium
+  # adds ~400 MiB resident (plus a much larger image) on top of ingestion's
+  # existing ~820 MiB of a 1.5 GiB limit, which would risk an OOM ingestion
+  # does not have today. Behind its own `render` profile so a default
+  # `make up`/`docker compose --profile full up` NEVER builds or starts this
+  # image — ingestion's behavior and image size with this profile disabled
+  # are byte-identical to before T7 (verified: `docker inspect` reports the
+  # same `ingestion` image size with or without this service ever having
+  # existed, since nothing here touches ingestion/Dockerfile or
+  # ingestion/pyproject.toml).
+  #
+  # Bring up alongside `full`: `docker compose --profile full --profile render up -d`.
+  renderer:
+    build:
+      context: ./renderer
+    container_name: self-docs-renderer
+    restart: unless-stopped
+    profiles:
+      - render
+    environment:
+      TZ: ${TZ:-Asia/Jerusalem}
+      # Shared secret between ingestion and this service — defense in depth
+      # against this container being abused as a blind fetch-any-url proxy
+      # by some OTHER container on the internal network, even though this
+      # service is never published on a host port either. Optional: if
+      # unset, the token check is skipped (fine for a genuinely trusted LAN
+      # network, but set it for anything more exposed).
+      RENDER_TOKEN: ${RENDER_TOKEN:-}
+      RENDER_TIMEOUT_S: ${RENDER_TIMEOUT_S:-20}
+      RENDER_NAV_TIMEOUT_S: ${RENDER_NAV_TIMEOUT_S:-15}
+    # No `ports:` — reachable ONLY over the internal compose network, by
+    # service DNS (`http://renderer:8090`), exactly like `ingestion` reaches
+    # `db`. Never published, in production or locally: this is the whole
+    # point of the shared-secret token above being "defense in depth" rather
+    # than the only guard.
+    networks:
+      - default
+    # /dev/shm defaults to 64 MiB in Docker, which is tight for Chromium;
+    # --disable-dev-shm-usage (baked into app/main.py's launch args) avoids
+    # depending on this being sized generously on every deployment, but a
+    # little headroom here costs nothing and avoids flakiness under load.
+    shm_size: "256mb"
+    deploy:
+      resources:
+        limits:
+          # Chromium's own resident footprint is ~300-400 MiB; this leaves
+          # comfortable headroom for the Python/Playwright/uvicorn process
+          # plus a handful of concurrent contexts without being anywhere
+          # near ingestion's 1.5 GiB (this service does no embedding, no
+          # ONNX runtime — it is a browser, nothing else).
+          memory: ${RENDERER_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Chromium cold-launch (browser process start) takes a few seconds;
+      # generous grace period so the container doesn't flap mid-startup.
+      start_period: 30s
 
   mcp-server:
     build:

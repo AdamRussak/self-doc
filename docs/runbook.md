@@ -54,6 +54,16 @@ adds (all idempotent `ADD COLUMN IF NOT EXISTS`, same as the columns above):
 - See ADR-003 (`docs/adr/003-llms-txt-etag-multilang-fts.md`) for the full
   design rationale behind all three of these additions.
 
+**Update (T7): `02_sources_config.sql` also adds `doc_sources.js_render`**
+(`BOOLEAN NOT NULL DEFAULT FALSE`, same idempotent `ADD COLUMN IF NOT
+EXISTS` pattern as everything else in this file) — the per-source opt-in
+for the headless-render retry path. See [Headless-render retry
+(T7)](#headless-render-retry-t7) below. Defaulting to `FALSE` means every
+existing source is completely unaffected until you explicitly opt it in;
+re-run `./scripts/migrate.sh` (same command as above) to pick up this
+column on a deployment that already applied an earlier version of this
+file.
+
 `db/init/*.sql` scripts run **only** against an empty Postgres data
 directory (first cluster init). On any **existing** database — which is the
 case for this deployment — `02_sources_config.sql` must be applied by hand:
@@ -418,6 +428,14 @@ proposal):
      **Changing `llms_txt` on an existing source triggers a full re-index of
      that source on its next sync** (the set of indexed URLs changes), bound
      by the existing purge-ratio/coverage guards — expected, not a bug.
+   - **`js_render` (default off, T7).** Opt-in retry, through the separate
+     `renderer` compose service, for pages this source's crawl flags as a
+     suspected client-side-rendered "JS shell" (a static HTML/noscript stub
+     re-served for every route — see [Headless-render retry
+     (T7)](#headless-render-retry-t7) below). Leave it off unless you've
+     confirmed a source's pages extract to a suspiciously identical short
+     length (`js_shell_suspected` in the logs) — turning it on for a source
+     that doesn't need it just spends renderer capacity for nothing.
    - **`language`** must be one of the ~30 Postgres built-in text-search
      configuration names in `SUPPORTED_FTS_LANGUAGES`
      (`ingestion/app/config.py`) — e.g. `english`, `french`, `german`,
@@ -542,6 +560,84 @@ server-side session store. This means:
   token. Treat a suspected admin-cookie leak exactly like a suspected
   `SYNC_TOKEN` leak: rotate `SYNC_TOKEN` in `.env` and restart `ingestion` —
   full procedure in "Rotate `SYNC_TOKEN`" above.
+
+---
+
+## Headless-render retry (T7)
+
+**What it's for.** Some doc sites (traefik's `user-guides` tree, pptr.dev)
+render their content client-side: the server's raw HTML response is a
+static, near-empty "shell" (a `<div id="app">` and a `<script>` bundle),
+so `extract.extract`'s trafilatura/BS4 pass finds nothing real and the page
+soft-fails as too-short. `ingestion/app/store.py`'s `_detect_js_shell_pages`
+detects this pattern (many pages in one source extracting to the *exact
+same* short length — see the module comment there) and logs a
+`js_shell_suspected` warning per flagged page. This section covers
+*recovering* those pages, which detection alone does not do.
+
+**Why a separate container.** Recovering a shell page means actually
+running a browser (headless Chromium via Playwright) to let the JS paint,
+then reading the resulting DOM. Chromium adds ~400 MiB resident (and a much
+larger image) — `ingestion` runs at ~820 MiB of a 1.5 GiB limit today and
+has no headroom for that, so this lives in its own `renderer` service/image
+instead, behind its own `render` compose profile (mirroring how `ingestion`
+sits behind `full`). It is never built or started unless you explicitly ask
+for it.
+
+**Turning it on:**
+
+```bash
+# 1. Apply the doc_sources.js_render migration if you haven't already
+#    (see the migration section at the top of this file):
+./scripts/migrate.sh
+
+# 2. Bring the renderer up ALONGSIDE the full stack (both profiles):
+docker compose --profile full --profile render up -d
+
+# 3. Opt a specific source in (admin UI edit form's "js_render" checkbox,
+#    or SourceConfig(..., js_render=True) via the MCP/API write paths).
+```
+
+Bringing up `--profile full` alone (i.e. today's default `make up`) never
+starts `renderer` — that source's `js_render` checkbox being on then just
+means every render attempt fails to connect and degrades to the exact same
+soft-fail as before T7 existed (see "Fails safe" below). There is nothing
+to break by leaving it off, and nothing silently broken by forgetting to
+start it.
+
+**How the retry is sequenced.** Detection is inherently cross-page — a
+single 61-character page proves nothing on its own, only "115 pages in this
+source landed on the exact same length" does. So the renderer retry runs as
+a **second pass**, after a source's whole crawl loop has finished and
+`_detect_js_shell_pages` has classified the run's soft-failures, over
+exactly the URLs it flagged — never at first-extraction time, and never for
+a source that hasn't opted in.
+
+**Fails safe, always.** Every renderer call
+(`ingestion/app/renderer.py::render_page`) is soft-fail by construction: an
+unreachable renderer (profile off, container down), a slow one, or one that
+errors on a given page all return `None`, exactly like today's ordinary
+fetch failure — the page simply stays soft-failed, `sync_source` never
+raises, and the sync never hangs. Both sides enforce an explicit timeout
+independently (`RENDERER_CLIENT_TIMEOUT_S` on the ingestion side,
+`RENDER_TIMEOUT_S`/`RENDER_NAV_TIMEOUT_S` on the renderer side) so a single
+stuck browser process can cost at most a bounded number of seconds, never
+an unbounded chunk of a multi-hour sync.
+
+**Rate limiting.** The retry pass reuses the SAME `crawler.RateLimiter` at
+the source's configured `rate_limit_rps` — the renderer is not a way to
+bypass crawl politeness.
+
+**SSRF posture.** The renderer independently re-validates every URL's host
+against private/loopback/link-local/reserved/multicast address space before
+navigating (mirrors, but does not import, `ingestion/app/urlscope.py`'s
+logic — this is a genuinely separate deployable) — a second, independent
+gate even though the ingestion caller only ever asks it to render pages of
+an already-validated `base_url`. It is never published on a host port
+either (compose service DNS only, `http://renderer:8090`), and an optional
+shared-secret `RENDER_TOKEN` (checked as the `X-Render-Token` header) is
+defense in depth against another container on the same compose network
+abusing it as a blind fetch-any-url proxy.
 
 ---
 

@@ -1,0 +1,163 @@
+name: Release Containers to GHCR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:0.8.2-pg16
+        env:
+          POSTGRES_USER: self_docs
+          POSTGRES_PASSWORD: testpass123
+          POSTGRES_DB: self_docs
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U self_docs -d self_docs"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 20s
+
+    env:
+      POSTGRES_USER: self_docs
+      POSTGRES_PASSWORD: testpass123
+      POSTGRES_DB: self_docs
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5433"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Lint (ruff)
+        run: make lint
+
+      - name: Type-check (mypy)
+        run: make typecheck
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5433 -U self_docs && break
+            sleep 1
+          done
+
+      - name: Configure embedding model (small/fast for CI)
+        run: |
+          python -m pip install --quiet pyyaml
+          make configure MODEL=BAAI/bge-small-en-v1.5
+
+      - name: Pre-download embedding model weights for CI
+        run: |
+          python -m pip install --quiet fastembed
+          python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
+
+      - name: Init database schema
+        run: |
+          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
+            -f db/init/01_schema.sql
+          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
+            -f db/init/02_sources_config.sql
+
+      - name: Run tests
+        run: make test
+
+  bump-version:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+      new_version: ${{ steps.tag.outputs.new_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version and push tag
+        id: tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          initial_version: 0.0.1
+
+  build-and-push:
+    needs: [verify, bump-version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ingestion, mcp-server]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Normalize repository owner to lowercase
+        id: normalize
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "REPO_LOWER=${REPO_LOWER}" >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.bump-version.outputs.new_tag }}
+            type=raw,value=${{ needs.bump-version.outputs.new_version }}
+            type=sha,format=long
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
+          cache-from: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache,mode=max
+          provenance: true
+          sbom: true

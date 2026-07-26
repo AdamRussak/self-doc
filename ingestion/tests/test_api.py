@@ -33,6 +33,7 @@ def _make_record(id: int, name: str, *, status: str = "active"):
         last_synced=None,
         last_status=None,
         llms_txt="auto",
+        js_render=False,
     )
 
 

@@ -246,6 +246,7 @@ def _make_record(**overrides) -> SourceRecord:
         language="english",
         rate_limit_rps=1.0,
         llms_txt="auto",
+        js_render=False,
         schedule_cron=None,
         enabled=True,
         status="active",

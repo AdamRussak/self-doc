@@ -45,7 +45,12 @@ ALTER TABLE doc_sources
     ADD COLUMN IF NOT EXISTS created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS llms_txt           TEXT        NOT NULL DEFAULT 'auto',
     ADD COLUMN IF NOT EXISTS llms_etag          TEXT,
-    ADD COLUMN IF NOT EXISTS llms_last_modified TEXT;
+    ADD COLUMN IF NOT EXISTS llms_last_modified TEXT,
+    -- T7: per-source opt-in for the headless-render retry path (see
+    -- app/renderer.py + the `render`-profile `renderer` compose service).
+    -- Defaults to FALSE so every existing source is completely unaffected
+    -- until an operator explicitly turns it on.
+    ADD COLUMN IF NOT EXISTS js_render          BOOLEAN     NOT NULL DEFAULT FALSE;
 
 -- CHECK constraints have no "ADD CONSTRAINT IF NOT EXISTS" form in Postgres,
 -- so guard the add with an explicit pg_constraint lookup to make re-running

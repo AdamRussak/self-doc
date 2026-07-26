@@ -58,6 +58,7 @@ def _make_record(
         last_synced=None,
         last_status=None,
         llms_txt="auto",
+        js_render=False,
     )
 
 

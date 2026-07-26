@@ -47,6 +47,7 @@ def _make_record(
         language="english",
         rate_limit_rps=1.0,
         llms_txt="auto",
+        js_render=False,
         schedule_cron=schedule_cron,
         enabled=enabled,
         status=status,
