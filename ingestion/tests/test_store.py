@@ -490,9 +490,11 @@ def test_mark_source_failed_persists_status_on_fresh_connection(conn):
     assert status == "failed"
 
 
-def test_source_status_ok_on_soft_page_failures(conn, monkeypatch):
-    # If some pages encounter soft failures (e.g. skipped extract or fetch failure)
-    # while others succeed, status should remain "ok" and pages_soft_failed incremented.
+def test_source_status_partial_on_soft_page_failure_ratio(conn, monkeypatch):
+    # If soft failures make up more than SOFT_FAIL_PARTIAL_RATIO of pages seen
+    # (here 1/2 = 0.5), status must be "partial" (not "ok") even though there
+    # are zero HARD failures — see `classify_sync`. pages_soft_failed is still
+    # incremented either way.
     source = make_source()
 
     def fake_crawl(source, client=None):
@@ -512,7 +514,7 @@ def test_source_status_ok_on_soft_page_failures(conn, monkeypatch):
     monkeypatch.setattr(store.extract, "extract", fake_extract)
 
     outcome = store.sync_source(source, conn)
-    assert outcome.status == "ok"
+    assert outcome.status == "partial"
     assert outcome.pages_fetched == 1
     assert outcome.pages_soft_failed == 1
     assert outcome.pages_failed == 0
@@ -773,7 +775,10 @@ def test_sync_source_fetch_failed_503_preserves_existing_page_verified_second_co
     assert outcome_second.pages_soft_failed == 1
     assert outcome_second.pages_failed == 0
     assert outcome_second.pages_removed == 0
-    assert outcome_second.status == "ok"
+    # Nothing was indexed or confirmed unchanged THIS run (the only page seen
+    # soft-failed) -- classify_sync reports "failed" even though the prior
+    # content is preserved untouched (see the DB assertions below).
+    assert outcome_second.status == "failed"
 
     second_conn = store.get_connection()
     try:
@@ -834,8 +839,12 @@ def test_sync_source_genuinely_absent_page_is_still_purged(conn, monkeypatch):
         second_conn.close()
 
 
-def test_sync_source_all_pages_soft_failed_reports_status_ok(conn, monkeypatch):
-    """A source whose pages all soft-fail (e.g. 404/503 fetch errors) reports status 'ok' and tracks soft failures."""
+def test_sync_source_all_pages_soft_failed_reports_status_failed(conn, monkeypatch):
+    """A source whose pages ALL soft-fail (e.g. 404/503 fetch errors) reports
+    status 'failed' -- nothing was indexed or confirmed unchanged this run --
+    while still tracking soft failures (see `test_sync_health.py`'s
+    `test_all_pages_soft_failed_should_be_failed_not_ok` for the full
+    regression-test rationale)."""
     source = make_source()
 
     def fake_crawl(source, client=None):
@@ -848,13 +857,13 @@ def test_sync_source_all_pages_soft_failed_reports_status_ok(conn, monkeypatch):
     assert outcome.pages_soft_failed == 2
     assert outcome.pages_failed == 0
     assert outcome.pages_fetched == 0
-    assert outcome.status == "ok"
+    assert outcome.status == "failed"
 
     second_conn = store.get_connection()
     try:
         with second_conn.cursor() as cur:
             cur.execute("SELECT last_status FROM doc_sources WHERE name = %s", (source.name,))
-            assert cur.fetchone()[0] == "ok"
+            assert cur.fetchone()[0] == "failed"
     finally:
         second_conn.close()
 
@@ -1005,7 +1014,7 @@ def test_recovery_mixed_source_partial_status_no_purge(conn, second_conn, monkey
     monkeypatch.setattr(store.extract, "extract", fake_extract)
 
     outcome = store.sync_source(source, conn)
-    assert outcome.status == "ok"
+    assert outcome.status == "partial"
     assert outcome.pages_fetched == 1 or outcome.pages_skipped == 1
     assert outcome.pages_soft_failed == 2
     assert outcome.pages_failed == 0

@@ -141,7 +141,6 @@ def _seed_pages(conn, monkeypatch, source: SourceConfig, urls: list[str]) -> Non
     assert outcome.pages_fetched == len(urls)
 
 
-@pytest.mark.xfail(strict=True, reason="T0: sync_source reports 'ok' when every page soft-fails; should be 'failed'")
 def test_all_pages_soft_failed_should_be_failed_not_ok(conn, monkeypatch):
     """A sync where every single page soft-fails (0 successes at all) must
     be reported 'failed' — not 'ok'. Today `sync_source` only looks at
@@ -166,10 +165,6 @@ def test_all_pages_soft_failed_should_be_failed_not_ok(conn, monkeypatch):
     assert outcome.status == "failed"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T0: sync_source reports 'ok' when 117/280 pages soft-fail (42% content loss); should be 'partial'",
-)
 def test_partial_soft_failure_ratio_should_be_partial_not_ok(conn, monkeypatch):
     """Real traefik-shaped case: 280 pages attempted, 163 succeed and 117
     soft-fail (42% content loss). Today's status logic treats any nonzero
@@ -205,10 +200,6 @@ def test_partial_soft_failure_ratio_should_be_partial_not_ok(conn, monkeypatch):
     assert outcome.status == "partial"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T0: sync_source reports 'ok' when the purge-ratio guard refuses a delete; should be 'partial'",
-)
 def test_purge_guard_refused_should_be_partial_not_ok(conn, second_conn, monkeypatch):
     """Real microsoft-clarity-shaped case: 150 existing pages, a crawl that
     (via BFS-collapse) only reaches 1 of them. coverage = 1/150 = 0.0067

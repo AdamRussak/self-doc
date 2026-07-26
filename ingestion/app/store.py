@@ -85,6 +85,28 @@ PURGE_FETCH_COVERAGE_FLOOR = 0.3
 # empty-`seen_urls` guard below still applies regardless of size.
 PURGE_RATIO_GUARD_MIN_EXISTING_PAGES = 20
 
+# --- Sync status classification --------------------------------------------
+#
+# 2026-07-26 sync-health incident: a 40-source production run reported
+# `last_status="ok"` for every single source — including 6 that indexed zero
+# pages and traefik, which silently lost 117/280 pages (42%) to soft
+# failures. Root cause was an implicit conditional chain where
+# `pages_soft_failed` counted toward both `pages_seen` (defeating the
+# "empty crawl" failed-guard) and `succeeded_any` (making any nonzero
+# soft-failure count look like a "success" as long as the HARD-failure
+# counter `pages_failed` was zero). `classify_sync` below replaces that
+# chain with an explicit, directly unit-testable set of ordered rules — see
+# its docstring for the exact rule order.
+#
+# Ratio above which soft failures alone (zero hard failures) demote an
+# otherwise-clean sync from "ok" to "partial". Calibrated against the
+# traefik incident: 117/280 = 0.418 soft-failure ratio, comfortably above
+# this floor -> must be "partial". A source with only a couple of
+# incidental soft failures out of hundreds of pages shouldn't flap to
+# "partial" on every run, hence a floor rather than "any soft failure at
+# all counts".
+SOFT_FAIL_PARTIAL_RATIO = 0.2
+
 
 def get_dsn() -> str:
     """Build a libpq keyword/value DSN from the standard Postgres env vars."""
@@ -139,6 +161,69 @@ class SourceOutcome:
     chunks_indexed: int = 0
     status: str = "ok"  # ok | partial | failed
     error: str | None = None
+
+
+def classify_sync(
+    outcome: SourceOutcome,
+    *,
+    crawl_aborted_early: bool = False,
+    purge_guard_refused: bool = False,
+) -> str:
+    """Classify one sync attempt's final `outcome` into `ok` / `partial` /
+    `failed`, as an explicit, directly-testable function of the outcome's
+    counters plus the two out-of-band signals the counters alone can't
+    convey (`crawl_aborted_early`, `purge_guard_refused`).
+
+    Rules, evaluated IN ORDER (first match wins):
+
+      failed  - cancelled by user (`outcome.error == "Aborted by user"`)
+      failed  - nothing indexed or confirmed this run:
+                `pages_fetched + pages_skipped + pages_not_modified == 0`
+                (a source where every page soft/hard-failed, or the crawl
+                saw nothing at all, must never read as "ok" — that's
+                exactly what let the 2026-07-26 incident hide 6 zero-page
+                sources as healthy)
+      partial - `purge_guard_refused` (the purge-ratio guard declining to
+                delete anything is itself an incident worth surfacing, even
+                though the pages it protected are still intact)
+      partial - `crawl_aborted_early` (the crawl broke off mid-stream; every
+                page it did reach may have succeeded, but the corpus is
+                incomplete)
+      partial - `pages_failed > 0` (at least one HARD pipeline failure)
+      partial - soft-failure ratio exceeds `SOFT_FAIL_PARTIAL_RATIO`:
+                `pages_soft_failed / pages_seen > SOFT_FAIL_PARTIAL_RATIO`,
+                where `pages_seen` includes every page category (fetched,
+                skipped, hard-failed, soft-failed, not-modified) — this is
+                the traefik case: 0 hard failures, but 117/280 (42%) of
+                pages silently lost to soft failures
+      ok      - otherwise
+    """
+    if outcome.error == "Aborted by user":
+        return "failed"
+
+    if outcome.pages_fetched + outcome.pages_skipped + outcome.pages_not_modified == 0:
+        return "failed"
+
+    if purge_guard_refused:
+        return "partial"
+
+    if crawl_aborted_early:
+        return "partial"
+
+    if outcome.pages_failed > 0:
+        return "partial"
+
+    pages_seen = (
+        outcome.pages_fetched
+        + outcome.pages_skipped
+        + outcome.pages_failed
+        + outcome.pages_soft_failed
+        + outcome.pages_not_modified
+    )
+    if pages_seen > 0 and outcome.pages_soft_failed / pages_seen > SOFT_FAIL_PARTIAL_RATIO:
+        return "partial"
+
+    return "ok"
 
 
 def ensure_source(conn: psycopg.Connection, source: SourceConfig) -> int:
@@ -288,9 +373,18 @@ def _delete_missing_pages(
     force_delete_all: bool = False,
     existing_count: int | None = None,
     successful_seen_count: int | None = None,
+    guard_refused_out: list[bool] | None = None,
 ) -> int:
     """Delete `doc_pages` rows for `source_id` whose URL was not seen in this
     crawl (i.e. removed upstream, or unreachable this run).
+
+    `guard_refused_out`, if given, is a caller-owned list this function
+    appends `True` to when (and only when) the purge-RATIO guard (case 2
+    below) is the reason nothing was deleted — as opposed to the
+    unconditional empty-`seen_urls` refusal (case 1) or simply having
+    nothing to delete. Callers (namely `sync_source`) use this to feed
+    `classify_sync`'s `purge_guard_refused` signal without duplicating the
+    ratio math here.
 
     Two layers of defense in depth, both bypassed by `force_delete_all=True`
     (an explicit, deliberate "wipe this source" opt-in — `sync_source` never
@@ -383,6 +477,8 @@ def _delete_missing_pages(
                     coverage_ratio_floor=PURGE_FETCH_COVERAGE_FLOOR,
                     hint="pass force_delete_all=True for an intentional large purge",
                 )
+                if guard_refused_out is not None:
+                    guard_refused_out.append(True)
                 return 0
 
     with conn.cursor() as cur:
@@ -649,6 +745,7 @@ def sync_source(
     # Either way, `_delete_missing_pages` also refuses an empty `seen_urls`
     # on its own (defense in depth) — this check exists to log the *reason*
     # for skipping in a way that's specific to sync_source's two cases.
+    purge_guard_refused_flag: list[bool] = []
     if crawl_aborted_early or not seen_urls:
         outcome.pages_removed = 0
         reason = "crawl_aborted_early" if crawl_aborted_early else "completed_with_zero_pages_seen"
@@ -660,40 +757,19 @@ def sync_source(
             seen_urls,
             existing_count=pre_sync_existing_count,
             successful_seen_count=len(seen_urls - fetch_failed_urls),
+            guard_refused_out=purge_guard_refused_flag,
         )
+    purge_guard_refused = bool(purge_guard_refused_flag)
 
     if cancel_event and cancel_event.is_set():
         outcome.status = "failed"
         outcome.error = "Aborted by user"
     else:
-        pages_seen = (
-            outcome.pages_fetched
-            + outcome.pages_skipped
-            + outcome.pages_failed
-            + outcome.pages_soft_failed
-            + outcome.pages_not_modified
+        outcome.status = classify_sync(
+            outcome,
+            crawl_aborted_early=crawl_aborted_early,
+            purge_guard_refused=purge_guard_refused,
         )
-        succeeded_any = (
-            outcome.pages_fetched > 0
-            or outcome.pages_skipped > 0
-            or outcome.pages_soft_failed > 0
-            or outcome.pages_not_modified > 0
-        )
-        if pages_seen == 0:
-            # A crawl that fetched/skipped/failed nothing indexed nothing — never
-            # report "ok" for an empty crawl (defeats partial/failed alerting).
-            outcome.status = "failed"
-        elif outcome.pages_failed == 0:
-            outcome.status = "ok"
-        elif succeeded_any:
-            outcome.status = "partial"
-        else:
-            outcome.status = "failed"
-
-        if crawl_aborted_early and outcome.status == "ok":
-            # The crawl itself didn't finish even though every page it did yield
-            # succeeded — never report a fully-clean "ok" for an incomplete crawl.
-            outcome.status = "partial"
 
     _update_source_status(conn, source.name, outcome.status)
     log.info(
