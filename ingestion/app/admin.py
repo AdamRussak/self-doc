@@ -34,12 +34,13 @@ import hmac
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import psycopg
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -48,6 +49,7 @@ from pydantic import ValidationError
 from . import sources_repo, store
 from .config import SUPPORTED_FTS_LANGUAGES, ConfigError, SourceConfig
 from .logging_config import get_logger
+from .source_defaults import apply_creation_defaults
 from .sources_repo import SourceRecord
 
 logger = get_logger(component="admin")
@@ -514,21 +516,53 @@ def _build_source_config(
     language: str,
     rate_limit_rps: str,
     llms_txt: str = "auto",
+    taken: Collection[str] | None = None,
 ) -> tuple[SourceConfig | None, str | None]:
     """Validate raw form strings into a `SourceConfig`. Returns
     `(cfg, None)` on success or `(None, error_message)` on failure — NEVER
     raises, so callers can always re-render the form with a visible error
-    instead of a 500."""
+    instead of a 500.
+
+    `taken` is only meaningful on the CREATE path (`create_source_submit`):
+    when supplied (not `None`), a blank `name`/`include_prefixes`/`max_pages`
+    is filled in via `apply_creation_defaults` (derived name unique against
+    `taken`, derived include-prefix scoping, and `DEFAULT_MAX_PAGES` as a
+    real ceiling) BEFORE the value ever reaches `SourceConfig`. An
+    explicitly-supplied value always wins over a derived one. `taken=None`
+    (the update path, where a blank name is never valid — the name is
+    immutable there) preserves the pre-existing blank-means-"whole
+    host"/"unlimited" behavior untouched."""
     try:
+        rate_limit_rps_value = rate_limit_rps.strip() or "1.0"
+        if taken is not None:
+            fields: dict[str, Any] = {"base_url": base_url.strip()}
+            name_stripped = name.strip()
+            if name_stripped:
+                fields["name"] = name_stripped
+            include_prefixes_stripped = include_prefixes.strip()
+            if include_prefixes_stripped:
+                fields["include_prefixes"] = _split_prefixes(include_prefixes)
+            max_pages_stripped = max_pages.strip()
+            if max_pages_stripped:
+                fields["max_pages"] = max_pages_stripped
+            fields = apply_creation_defaults(fields, taken)
+            name_value = fields["name"]
+            include_prefixes_value = fields["include_prefixes"]
+            max_pages_value = fields["max_pages"]
+        else:
+            name_value = name.strip()
+            include_prefixes_value = _split_prefixes(include_prefixes)
+            max_pages_value = max_pages.strip() or None
+
         cfg = SourceConfig(
-            name=name.strip(),
+            name=name_value,
             base_url=base_url.strip(),
             sitemap=sitemap.strip() or None,
-            include_prefixes=_split_prefixes(include_prefixes),
+            include_prefixes=include_prefixes_value,
             exclude_prefixes=_split_prefixes(exclude_prefixes),
-            max_pages=(max_pages.strip() or None),
+            max_pages=max_pages_value,
             language=language.strip() or "english",
-            rate_limit_rps=rate_limit_rps.strip(),
+            rate_limit_rps=rate_limit_rps_value,
             llms_txt=(llms_txt.strip() or "auto"),
         )
         return cfg, None
@@ -639,7 +673,7 @@ def new_source_form(request: Request, _auth=Depends(require_session)):
 @router.post("/sources/new", response_class=HTMLResponse)
 def create_source_submit(
     request: Request,
-    name: str = Form(...),
+    name: str = Form(default=""),
     base_url: str = Form(...),
     sitemap: str = Form(default=""),
     include_prefixes: str = Form(default=""),
@@ -662,6 +696,13 @@ def create_source_submit(
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
     }
+    # `taken` must include names from EVERY status (a `rejected` row still
+    # holds its name — see `derive_name`'s docstring), so this reads all
+    # sources unfiltered. Only fetched when `name` is blank: an
+    # explicitly-supplied name never needs collision resolution, and this
+    # keeps the common "name already chosen" path from paying for a query
+    # it doesn't need.
+    taken: Collection[str] = set() if name.strip() else {r.name for r in sources_repo.list_sources(conn)}
     cfg, error = _build_source_config(
         name=name,
         base_url=base_url,
@@ -672,6 +713,7 @@ def create_source_submit(
         language=language,
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
+        taken=taken,
     )
     if cfg is None:
         return templates.TemplateResponse(
@@ -680,7 +722,28 @@ def create_source_submit(
             _form_context(request, error=error, values=submitted),
             status_code=400,
         )
-    source_id = sources_repo.create_source(conn, cfg, status="active", proposed_by=None)
+    try:
+        source_id = sources_repo.create_source(conn, cfg, status="active", proposed_by=None)
+    except psycopg.errors.UniqueViolation:
+        # A duplicate name is far more likely now that name is auto-derived
+        # from base_url — re-render with a 400 and a readable error instead
+        # of letting an unhandled 500 poison the request's DB transaction.
+        if hasattr(conn, "rollback"):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.warning("admin_source_create_duplicate_name", name=cfg.name)
+        return templates.TemplateResponse(
+            request,
+            "admin/form.html",
+            _form_context(
+                request,
+                error=f"a source named {cfg.name!r} already exists — choose a different name.",
+                values=submitted,
+            ),
+            status_code=400,
+        )
     logger.info("admin_source_created", source_id=source_id, name=cfg.name)
     return RedirectResponse(url=f"/admin?msg=created+{cfg.name}", status_code=303)
 

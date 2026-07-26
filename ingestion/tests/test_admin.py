@@ -19,6 +19,7 @@ import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import psycopg
 import pytest
 from app import admin
 from app.config import SourceConfig
@@ -453,6 +454,51 @@ def test_create_valid_input_calls_create_source_and_redirects(client, csrf_token
     assert cfg.name == "widget"
     assert create_mock.call_args.kwargs["status"] == "active"
     assert create_mock.call_args.kwargs["proposed_by"] is None
+
+
+def test_create_url_only_derives_name_prefixes_and_max_pages(client, csrf_token, monkeypatch):
+    """POST of only {csrf_token, base_url} — the URL-first happy path —
+    must land as an active source with a derived name, derived
+    include_prefixes, and a real max_pages ceiling (never an empty
+    allow-whole-host list or an unbounded crawl)."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    monkeypatch.setattr(admin.sources_repo, "list_sources", MagicMock(return_value=[]))
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "base_url": "https://docs.widget.example.com/guide/"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    create_mock.assert_called_once()
+    _conn, cfg = create_mock.call_args.args
+    assert isinstance(cfg, SourceConfig)
+    assert cfg.name  # derived, non-empty
+    assert cfg.include_prefixes == ["/guide"]
+    assert cfg.max_pages == 500
+
+
+def test_create_duplicate_name_returns_400_not_500(client, csrf_token, monkeypatch):
+    _login(client)
+    monkeypatch.setattr(
+        admin.sources_repo,
+        "create_source",
+        MagicMock(side_effect=psycopg.errors.UniqueViolation("duplicate key value violates unique constraint")),
+    )
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={
+            "csrf_token": csrf_token,
+            "name": "widget",
+            "base_url": "https://widget.example.com/docs/",
+            "max_pages": "100",
+        },
+    )
+    assert resp.status_code == 400
+    assert "already exists" in resp.text.lower()
 
 
 # --- Edit / update -------------------------------------------------------------------------
