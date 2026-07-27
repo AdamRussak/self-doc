@@ -517,6 +517,111 @@ def test_create_duplicate_name_returns_400_not_500(client, csrf_token, monkeypat
     assert "already exists" in resp.text.lower()
 
 
+# --- Create: source_type='upload' (T8) ------------------------------------------------------
+
+
+def test_new_source_form_renders_source_type_radios(client, monkeypatch):
+    """The CREATE form must offer a source-type selector, defaulted to
+    'crawl', that is absent on the EDIT form (source_type is immutable
+    after creation)."""
+    _login(client)
+    resp = client.get("/admin/sources/new")
+    assert resp.status_code == 200
+    assert 'name="source_type" value="crawl" checked' in resp.text
+    assert 'name="source_type" value="upload"' in resp.text
+
+
+def test_edit_form_does_not_render_source_type_radio(client, monkeypatch):
+    _login(client)
+    record = _make_record(id=7, name="widget")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+
+    resp = client.get("/admin/sources/7")
+    assert resp.status_code == 200
+    assert 'name="source_type"' not in resp.text
+
+
+def test_create_upload_source_with_just_name_succeeds(client, csrf_token, monkeypatch):
+    """POSTing only name + source_type='upload' (no base_url at all) must
+    succeed and synthesize base_url='upload://{name}'."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "x", "source_type": "upload"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    create_mock.assert_called_once()
+    _conn, cfg = create_mock.call_args.args
+    assert isinstance(cfg, SourceConfig)
+    assert cfg.source_type == "upload"
+    assert cfg.base_url == "upload://x"
+
+
+def test_create_upload_source_ignores_submitted_base_url(client, csrf_token, monkeypatch):
+    """A submitted base_url is never trusted for source_type='upload' — the
+    sentinel is always synthesized from name, defense in depth against a
+    hand-crafted POST bypassing the hidden field."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={
+            "csrf_token": csrf_token,
+            "name": "x",
+            "source_type": "upload",
+            "base_url": "https://evil.example.com/",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    _conn, cfg = create_mock.call_args.args
+    assert cfg.base_url == "upload://x"
+
+
+def test_create_upload_without_name_returns_422(client, csrf_token, monkeypatch):
+    """The required-name 422 behavior from bbd4255 fires for source_type='upload'
+    too, not just the default 'crawl' path."""
+    _login(client)
+    create_mock = MagicMock()
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "source_type": "upload"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 422
+    create_mock.assert_not_called()
+
+
+def test_create_missing_source_type_defaults_to_crawl(client, csrf_token, monkeypatch):
+    """Backward safety: an omitted source_type field must behave exactly
+    like the pre-existing 'crawl' default path."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={
+            "csrf_token": csrf_token,
+            "name": "widget",
+            "base_url": "https://widget.example.com/docs/",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    _conn, cfg = create_mock.call_args.args
+    assert cfg.source_type == "crawl"
+    assert cfg.base_url == "https://widget.example.com/docs/"
+
+
 # --- Edit / update -------------------------------------------------------------------------
 
 
@@ -782,6 +887,43 @@ def test_build_source_config_invalid_returns_error_not_raise():
     )
     assert cfg is None
     assert error is not None
+
+
+def test_build_source_config_upload_synthesizes_base_url():
+    """source_type='upload' must ignore whatever raw base_url string was
+    passed in and synthesize the 'upload://{name}' sentinel instead."""
+    cfg, error = admin._build_source_config(
+        name="x",
+        base_url="",
+        sitemap="",
+        include_prefixes="",
+        exclude_prefixes="",
+        max_pages="",
+        language="english",
+        rate_limit_rps="1.0",
+        source_type="upload",
+        taken=set(),
+    )
+    assert error is None
+    assert isinstance(cfg, SourceConfig)
+    assert cfg.source_type == "upload"
+    assert cfg.base_url == "upload://x"
+
+
+def test_build_source_config_upload_ignores_submitted_base_url():
+    cfg, error = admin._build_source_config(
+        name="x",
+        base_url="https://evil.example.com/",
+        sitemap="",
+        include_prefixes="",
+        exclude_prefixes="",
+        max_pages="",
+        language="english",
+        rate_limit_rps="1.0",
+        source_type="upload",
+    )
+    assert error is None
+    assert cfg.base_url == "upload://x"
 
 
 def test_record_to_config_roundtrip():

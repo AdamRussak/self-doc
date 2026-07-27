@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import os
 import sys
 import threading
@@ -47,7 +48,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
-from . import admin, metrics, scheduler, security, sources_repo, store
+from . import admin, metrics, scheduler, security, sources_repo, store, uploads
 from .logging_config import get_logger
 from .metrics import (
     CHUNKS_INDEXED,
@@ -274,7 +275,107 @@ def is_sync_locked() -> bool:
     return _sync_lock.locked()
 
 
+# --- Request body size cap --------------------------------------------------------------
+#
+# Pure ASGI middleware (not `BaseHTTPMiddleware`): the 413 is sent directly
+# via `send()` rather than raised as an exception through the app stack,
+# because an exception raised out of `receive()` would otherwise be caught
+# by Starlette's outermost `ServerErrorMiddleware` (added automatically,
+# always the OUTERMOST wrapper regardless of `add_middleware` call order)
+# and turned into a generic 500 -- not the 413 this middleware exists to
+# produce. Registered below via `app.add_middleware(...)`, which accepts
+# any `cls(app, **options)`-shaped ASGI callable, not just
+# `BaseHTTPMiddleware` subclasses.
+#
+# Two-path enforcement of `uploads.MAX_UPLOAD_BYTES`:
+#   1. `Content-Length` header over the limit -> reject with 413
+#      IMMEDIATELY, before `receive()` is ever called (the body is never
+#      read at all in this path).
+#   2. No usable `Content-Length` (missing, or chunked transfer-encoding
+#      the ASGI server has already stripped down to a stream of
+#      `http.request` messages) -> accumulate the `body` bytes off each
+#      ASGI message as they arrive and reject with 413 the moment the
+#      running total exceeds the limit, WITHOUT waiting for the rest of
+#      the stream. This is the actual bypass this middleware closes: a
+#      Content-Length-only check is trivially defeated by omitting the
+#      header.
+# When the body turns out to be within bounds, the `http.request` messages
+# consumed here (to measure it) are buffered and replayed verbatim via
+# `buffered_receive` so the wrapped app/route sees an identical stream.
+#
+# Scoped to POST/PUT/PATCH only: any other method (GET/HEAD/DELETE/...) or
+# non-"http" ASGI scope (lifespan, websocket) returns through `self.app`
+# on the very first line, with zero header parsing or receive-wrapping --
+# `GET /health` and `GET /metrics` never enter the size-check branch at
+# all.
+class MaxBodySizeMiddleware:
+    def __init__(self, app, max_bytes: int = uploads.MAX_UPLOAD_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                declared = None
+            if declared is not None and declared > self.max_bytes:
+                await self._reject(send)
+                return
+
+        # Stream/accumulate: covers both "no Content-Length at all" and a
+        # Content-Length that lied (understated the true body size) -- the
+        # running total, not the declared header, is what's enforced here.
+        buffered: list[dict] = []
+        total = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            total += len(message.get("body", b"") or b"")
+            if total > self.max_bytes:
+                await self._reject(send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        index = 0
+
+        async def buffered_receive():
+            nonlocal index
+            if index < len(buffered):
+                message = buffered[index]
+                index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, buffered_receive, send)
+
+    @staticmethod
+    async def _reject(send) -> None:
+        body = json.dumps({"detail": "request body too large"}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
 app = FastAPI(title="self-docs ingestion")
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=uploads.MAX_UPLOAD_BYTES)
 
 _state: dict = {
     "running": False,

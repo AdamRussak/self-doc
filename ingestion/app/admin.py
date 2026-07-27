@@ -535,6 +535,7 @@ def _build_source_config(
     rate_limit_rps: str,
     llms_txt: str = "auto",
     js_render: bool = False,
+    source_type: str = "crawl",
     taken: Collection[str] | None = None,
 ) -> tuple[SourceConfig | None, str | None]:
     """Validate raw form strings into a `SourceConfig`. Returns
@@ -542,16 +543,30 @@ def _build_source_config(
     raises, so callers can always re-render the form with a visible error
     instead of a 500.
 
+    `source_type='upload'` synthesizes `base_url` as the fixed
+    `'upload://{name}'` sentinel here, ignoring whatever the form actually
+    submitted for `base_url` (an upload source has nothing to crawl, so
+    there is no URL to validate) — the submitted `base_url` string never
+    reaches `SourceConfig` for an upload source. `SourceConfig`'s own
+    `_base_url_matches_source_type` model validator is the real
+    enforcement point for the sentinel's exact shape; this just guarantees
+    the value handed to it is already correct.
+
     `taken` is only meaningful on the CREATE path (`create_source_submit`):
-    when supplied (not `None`), a blank `name`/`include_prefixes`/`max_pages`
-    is filled in via `apply_creation_defaults` (derived name unique against
-    `taken`, derived include-prefix scoping, and `DEFAULT_MAX_PAGES` as a
-    real ceiling) BEFORE the value ever reaches `SourceConfig`. An
+    when supplied (not `None`), a blank `include_prefixes`/`max_pages` is
+    filled in via `apply_creation_defaults` (derived include-prefix
+    scoping and `DEFAULT_MAX_PAGES` as a real ceiling) BEFORE the value
+    ever reaches `SourceConfig`. `name` itself is always required and
+    explicitly supplied by the caller now (the create form's `name` field
+    is required, see bbd4255), so `apply_creation_defaults` never derives
+    it — only include_prefixes/max_pages can still be blank-filled. An
     explicitly-supplied value always wins over a derived one. `taken=None`
     (the update path, where a blank name is never valid — the name is
     immutable there) preserves the pre-existing blank-means-"whole
     host"/"unlimited" behavior untouched."""
     try:
+        if source_type == "upload":
+            base_url = f"upload://{name.strip()}"
         rate_limit_rps_value = rate_limit_rps.strip() or "1.0"
         if taken is not None:
             fields: dict[str, Any] = {"base_url": base_url.strip()}
@@ -575,6 +590,7 @@ def _build_source_config(
 
         cfg = SourceConfig(
             name=name_value,
+            source_type=source_type,
             base_url=base_url.strip(),
             sitemap=sitemap.strip() or None,
             include_prefixes=include_prefixes_value,
@@ -695,7 +711,14 @@ def new_source_form(request: Request, _auth=Depends(require_session)):
 def create_source_submit(
     request: Request,
     name: str = Form(...),
-    base_url: str = Form(...),
+    # Not `Form(...)`: an upload-type source has no URL to submit at all
+    # (see `_build_source_config`, which synthesizes the sentinel
+    # 'upload://{name}' internally for source_type='upload' and never reads
+    # this raw value in that case). A crawl-type source with a genuinely
+    # missing base_url still gets rejected — just via SourceConfig's
+    # http(s)-format validation (400) instead of FastAPI's required-field
+    # check (422), since the field is no longer required at the Form layer.
+    base_url: str = Form(default=""),
     sitemap: str = Form(default=""),
     include_prefixes: str = Form(default=""),
     exclude_prefixes: str = Form(default=""),
@@ -704,9 +727,14 @@ def create_source_submit(
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
     js_render: str = Form(default=""),
+    # Defaults to "crawl" if missing/empty for backward safety (e.g. a
+    # stale cached form or a direct API call) — the create form itself
+    # always submits an explicit value via its source-type radio group.
+    source_type: str = Form(default="crawl"),
     _auth=Depends(require_csrf),
     conn=Depends(get_conn),
 ):
+    source_type = source_type.strip().lower() or "crawl"
     submitted = {
         "name": name,
         "base_url": base_url,
@@ -731,6 +759,7 @@ def create_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        source_type=source_type,
         taken=taken,
     )
     if cfg is None:
@@ -840,7 +869,10 @@ def update_source_submit(
 
     # `update_source` requires `name` on `SourceConfig` but never writes it
     # (see sources_repo module docstring) — reuse the existing, immutable
-    # name so validation runs against the real record identity.
+    # name so validation runs against the real record identity. `source_type`
+    # is likewise immutable after creation (no selector on the edit form —
+    # see form.html) so it is read from the stored record, never from the
+    # submitted form.
     cfg, error = _build_source_config(
         name=record.name,
         base_url=base_url,
@@ -852,6 +884,7 @@ def update_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        source_type=record.source_type,
     )
     if cfg is None:
         return templates.TemplateResponse(

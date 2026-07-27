@@ -13,6 +13,8 @@ that module.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -1068,3 +1070,231 @@ def test_api_stop_endpoint(app_module):
         assert resp.status_code == 200
         assert resp.json() == {"sync": "stopping"}
         assert app_module.admin._sync_cancel_event.is_set()
+
+
+# --- Task T7: MaxBodySizeMiddleware -------------------------------------------------------
+#
+# `app.main.MaxBodySizeMiddleware` is a raw ASGI middleware (registered via
+# `app.add_middleware(...)`, not `BaseHTTPMiddleware`) enforcing
+# `uploads.MAX_UPLOAD_BYTES` on POST/PUT/PATCH bodies via two paths: an
+# over-limit `Content-Length` header (rejected before `receive()` is ever
+# called), and a streamed/chunked body with no usable `Content-Length`
+# (rejected once accumulated bytes exceed the limit, mid-stream).
+#
+# The first group below drives the middleware directly with a tiny custom
+# `max_bytes` and a fake ASGI `receive`/`send`/downstream-`app`, so the
+# mechanism (never reads the body on the Content-Length path; never invokes
+# the downstream app once the streamed total is exceeded; replays buffered
+# messages verbatim when the body fits; skips inspection entirely for
+# non-POST/PUT/PATCH) can be asserted precisely and fast, without allocating
+# real 50 MiB payloads. The second group is an end-to-end check against the
+# real app (with the real `uploads.MAX_UPLOAD_BYTES` default) via
+# `TestClient`/`httpx.ASGITransport`.
+
+
+def _make_asgi_send_recorder():
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    return sent, send
+
+
+def test_middleware_content_length_over_limit_rejects_without_reading_body(app_module):
+    """Path 1: an over-limit `Content-Length` header must be rejected with
+    413 BEFORE `receive()` is ever invoked -- the body must never be read
+    into memory for this path.
+
+    Depends on the `app_module` fixture (unused directly) purely to force
+    `app.main` to already be imported with `SYNC_TOKEN`/DB patches in place
+    before this test's own `from app.main import ...`, so this test passes
+    regardless of test selection/order (see `test_missing_sync_token_refuses_
+    to_start`, which imports `app.main` fresh in a subprocess specifically
+    because a bare import without `SYNC_TOKEN` set is fatal)."""
+    from app.main import MaxBodySizeMiddleware
+
+    receive_calls = []
+
+    async def receive():
+        receive_calls.append(1)
+        raise AssertionError("receive() must never be called when Content-Length alone exceeds the limit")
+
+    app_calls = []
+
+    async def downstream_app(scope, receive, send):
+        app_calls.append(1)
+
+    mw = MaxBodySizeMiddleware(downstream_app, max_bytes=10)
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"content-length", b"11")],
+    }
+    sent, send = _make_asgi_send_recorder()
+
+    asyncio.run(mw(scope, receive, send))
+
+    assert receive_calls == []
+    assert app_calls == []
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 413
+    body_msg = next(m for m in sent if m["type"] == "http.response.body")
+    assert json.loads(body_msg["body"]) == {"detail": "request body too large"}
+
+
+def test_middleware_no_content_length_streams_and_rejects_over_limit(app_module):
+    """Path 2 (the actual bypass vector): a request with NO Content-Length
+    header, streamed as multiple `http.request` ASGI messages, must be
+    rejected with 413 once the accumulated bytes exceed the limit -- and the
+    downstream app must never be invoked, proving the middleware aborts
+    mid-stream rather than buffering the whole thing first."""
+    from app.main import MaxBodySizeMiddleware
+
+    chunks = [b"a" * 6, b"b" * 6]  # 12 bytes total, max_bytes=10
+    chunk_iter = iter(chunks)
+
+    async def receive():
+        try:
+            chunk = next(chunk_iter)
+            return {"type": "http.request", "body": chunk, "more_body": True}
+        except StopIteration:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+    app_calls = []
+
+    async def downstream_app(scope, receive, send):
+        app_calls.append(1)
+
+    mw = MaxBodySizeMiddleware(downstream_app, max_bytes=10)
+    scope = {"type": "http", "method": "POST", "headers": []}
+    sent, send = _make_asgi_send_recorder()
+
+    asyncio.run(mw(scope, receive, send))
+
+    assert app_calls == []
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 413
+    body_msg = next(m for m in sent if m["type"] == "http.response.body")
+    assert json.loads(body_msg["body"]) == {"detail": "request body too large"}
+
+
+def test_middleware_passes_through_body_within_limit(app_module):
+    """When the body fits within `max_bytes`, the downstream app must still
+    receive the exact same bytes via the replayed `buffered_receive`."""
+    from app.main import MaxBodySizeMiddleware
+
+    messages = [
+        {"type": "http.request", "body": b"hello ", "more_body": True},
+        {"type": "http.request", "body": b"world", "more_body": False},
+    ]
+    msg_iter = iter(messages)
+
+    async def receive():
+        return next(msg_iter)
+
+    received_body = bytearray()
+
+    async def downstream_app(scope, receive, send):
+        while True:
+            message = await receive()
+            received_body.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+    mw = MaxBodySizeMiddleware(downstream_app, max_bytes=100)
+    scope = {"type": "http", "method": "POST", "headers": []}
+    sent, send = _make_asgi_send_recorder()
+
+    asyncio.run(mw(scope, receive, send))
+
+    assert bytes(received_body) == b"hello world"
+    assert sent == []  # the middleware itself never sends a response in this path
+
+
+def test_middleware_skips_non_post_put_patch_with_zero_overhead(app_module):
+    """GET/HEAD/DELETE (and any other method) must return through the
+    downstream app on the very first line -- no header parsing, no receive
+    wrapping. Verified here by asserting the ORIGINAL `receive` callable is
+    passed through unwrapped (identity check)."""
+    from app.main import MaxBodySizeMiddleware
+
+    async def receive():
+        raise AssertionError("receive() must not be called by the middleware itself for GET")
+
+    seen = {}
+
+    async def downstream_app(scope, receive, send):
+        seen["receive"] = receive
+
+    mw = MaxBodySizeMiddleware(downstream_app, max_bytes=10)
+    scope = {"type": "http", "method": "GET", "headers": [(b"content-length", b"999999")]}
+    sent, send = _make_asgi_send_recorder()
+
+    asyncio.run(mw(scope, receive, send))
+
+    assert seen["receive"] is receive  # unwrapped: identity, not `buffered_receive`
+    assert sent == []
+
+
+def test_post_sync_with_content_length_over_max_upload_bytes_returns_413(app_module):
+    """End-to-end: hitting the real app (real `uploads.MAX_UPLOAD_BYTES`
+    default) with a declared `Content-Length` above the cap gets 413 before
+    auth or routing ever run -- this must happen even for an endpoint that
+    normally requires a bearer token, since the middleware runs first."""
+    import httpx
+
+    over_limit = app_module.uploads.MAX_UPLOAD_BYTES + 1
+
+    transport = httpx.ASGITransport(app=app_module.app)
+
+    async def _do_request():
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.post(
+                "/sync",
+                headers={"Content-Length": str(over_limit)},
+                content=b"tiny-body-much-smaller-than-declared-length",
+            )
+
+    resp = asyncio.run(_do_request())
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": "request body too large"}
+
+
+def test_post_sync_streamed_without_content_length_over_max_upload_bytes_returns_413(app_module):
+    """End-to-end bypass check: a POST with NO `Content-Length` header at
+    all (streamed body, as `httpx` sends when given an async generator
+    content) that exceeds `uploads.MAX_UPLOAD_BYTES` must still get 413 --
+    this is the case a naive Content-Length-only check would miss."""
+    import httpx
+
+    max_bytes = app_module.uploads.MAX_UPLOAD_BYTES
+    chunk = b"x" * (1024 * 1024)  # 1 MiB per chunk
+    n_chunks = (max_bytes // len(chunk)) + 2  # comfortably over the cap
+
+    async def body_stream():
+        for _ in range(n_chunks):
+            yield chunk
+
+    transport = httpx.ASGITransport(app=app_module.app)
+    async def _do_request():
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.post("/sync", content=body_stream())
+
+    resp = asyncio.run(_do_request())
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": "request body too large"}
+
+
+def test_health_and_metrics_unaffected_by_body_size_middleware(app_module):
+    """Acceptance criterion: GET /health and GET /metrics are completely
+    unaffected by the middleware -- same 200 response as the pre-existing
+    `test_health_ok`/`test_metrics_exposes_expected_series` tests, which
+    must also still pass unmodified."""
+    client = TestClient(app_module.app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+    resp2 = client.get("/metrics")
+    assert resp2.status_code == 200
