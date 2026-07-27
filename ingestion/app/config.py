@@ -13,6 +13,14 @@ Schema (per IMPLEMENTATION_PLAN.md §2 `sources.yaml` schema):
         rate_limit_rps: 1.0         # optional, default 1.0
         js_render: false            # optional, default false — see T7 below
 
+`source_type` (default `'crawl'`): set to `'upload'` for a source whose
+content comes from a document upload (Markdown/text, HTML, PDF, zip bundle)
+rather than a crawl. An upload source's `base_url` is not a network address —
+it is the fixed sentinel `'upload://{name}'` — so it never triggers a crawl
+and is excluded from `sources_repo.due_sources()`'s scheduling query. See
+`_base_url_matches_source_type` below for the validation split between the
+two `source_type`s.
+
 Validation fails fast (raises `ConfigError`) on:
   - duplicate `name` values
   - missing/invalid `base_url` (must be a valid http(s) URL)
@@ -123,7 +131,12 @@ class SourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(pattern=NAME_PATTERN)
-    base_url: HttpUrl
+    source_type: Literal["crawl", "upload"] = "crawl"
+    # NOTE: not `HttpUrl` — an upload source's base_url is the
+    # 'upload://{name}' sentinel, which is not an http(s) URL. Format is
+    # enforced per-source_type by `_base_url_matches_source_type` below
+    # instead of by the field's own type.
+    base_url: str
     sitemap: HttpUrl | None = None
     include_prefixes: list[str] = Field(default_factory=list)
     exclude_prefixes: list[str] = Field(default_factory=list)
@@ -150,6 +163,40 @@ class SourceConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
+    def _base_url_matches_source_type(self) -> SourceConfig:
+        # Upload sources have no crawled base_url: the entire http(s) + SSRF +
+        # placeholder-host guard family below (`_sitemap_shares_base_url_host`,
+        # `_hosts_must_not_be_private`, `_base_url_must_not_be_placeholder`,
+        # `_base_url_passes_own_prefix_filters`) exists to protect a NETWORK
+        # FETCH an upload source never performs — raw bytes come from a local
+        # upload, never a URL fetch — so those checks are unreachable for
+        # source_type='upload' (each returns early below) and this validator
+        # instead requires the fixed 'upload://{name}' sentinel exactly. For
+        # source_type='crawl' (the default), this validator preserves the
+        # original `HttpUrl`-typed field's behavior byte-for-byte: reject
+        # anything that isn't a valid http(s) URL, then normalize `base_url`
+        # to the canonical form `HttpUrl` would have produced.
+        if self.source_type == "upload":
+            expected = f"upload://{self.name}"
+            if self.base_url != expected:
+                raise ValueError(
+                    f"source '{self.name}': an upload-type source's base_url must be "
+                    f"exactly {expected!r} (the upload sentinel URL) — got "
+                    f"{self.base_url!r}"
+                )
+            return self
+
+        try:
+            parsed = HttpUrl(self.base_url)
+        except ValidationError as e:
+            raise ValueError(
+                f"source '{self.name}': base_url {self.base_url!r} is not a valid "
+                f"http(s) URL: {e}"
+            ) from e
+        self.base_url = str(parsed)
+        return self
+
+    @model_validator(mode="after")
     def _sitemap_shares_base_url_host(self) -> SourceConfig:
         # SSRF guard (security review H1): `sitemap` is fetched BEFORE any of
         # its `<loc>` entries are host-filtered, and a `<sitemapindex>` fans
@@ -157,7 +204,7 @@ class SourceConfig(BaseModel):
         # base_url's host closes both: the root request is in-scope by
         # construction and every child is checkable against the same host.
         # This is a real constraint on every real doc site.
-        if self.sitemap is None:
+        if self.source_type == "upload" or self.sitemap is None:
             return self
         base_host = urlparse(str(self.base_url)).netloc
         sitemap_host = urlparse(str(self.sitemap)).netloc
@@ -178,7 +225,10 @@ class SourceConfig(BaseModel):
         # space at validation time — before a human is ever shown an approval
         # prompt. Fails closed on an unresolvable host. See
         # `urlscope._resolve_is_private` for the accepted DNS-rebinding
-        # residual.
+        # residual. Unreachable for source_type='upload' — see
+        # `_base_url_matches_source_type`.
+        if self.source_type == "upload":
+            return self
         for field_name, value in (("base_url", self.base_url), ("sitemap", self.sitemap)):
             if value is None:
                 continue
@@ -201,7 +251,10 @@ class SourceConfig(BaseModel):
         # page that got indexed under a trusted source name) leaked into the
         # production doc index. Reject them at validation time so this class
         # of placeholder can never be re-added, whether from a hand-edited
-        # sources.yaml or a copy-pasted test fixture.
+        # sources.yaml or a copy-pasted test fixture. Unreachable for
+        # source_type='upload' — see `_base_url_matches_source_type`.
+        if self.source_type == "upload":
+            return self
         for field_name, value in (("base_url", self.base_url), ("sitemap", self.sitemap)):
             if value is None:
                 continue
@@ -221,8 +274,9 @@ class SourceConfig(BaseModel):
         # source's own include/exclude_prefixes, the seed is filtered out
         # before the first fetch and the source silently indexes nothing
         # (see security/lesson: nextjs base_url `/docs` vs include_prefixes
-        # `["/docs/"]`). Fail fast at config-load time instead.
-        if self.sitemap is not None:
+        # `["/docs/"]`). Fail fast at config-load time instead. Unreachable
+        # for source_type='upload' — see `_base_url_matches_source_type`.
+        if self.source_type == "upload" or self.sitemap is not None:
             return self
         path = urlparse(str(self.base_url)).path or "/"
         if not _path_allowed(path, self.include_prefixes, self.exclude_prefixes):

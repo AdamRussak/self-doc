@@ -12,7 +12,13 @@ CREATE TABLE doc_sources (
     llms_txt           TEXT NOT NULL DEFAULT 'auto'
                             CHECK (llms_txt IN ('auto', 'off', 'only')),
     llms_etag          TEXT,
-    llms_last_modified TEXT
+    llms_last_modified TEXT,
+    -- 'crawl' (default): base_url is a live site crawled by the ingestion
+    -- pipeline. 'upload': base_url is an 'upload://{name}/{rel_path}'
+    -- sentinel — content came from an uploaded file (Markdown/HTML/PDF/zip)
+    -- rather than a crawl; see db/init/04_upload_sources.sql.
+    source_type        TEXT NOT NULL DEFAULT 'crawl'
+                            CHECK (source_type IN ('crawl', 'upload'))
 );
 
 CREATE TABLE doc_pages (

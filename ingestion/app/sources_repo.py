@@ -111,6 +111,10 @@ SOURCE_COLUMNS: tuple[str, ...] = (
     "created_at",
     "last_synced",
     "last_status",
+    # Appended, NOT reordered: other code and tests index SOURCE_COLUMNS by
+    # position. 'crawl' (scheduled by due_sources) or 'upload' (never
+    # scheduled — see due_sources' WHERE clause below).
+    "source_type",
 )
 
 _SELECT_COLUMNS_SQL = ", ".join(SOURCE_COLUMNS)
@@ -142,6 +146,13 @@ class SourceRecord:
     created_at: datetime
     last_synced: datetime | None
     last_status: str | None
+    # Always exactly 'crawl' or 'upload', never None (see `_row_to_record`'s
+    # defensive fallback below). Contract for T6/T8/T11. Defaulted to
+    # 'crawl' (rather than a required kwarg) so pre-existing test call sites
+    # across the suite that construct a `SourceRecord` directly (test_main.py,
+    # test_api.py, test_scheduler.py, test_sync_health.py — outside this
+    # task's touch-list) keep working unmodified.
+    source_type: str = "crawl"
 
 
 @dataclass(frozen=True)
@@ -184,6 +195,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         created_at,
         last_synced,
         last_status,
+        source_type,
     ) = row
     return SourceRecord(
         id=id_,
@@ -204,13 +216,18 @@ def _row_to_record(row: tuple) -> SourceRecord:
         created_at=created_at,
         last_synced=last_synced,
         last_status=last_status,
+        # Defense in depth, mirroring language/llms_txt above: contract
+        # guarantees this is never None even if a row somehow has a NULL/
+        # empty value (should be impossible given the DB's NOT NULL DEFAULT).
+        source_type=source_type if source_type in ("crawl", "upload") else "crawl",
     )
 
 
 def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
     """`SourceConfig` -> the plain-value tuple shared by every write path:
     `(base_url, sitemap, include_prefixes, exclude_prefixes, max_pages,
-    language, rate_limit_rps, llms_txt, js_render)`. Pure — no DB, no I/O.
+    language, rate_limit_rps, llms_txt, js_render, source_type)`. Pure — no
+    DB, no I/O.
 
     `name` is deliberately excluded: `create_source` writes it once at
     insert time (a source's `name` is its stable identity, see
@@ -227,6 +244,7 @@ def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
         cfg.rate_limit_rps,
         str(cfg.llms_txt),
         bool(cfg.js_render),
+        cfg.source_type,
     )
 
 
@@ -244,6 +262,7 @@ def _cfg_matches_record(cfg: SourceConfig, record: SourceRecord) -> bool:
         and abs(cfg.rate_limit_rps - record.rate_limit_rps) < 1e-9
         and cfg.llms_txt == record.llms_txt
         and bool(cfg.js_render) == record.js_render
+        and cfg.source_type == record.source_type
     )
 
 
@@ -438,7 +457,7 @@ def create_source(
     if status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status!r}: must be one of {VALID_STATUSES}")
 
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render, source_type = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -446,8 +465,8 @@ def create_source(
             """
             INSERT INTO doc_sources
                 (name, base_url, sitemap, include_prefixes, exclude_prefixes,
-                 max_pages, language, rate_limit_rps, llms_txt, js_render, status, proposed_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 max_pages, language, rate_limit_rps, llms_txt, js_render, source_type, status, proposed_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -461,6 +480,7 @@ def create_source(
                 rate_limit_rps,
                 llms_txt,
                 js_render,
+                source_type,
                 status,
                 proposed_by,
             ),
@@ -479,7 +499,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
     (`name` is immutable via this function; `source_id` is the identity) and
     does not touch `status`/`enabled`/`schedule_cron`/`proposed_by` — use
     `set_status` for status changes. DB-dependent."""
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render, source_type = (
         _cfg_to_write_values(cfg)
     )
     with conn.cursor() as cur:
@@ -488,7 +508,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
             UPDATE doc_sources
             SET base_url = %s, sitemap = %s, include_prefixes = %s,
                 exclude_prefixes = %s, max_pages = %s, language = %s,
-                rate_limit_rps = %s, llms_txt = %s, js_render = %s
+                rate_limit_rps = %s, llms_txt = %s, js_render = %s, source_type = %s
             WHERE id = %s
             """,
             (
@@ -501,6 +521,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
                 rate_limit_rps,
                 llms_txt,
                 js_render,
+                source_type,
                 source_id,
             ),
         )
@@ -564,10 +585,13 @@ def set_enabled(conn: psycopg.Connection, source_id: int, enabled: bool) -> None
 
 
 def due_sources(conn: psycopg.Connection, now: datetime) -> list[SourceRecord]:
-    """Sources that are `enabled`, `status='active'`, have a non-null
-    `schedule_cron`, and whose cron expression matches `now`. A pending or
-    disabled source (or one with no `schedule_cron` at all) is NEVER
-    returned — enforced by the SQL WHERE clause.
+    """Sources that are `enabled`, `status='active'`, `source_type='crawl'`,
+    have a non-null `schedule_cron`, and whose cron expression matches `now`.
+    A pending or disabled source, an upload source, or one with no
+    `schedule_cron` at all is NEVER returned — enforced by the SQL WHERE
+    clause. Upload sources have no crawl to schedule (their content arrives
+    via document upload, not a periodic fetch), so they are excluded
+    unconditionally regardless of `enabled`/`status`/`schedule_cron`.
 
     A row whose `schedule_cron` is unparseable is SKIPPED (logged loudly,
     not raised) rather than halting the whole pass — see `_select_due_records`
@@ -580,6 +604,7 @@ def due_sources(conn: psycopg.Connection, now: datetime) -> list[SourceRecord]:
             f"""
             SELECT {_SELECT_COLUMNS_SQL} FROM doc_sources
             WHERE enabled = TRUE AND status = 'active' AND schedule_cron IS NOT NULL
+                  AND source_type = 'crawl'
             ORDER BY name
             """
         )

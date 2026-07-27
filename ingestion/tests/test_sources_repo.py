@@ -69,6 +69,7 @@ def _row_from_cfg(
     created_at: datetime = datetime(2026, 1, 1, 0, 0, 0),
     last_synced: datetime | None = None,
     last_status: str | None = None,
+    source_type: str | None = None,
 ) -> tuple:
     """Build a plain row tuple in SOURCE_COLUMNS order the way a real
     `SELECT ... FROM doc_sources` would return it (psycopg hands back TEXT[]
@@ -92,6 +93,7 @@ def _row_from_cfg(
         "created_at": created_at,
         "last_synced": last_synced,
         "last_status": last_status,
+        "source_type": source_type if source_type is not None else cfg.source_type,
     }
     return tuple(values[col] for col in SOURCE_COLUMNS)
 
@@ -139,7 +141,7 @@ def test_cfg_to_write_values_matches_row_mapping() -> None:
     SourceConfig's fields map to plain values — this is the fidelity the
     round-trip test above exercises end to end."""
     cfg = _make_cfg()
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render = (
+    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render, *_ = (
         _cfg_to_write_values(cfg)
     )
     row = _row_from_cfg(cfg, id_=1)
