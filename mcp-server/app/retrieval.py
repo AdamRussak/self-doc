@@ -19,6 +19,7 @@ import atexit
 import hashlib
 import ipaddress
 import os
+import re
 import socket
 import time
 from collections.abc import Collection
@@ -33,7 +34,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
-from app.source_defaults import apply_creation_defaults
+from app.source_defaults import _slugify, apply_creation_defaults
 
 logger = structlog.get_logger(__name__)
 
@@ -47,8 +48,15 @@ logger = structlog.get_logger(__name__)
 # default row in config/models.yaml — the parity tests enforce it.
 DEFAULT_MODEL_NAME = "mixedbread-ai/mxbai-embed-large-v1"
 DEFAULT_QUERY_PROMPT = "Represent this sentence for searching relevant passages: "
+# PASSAGE_PROMPT is the mcp-server-side counterpart of ingestion/app/embedder.py's
+# EMBEDDING_PASSAGE_PROMPT, used only by upload_text (T11) to embed
+# MCP-uploaded content on the same asymmetric passage side ingestion's crawl
+# pipeline uses — empty for mxbai/bge, same env var name so a `make configure`
+# run that sets EMBEDDING_PASSAGE_PROMPT for ingestion also takes effect here.
+DEFAULT_PASSAGE_PROMPT = ""
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
 QUERY_PROMPT = os.environ.get("EMBEDDING_QUERY_PROMPT", DEFAULT_QUERY_PROMPT)
+PASSAGE_PROMPT = os.environ.get("EMBEDDING_PASSAGE_PROMPT", DEFAULT_PASSAGE_PROMPT)
 RRF_K = 60
 ARM_CANDIDATE_LIMIT = 30
 
@@ -177,6 +185,17 @@ def _embed_query(query: str) -> str:
     use plain `embed()`."""
     model = get_embedding_model()
     (vector,) = list(model.embed([QUERY_PROMPT + query]))
+    return _format_vector_literal(vector)
+
+
+def _embed_passage(text: str) -> str:
+    """Embed a document/passage chunk (upload_text's use case), prepending
+    PASSAGE_PROMPT — the asymmetric counterpart to `_embed_query`, mirroring
+    ingestion/app/embedder.py's `embed_chunks` prompt handling for a single
+    chunk at a time (upload_text's expected batch sizes are small enough that
+    ingestion's batched-embed call shape isn't needed here)."""
+    model = get_embedding_model()
+    (vector,) = list(model.embed([PASSAGE_PROMPT + text]))
     return _format_vector_literal(vector)
 
 
@@ -414,7 +433,23 @@ class ProposedSourceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(pattern=NAME_PATTERN)
-    base_url: HttpUrl
+    # Field-for-field mirror of ingestion/app/config.py's SourceConfig.source_type
+    # (T2) — kept in sync by the drift-guard test
+    # test_proposed_source_config_stays_in_sync_with_ingestion_source_config.
+    # NOTE: propose_doc_source (the only caller that builds a ProposedSourceConfig)
+    # never sets this to anything but the 'crawl' default — this tool proposes
+    # CRAWL sources only, per CLAUDE.md's propose->human-approve model. An
+    # upload-type source can only be created by a human via the admin UI
+    # (T8/T9); adding a value here does NOT grant any new capability.
+    source_type: Literal["crawl", "upload"] = "crawl"
+    # NOT `HttpUrl` (field-for-field mirror requirement — the drift-guard test
+    # compares annotations directly): ingestion/app/config.py's `SourceConfig`
+    # switched this to a plain `str` in T2 because an upload-type source's
+    # base_url is the non-http(s) `upload://{name}` sentinel. http(s)-URL
+    # validation for `source_type='crawl'` (the only value propose_doc_source
+    # ever produces) now happens in `_base_url_matches_source_type` below
+    # instead of via the field's own type, exactly mirroring SourceConfig.
+    base_url: str
     sitemap: HttpUrl | None = None
     include_prefixes: list[str] = Field(default_factory=list)
     exclude_prefixes: list[str] = Field(default_factory=list)
@@ -441,6 +476,35 @@ class ProposedSourceConfig(BaseModel):
         return normalized
 
     @model_validator(mode="after")
+    def _base_url_matches_source_type(self) -> ProposedSourceConfig:
+        # Mirrors ingestion/app/config.py's `SourceConfig._base_url_matches_source_type`
+        # byte-for-behavior-equivalent (see module note above `ProposedSourceConfig`).
+        # propose_doc_source never sets source_type='upload' (only the admin UI
+        # can create an upload-type source), so the `upload` branch below is
+        # unreachable in practice today — it exists purely so this validator,
+        # and therefore the field it guards, stays a true field-for-field
+        # mirror of SourceConfig for the drift-guard test.
+        if self.source_type == "upload":
+            expected = f"upload://{self.name}"
+            if self.base_url != expected:
+                raise ValueError(
+                    f"source '{self.name}': an upload-type source's base_url must be "
+                    f"exactly {expected!r} (the upload sentinel URL) — got "
+                    f"{self.base_url!r}"
+                )
+            return self
+
+        try:
+            parsed = HttpUrl(self.base_url)
+        except ValidationError as e:
+            raise ValueError(
+                f"source '{self.name}': base_url {self.base_url!r} is not a valid "
+                f"http(s) URL: {e}"
+            ) from e
+        self.base_url = str(parsed)
+        return self
+
+    @model_validator(mode="after")
     def _sitemap_shares_base_url_host(self) -> ProposedSourceConfig:
         # SSRF guard (security review H1): `sitemap` is fetched BEFORE any of
         # its `<loc>` entries are host-filtered, and a `<sitemapindex>` fans
@@ -448,7 +512,7 @@ class ProposedSourceConfig(BaseModel):
         # base_url's host closes both: the root request is in-scope by
         # construction and every child is checkable against the same host.
         # Mirrors ingestion/app/config.py's `SourceConfig._sitemap_shares_base_url_host`.
-        if self.sitemap is None:
+        if self.source_type == "upload" or self.sitemap is None:
             return self
         base_host = urlparse(str(self.base_url)).netloc
         sitemap_host = urlparse(str(self.sitemap)).netloc
@@ -662,3 +726,234 @@ def propose_source(
     assert row is not None
     logger.info("propose_doc_source", name=cfg.name, source_id=row["id"])
     return row["id"]
+
+
+# ---------------------------------------------------------------------------
+# upload_doc_text (T11): agent-facing write of Markdown/text content into an
+# EXISTING `source_type='upload'` doc_sources row. Unlike propose_source
+# above (which only ever INSERTs a status='pending' doc_sources row for a
+# human to approve later), this function can NEVER create or modify a
+# doc_sources row — it only ever reads one (by name) to check its id/
+# source_type/language, then writes doc_pages/doc_chunks for that existing
+# source id. That is what makes it structurally impossible for this tool to
+# create a source or write into a crawl-type source: there is no `INSERT
+# INTO doc_sources` anywhere in this function, and the `source_type != 'upload'`
+# check below runs before any doc_pages/doc_chunks write.
+#
+# mcp-server cannot import ingestion/app/store.py (separate package/build
+# context — see the module note above `ProposedSourceConfig`), so the
+# chunk/embed/insert primitives below are a deliberately MINIMAL, PURPOSE-BUILT
+# duplicate rather than a full mirror of ingestion's pipeline:
+#   - chunking: `_chunk_upload_content` is a simplified sibling of
+#     ingestion/app/chunker.py's heading-aware, tokenizer-windowed chunker —
+#     same heading-breadcrumb idea, but windowed by a character budget
+#     instead of an actual BGE token count (no code-fence-aware unit
+#     splitting, no overlap), so this file does not need a hard dependency on
+#     `tokenizers`/downloading a tokenizer.json for a feature whose expected
+#     input (an agent-pasted note, capped at 1 MB) is short-form text rather
+#     than a full crawled page.
+#   - embedding: `_embed_passage` reuses the SAME `get_embedding_model()` /
+#     `_format_vector_literal` primitives `_embed_query` already uses for
+#     search, just on the passage side (PASSAGE_PROMPT instead of
+#     QUERY_PROMPT) — this is the asymmetric counterpart already established
+#     in this file, adapted rather than reinvented.
+#   - insert: `upload_text` replicates `ingestion/app/store.py`'s
+#     `replace_page`'s exact DELETE-then-INSERT shape and its
+#     `hash_markdown`-style SHA-256 `content_hash` convention (delete any
+#     existing doc_pages row for this url, insert a fresh one, insert its
+#     chunks) rather than reinventing a different write shape.
+# ---------------------------------------------------------------------------
+
+MAX_UPLOAD_CONTENT_BYTES = 1_000_000  # 1 MB
+MAX_UPLOAD_TITLE_CHARS = 200
+
+# Char budget for _chunk_upload_content: a coarse proxy for
+# ingestion/app/chunker.py's MIN_TOKENS..MAX_TOKENS window (400-600 BGE
+# tokens) using ~4 chars/BGE-subword-token as a standard rule-of-thumb for
+# English prose (~4 * 500 =~ 2000), instead of an actual tokenizer count —
+# see the module note above this section for why.
+UPLOAD_CHUNK_CHAR_BUDGET = 2000
+
+_UPLOAD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+class UploadError(ValueError):
+    """Raised when an upload_doc_text call is rejected: unknown source name,
+    a source that isn't source_type='upload', or content/title exceeding
+    their size caps. Message is human-readable and safe to return directly
+    to the calling agent."""
+
+
+def _split_upload_into_heading_sections(content: str) -> list[tuple[str, str]]:
+    """Split `content` into (heading_path, section_text) pairs on markdown
+    heading boundaries (# .. ######), tracking a breadcrumb the same way
+    ingestion/app/chunker.py's `_split_into_heading_segments` does. A
+    deliberately simpler sibling (no fenced-code-block handling) — see the
+    module note above `MAX_UPLOAD_CONTENT_BYTES`."""
+    lines = content.splitlines()
+    breadcrumb: list[str] = []
+    sections: list[tuple[str, list[str]]] = [("", [])]
+
+    for line in lines:
+        match = _UPLOAD_HEADING_RE.match(line)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            breadcrumb = breadcrumb[: level - 1]
+            while len(breadcrumb) < level - 1:
+                breadcrumb.append("")
+            breadcrumb.append(title)
+            heading_path = " > ".join(b for b in breadcrumb if b)
+            sections.append((heading_path, []))
+            continue
+        sections[-1][1].append(line)
+
+    return [
+        (heading, "\n".join(section_lines).strip())
+        for heading, section_lines in sections
+        if "\n".join(section_lines).strip()
+    ]
+
+
+def _chunk_upload_content(content: str, *, char_budget: int = UPLOAD_CHUNK_CHAR_BUDGET) -> list[dict]:
+    """Chunk `content` into `{heading_path, chunk_index, content}` dicts:
+    split on heading boundaries, then greedily pack each section's
+    paragraphs (blank-line separated) into windows of at most `char_budget`
+    characters, with no overlap. A single paragraph longer than
+    `char_budget` becomes its own oversize chunk rather than being split
+    mid-paragraph."""
+    chunk_index = 0
+    chunks: list[dict] = []
+    for heading_path, section_text in _split_upload_into_heading_sections(content):
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", section_text) if p.strip()]
+        if not paragraphs:
+            continue
+
+        window: list[str] = []
+        window_len = 0
+        for para in paragraphs:
+            if window and window_len + len(para) > char_budget:
+                chunks.append(
+                    {
+                        "heading_path": heading_path,
+                        "chunk_index": chunk_index,
+                        "content": "\n\n".join(window),
+                    }
+                )
+                chunk_index += 1
+                window = []
+                window_len = 0
+            window.append(para)
+            window_len += len(para)
+        if window:
+            chunks.append(
+                {
+                    "heading_path": heading_path,
+                    "chunk_index": chunk_index,
+                    "content": "\n\n".join(window),
+                }
+            )
+            chunk_index += 1
+
+    return chunks
+
+
+def upload_text(*, source: str, title: str, content: str) -> str:
+    """Slugify `title`, chunk+embed `content`, and write it into an EXISTING
+    `source_type='upload'` doc_sources row named `source` (by name, not id).
+
+    Raises `UploadError` (never a raw exception) on:
+      - `source` not found in `doc_sources`,
+      - `source`'s `source_type != 'upload'` (this function NEVER writes into
+        a crawl-type source, and never creates a `doc_sources` row — see the
+        module note above `MAX_UPLOAD_CONTENT_BYTES`),
+      - `content` exceeding `MAX_UPLOAD_CONTENT_BYTES` (measured in UTF-8
+        bytes) or `title` exceeding `MAX_UPLOAD_TITLE_CHARS` (measured in
+        characters) — either cap being exceeded rejects the WHOLE call with
+        no partial processing.
+
+    The page URL is the sentinel `upload://{source}/{slug}.md`, where `slug`
+    is `title` slugified via `app.source_defaults._slugify` (the same
+    slugify helper `derive_name` already uses elsewhere in this file) —
+    re-uploading under the same `title` therefore replaces the same page
+    (DELETE-then-INSERT, matching `ingestion/app/store.py`'s `replace_page`
+    shape) rather than accumulating duplicates.
+    """
+    if len(title) > MAX_UPLOAD_TITLE_CHARS:
+        raise UploadError(
+            f"title is {len(title)} characters, exceeding the {MAX_UPLOAD_TITLE_CHARS}-character cap"
+        )
+
+    content_bytes = len(content.encode("utf-8"))
+    if content_bytes > MAX_UPLOAD_CONTENT_BYTES:
+        raise UploadError(
+            f"content is {content_bytes} bytes, exceeding the {MAX_UPLOAD_CONTENT_BYTES}-byte (1 MB) cap"
+        )
+
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # The ONLY doc_sources access in this whole function: a read, by
+            # name. There is no INSERT/UPDATE against doc_sources anywhere in
+            # upload_text — see the module note above `MAX_UPLOAD_CONTENT_BYTES`.
+            cur.execute(
+                "SELECT id, source_type, language FROM doc_sources WHERE name = %s",
+                (source,),
+            )
+            source_row = cur.fetchone()
+            if source_row is None:
+                raise UploadError(f"unknown source '{source}'")
+            if source_row["source_type"] != "upload":
+                raise UploadError(
+                    f"source '{source}' does not accept uploads (source_type="
+                    f"{source_row['source_type']!r}) — only a source_type='upload' source, "
+                    "created by a human in the admin UI, accepts content through this tool"
+                )
+            source_id = source_row["id"]
+            fts_config = source_row["language"]
+
+            slug = _slugify(title) or "untitled"
+            url = f"upload://{source}/{slug}.md"
+
+            chunks = _chunk_upload_content(content)
+            if not chunks:
+                raise UploadError("content has no indexable text after chunking")
+
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            # Mirrors ingestion/app/store.py's `replace_page`: delete any
+            # existing doc_pages row for this url (ON DELETE CASCADE wipes
+            # its old chunks), then insert a fresh page + chunk rows.
+            cur.execute("DELETE FROM doc_pages WHERE url = %s", (url,))
+            cur.execute(
+                """
+                INSERT INTO doc_pages (source_id, url, content_hash)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (source_id, url, content_hash),
+            )
+            page_row = cur.fetchone()
+            assert page_row is not None
+            page_id = page_row["id"]
+
+            for chunk in chunks:
+                vector_literal = _embed_passage(chunk["content"])
+                cur.execute(
+                    """
+                    INSERT INTO doc_chunks (page_id, heading_path, chunk_index, content, embedding, fts_config)
+                    VALUES (%(page_id)s, %(heading_path)s, %(chunk_index)s, %(content)s,
+                            %(embedding)s::vector, %(fts_config)s::regconfig)
+                    """,
+                    {
+                        "page_id": page_id,
+                        "heading_path": chunk["heading_path"],
+                        "chunk_index": chunk["chunk_index"],
+                        "content": chunk["content"],
+                        "embedding": vector_literal,
+                        "fts_config": fts_config,
+                    },
+                )
+
+    logger.info("upload_doc_text", source=source, url=url, chunk_count=len(chunks))
+    return f"Uploaded '{title}' to source '{source}' as {len(chunks)} chunk(s) (url={url})."

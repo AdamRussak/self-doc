@@ -88,7 +88,13 @@ def model() -> TextEmbedding:
 # table) keeps this suite from ever touching genuine indexed sources
 # (fastapi, traefik, docker-compose, pgvector-readme, ...) when run against
 # the live DB.
-_TEST_SOURCE_NAMES = ("source-a", "source-b", "source-fr")
+_TEST_SOURCE_NAMES = (
+    "source-a",
+    "source-b",
+    "source-fr",
+    "source-crawl-reject",
+    "source-upload-target",
+)
 
 
 def _purge_test_sources(c) -> None:
@@ -139,11 +145,17 @@ class _PoolShim:
         return _NoCloseCtx(self._conn)
 
 
-def _insert_source(conn, name: str, base_url: str = "https://example.com/", language: str = "english") -> int:
+def _insert_source(
+    conn,
+    name: str,
+    base_url: str = "https://example.com/",
+    language: str = "english",
+    source_type: str = "crawl",
+) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO doc_sources (name, base_url, language) VALUES (%s, %s, %s) RETURNING id",
-            (name, base_url, language),
+            "INSERT INTO doc_sources (name, base_url, language, source_type) VALUES (%s, %s, %s, %s) RETURNING id",
+            (name, base_url, language, source_type),
         )
         row = cur.fetchone()
     conn.commit()
@@ -257,3 +269,107 @@ def test_source_filter_restricts_results(seeded):
 
     result_right_source = retrieval.search("wibblefratz", source="source-b", limit=5)
     assert "b-wibble" in result_right_source
+
+
+# ---------------------------------------------------------------------------
+# upload_text (T11) — DB-backed tests. Size-cap rejections (title > 200
+# chars, content > 1 MB) run before any DB access and are covered in
+# test_retrieval.py instead (no live Postgres required there).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def upload_pool(conn, model, monkeypatch):
+    """Patches retrieval.get_pool/get_embedding_model onto the fixture's own
+    connection/model, WITHOUT pre-inserting any doc_sources row — for tests
+    that need a real DB round-trip (the SELECT FROM doc_sources lookup
+    upload_text starts with) but supply their own source rows (or none, for
+    the unknown-source case)."""
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _PoolShim(conn))
+    monkeypatch.setattr(retrieval, "get_embedding_model", lambda: model)
+    return conn
+
+
+def test_upload_text_rejects_unknown_source(upload_pool):
+    with pytest.raises(retrieval.UploadError, match="unknown source"):
+        retrieval.upload_text(source="does-not-exist-xyz-upload-test", title="T", content="hello world")
+
+
+def test_upload_text_rejects_crawl_type_source(upload_pool):
+    _insert_source(upload_pool, "source-crawl-reject")  # default source_type='crawl'
+    with pytest.raises(retrieval.UploadError, match="does not accept uploads"):
+        retrieval.upload_text(source="source-crawl-reject", title="T", content="hello world")
+
+
+def test_upload_text_happy_path_inserts_and_is_retrievable(upload_pool):
+    _insert_source(
+        upload_pool,
+        "source-upload-target",
+        base_url="upload://source-upload-target",
+        source_type="upload",
+    )
+
+    result = retrieval.upload_text(
+        source="source-upload-target",
+        title="Zzqfrobnicate Guide",
+        content="Use zzqfrobnicate() to purge the internal cache index for uploaded docs.",
+    )
+
+    assert "source-upload-target" in result
+    assert "Rejected" not in result
+
+    search_result = retrieval.search("zzqfrobnicate", source="source-upload-target", limit=5)
+    assert "zzqfrobnicate" in search_result
+    assert "upload://source-upload-target/" in search_result
+
+
+def test_upload_text_never_issues_insert_into_doc_sources(upload_pool):
+    """Structural guardrail: spy on every SQL statement upload_text executes
+    against the real connection and assert it never contains an INSERT INTO
+    doc_sources — the critical property that makes it impossible for this
+    tool to create a source or repurpose an existing crawl-type source."""
+    _insert_source(
+        upload_pool,
+        "source-upload-target",
+        base_url="upload://source-upload-target",
+        source_type="upload",
+    )
+
+    conn = upload_pool
+    executed_sql: list[str] = []
+    real_cursor = conn.cursor
+
+    class _SpyCursor:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._cur = self._inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+        def execute(self, sql, params=None):
+            executed_sql.append(str(sql))
+            return self._cur.execute(sql, params)
+
+        def fetchone(self):
+            return self._cur.fetchone()
+
+        def fetchall(self):
+            return self._cur.fetchall()
+
+    conn.cursor = lambda *a, **k: _SpyCursor(real_cursor(*a, **k))
+    try:
+        retrieval.upload_text(
+            source="source-upload-target",
+            title="No Source Insert",
+            content="This call must never write a doc_sources row.",
+        )
+    finally:
+        conn.cursor = real_cursor
+
+    assert not any("insert into doc_sources" in sql.lower() for sql in executed_sql)
+    assert any("insert into doc_pages" in sql.lower() for sql in executed_sql)
+    assert any("insert into doc_chunks" in sql.lower() for sql in executed_sql)

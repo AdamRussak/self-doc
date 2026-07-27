@@ -3,6 +3,14 @@ export
 
 PREFIX ?= $(HOME)/.local
 
+# Captured once at parse time (before a `PATH=` command-line override to the
+# `upload` target below can take effect) so that override — which
+# necessarily shadows the shell PATH variable for its "file or directory to
+# upload" argument, and which the `export` directive above would otherwise
+# broadcast into every recipe's environment — can be restored just for the
+# `upload` recipe's own command invocation instead of breaking it.
+ORIG_PATH := $(shell echo $$PATH)
+
 # Single source of truth for the isolated `db-test` service's connection
 # settings. `export` above pushes these into every recipe's environment, so
 # BOTH docker-compose.test.yml (which reads ${TEST_POSTGRES_USER:-...} etc.,
@@ -16,7 +24,7 @@ TEST_POSTGRES_USER ?= self_docs
 TEST_POSTGRES_PASSWORD ?= testpass123
 TEST_POSTGRES_DB ?= self_docs
 
-.PHONY: up down up-prod down-prod sync test test-db-up test-db-down test-db-reset build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
+.PHONY: up down up-prod down-prod sync upload test test-db-up test-db-down test-db-reset build-cli test-cli install-cli install-skill install eval lint typecheck configure reindex backup backup-prune backup-auto restore purge refresh stop
 
 # Select the embedding model from config/models.yaml. Resolves the model's
 # vector dimension and per-service memory limits, writes them into .env, and
@@ -95,6 +103,15 @@ refresh:
 		-H "Authorization: Bearer $(SYNC_TOKEN)" \
 		-H "Content-Type: application/json" \
 		-d '{"source": "$(SOURCE)"}'
+
+# Upload local files (Markdown/text, HTML, PDF, zip bundles) into an existing
+# source_type='upload' doc source. Directories are walked recursively.
+# Usage: make upload SOURCE=my-docs PATH=./some/docs/dir
+# (PATH="$(ORIG_PATH)" below restores the real shell PATH for this one
+# command — see the ORIG_PATH comment near the top of this file.)
+upload:
+	@if [ -z "$(SOURCE)" ] || [ -z "$(PATH)" ]; then echo "Usage: make upload SOURCE=<name> PATH=<file_or_dir>"; exit 1; fi
+	PATH="$(ORIG_PATH)" python3 scripts/upload_docs.py --source "$(SOURCE)" "$(PATH)"
 
 # Stop the running sync. Usage: make stop
 stop:

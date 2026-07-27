@@ -149,6 +149,34 @@ def propose_doc_source(
     )
 
 
+@mcp.tool
+def upload_doc_text(source: str, title: str, content: str) -> str:
+    """Add a page of Markdown/plain text to an EXISTING upload-type
+    documentation source. `source` is a NAME (not an id) of a doc source a
+    HUMAN has already created as `source_type='upload'` via the admin UI —
+    this tool can NEVER create a new source and can NEVER write into a
+    crawl-type source; both are rejected. `content` is capped at 1 MB and
+    `title` at 200 characters (either cap being exceeded rejects the whole
+    call with no partial processing); `title` is slugified into the stored
+    page's URL, so re-uploading under the same `title` replaces that page
+    rather than duplicating it. Rejected (with a clear reason) if `source`
+    does not exist, is not an upload-type source, or either cap is
+    exceeded."""
+    try:
+        return retrieval.upload_text(source=source, title=title, content=content)
+    except retrieval.UploadError as e:
+        return f"Rejected: {e}"
+    except Exception:
+        # Defense in depth: this tool must NEVER raise back to the MCP
+        # client (unlike propose_doc_source, which only guards the known
+        # ProposalError case) — an unexpected failure (e.g. the DB or the
+        # embedding model being unavailable) is logged server-side and
+        # reported generically, never with raw exception detail that could
+        # leak internal state to the calling agent.
+        logger.exception("upload_doc_text_failed", source=source, title=title)
+        return "Rejected: upload failed unexpectedly due to an internal error."
+
+
 @mcp.custom_route("/metrics", methods=["GET"])
 async def metrics(request: Request) -> Response:
     """Prometheus scrape endpoint (search_requests_total, search_latency_seconds)."""

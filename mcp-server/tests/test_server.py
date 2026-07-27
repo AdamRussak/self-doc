@@ -1051,6 +1051,57 @@ def test_propose_doc_source_tool_rejects_status_kwarg():
         )
 
 
+# ---------------------------------------------------------------------------
+# upload_doc_text tool wrapper (T11)
+# ---------------------------------------------------------------------------
+
+
+def test_upload_doc_text_tool_passes_args_through_and_returns_success_message(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server.retrieval,
+        "upload_text",
+        lambda **kwargs: calls.append(kwargs) or "Uploaded 'T' to source 's' as 1 chunk(s) (url=upload://s/t.md).",
+    )
+
+    result = server.upload_doc_text(source="s", title="T", content="hello world")
+
+    assert calls == [{"source": "s", "title": "T", "content": "hello world"}]
+    assert "Uploaded" in result
+    assert "Rejected" not in result
+
+
+def test_upload_doc_text_tool_converts_upload_error_to_rejected_string(monkeypatch):
+    monkeypatch.setattr(
+        server.retrieval,
+        "upload_text",
+        lambda **kwargs: (_ for _ in ()).throw(retrieval.UploadError("unknown source 's'")),
+    )
+
+    result = server.upload_doc_text(source="s", title="T", content="hello world")
+
+    assert result == "Rejected: unknown source 's'"
+
+
+def test_upload_doc_text_tool_never_raises_on_unexpected_exception(monkeypatch):
+    """The tool must never throw back to the MCP client, even for a totally
+    unexpected failure (e.g. the DB connection dying mid-call) — unlike
+    UploadError, this is not a case retrieval.upload_text itself guards."""
+
+    def _boom(**kwargs):
+        raise RuntimeError("db connection reset by peer: password=hunter2")
+
+    monkeypatch.setattr(server.retrieval, "upload_text", _boom)
+
+    result = server.upload_doc_text(source="s", title="T", content="hello world")
+
+    assert result.startswith("Rejected:")
+    # The raw exception text (which could carry sensitive detail, e.g. a
+    # connection string) must never reach the caller.
+    assert "hunter2" not in result
+    assert "RuntimeError" not in result
+
+
 def test_metrics_returns_200_with_no_auth_header():
     """Regression guard: /metrics MUST stay unauthenticated. It backs the
     Dockerfile HEALTHCHECK — if this breaks, the container restart-loops."""
