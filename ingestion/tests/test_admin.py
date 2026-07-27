@@ -851,6 +851,160 @@ def test_sync_missing_source_is_404(client, csrf_token, monkeypatch):
     assert resp.status_code == 404
 
 
+# --- Upload (T9) -------------------------------------------------------------------------
+
+
+def _upload_record(**overrides) -> SourceRecord:
+    defaults = dict(source_type="upload", base_url="upload://widget-uploads", name="widget-uploads")
+    defaults.update(overrides)
+    return _make_record(**defaults)
+
+
+def test_upload_rejects_unauthenticated(client):
+    resp = client.post("/admin/sources/1/upload", files={"files": ("a.md", b"# hi", "text/markdown")})
+    assert resp.status_code == 401
+
+
+def test_upload_rejects_missing_csrf_token(client):
+    _login(client)
+    resp = client.post("/admin/sources/1/upload", files={"files": ("a.md", b"# hi", "text/markdown")})
+    assert resp.status_code == 403
+
+
+def test_upload_rejects_wrong_csrf_token(client):
+    _login(client)
+    resp = client.post(
+        "/admin/sources/1/upload",
+        data={"csrf_token": "not-the-right-value"},
+        files={"files": ("a.md", b"# hi", "text/markdown")},
+    )
+    assert resp.status_code == 403
+
+
+def test_upload_against_crawl_source_is_409(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _make_record(id=1, name="widget", source_type="crawl")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/1/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.md", b"# hi", "text/markdown")},
+    )
+    assert resp.status_code == 409
+    ingest_mock.assert_not_called()
+
+
+def test_upload_missing_source_is_404(client, csrf_token, monkeypatch):
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=None))
+    resp = client.post(
+        "/admin/sources/999/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.md", b"# hi", "text/markdown")},
+    )
+    assert resp.status_code == 404
+
+
+def test_upload_returns_409_with_message_when_lock_held(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    # Simulate the lock already being held by another in-flight sync/upload.
+    assert admin._manual_sync_lock.acquire(blocking=False)
+    try:
+        resp = client.post(
+            "/admin/sources/5/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("a.md", b"# hi", "text/markdown")},
+        )
+        assert resp.status_code == 409
+        assert "already" in resp.text.lower()
+        assert "Traceback" not in resp.text
+        ingest_mock.assert_not_called()
+        # The route must not further acquire (or release) the lock: it
+        # remains held by this test's own acquire, untouched.
+        assert admin._manual_sync_lock.locked()
+    finally:
+        admin._manual_sync_lock.release()
+
+
+def test_upload_parser_exception_still_releases_lock(client, csrf_token, monkeypatch):
+    """A non-UploadError exception raised mid-parse (e.g. a genuine parser
+    bug) must not leak the sync lock: the `finally` in `upload_source_submit`
+    releases it even though the exception itself propagates."""
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+
+    release_spy = MagicMock(side_effect=admin.release_sync_lock)
+    monkeypatch.setattr(admin, "release_sync_lock", release_spy)
+    monkeypatch.setattr(admin.uploads, "parse_upload", MagicMock(side_effect=RuntimeError("parser exploded")))
+
+    with pytest.raises(RuntimeError, match="parser exploded"):
+        client.post(
+            "/admin/sources/5/upload",
+            data={"csrf_token": csrf_token},
+            files={"files": ("a.md", b"# hi", "text/markdown")},
+        )
+
+    release_spy.assert_called_once()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_upload_all_files_fail_rerenders_form_with_first_error(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    def fake_parse_upload(filename, data):
+        raise admin.UploadError("could not read that file")
+
+    monkeypatch.setattr(admin.uploads, "parse_upload", fake_parse_upload)
+
+    resp = client.post(
+        "/admin/sources/5/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.txt", b"whatever", "text/plain")},
+    )
+    assert resp.status_code == 400
+    assert "could not read that file" in resp.text
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_upload_happy_path_calls_ingest_and_redirects(client, csrf_token, monkeypatch):
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status="ok", pages_fetched=1, chunks_indexed=3)
+    ingest_mock = MagicMock(return_value=outcome)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/5/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["hx-trigger"] == "syncStatusUpdated"
+    ingest_mock.assert_called_once()
+    call_args = ingest_mock.call_args
+    assert call_args.args[1] is record
+    docs = call_args.args[2]
+    assert len(docs) == 1
+    assert docs[0].markdown == "# hello world"
+    assert not admin._manual_sync_lock.locked()
+
+
 # --- Pure helper unit tests (no DB, no HTTP) ------------------------------------------------
 
 

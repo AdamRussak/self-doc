@@ -146,4 +146,22 @@
     </div>
   </form>
 </div>
+
+{% if record and record.source_type == 'upload' %}
+<div class="card" style="margin-top: 1.5rem;">
+  <h2>Upload files</h2>
+  <p class="hint">Upload Markdown/text, HTML, PDF, or zip-bundle files to index into this source.
+    Raw file bytes are never stored &mdash; only parsed Markdown, chunks, and embeddings.</p>
+  <form method="post" action="/admin/sources/{{ record.id }}/upload" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-group">
+      <label for="upload-files" style="margin-top: 0;">Files</label>
+      <input type="file" id="upload-files" name="files" multiple required accept=".md,.markdown,.txt,.html,.htm,.pdf,.zip">
+    </div>
+    <div class="actions" style="margin-top: 1rem;">
+      <button type="submit" class="btn btn-primary">Upload</button>
+    </div>
+  </form>
+</div>
+{% endif %}
 {% endblock %}

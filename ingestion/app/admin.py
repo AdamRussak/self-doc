@@ -13,6 +13,7 @@ Routes (see module docstring sections below for detail):
     POST /admin/sources/{id}           update (config + schedule + enabled)
     POST /admin/sources/{id}/delete    delete (cascades pages+chunks)
     POST /admin/sources/{id}/sync      manual sync trigger
+    POST /admin/sources/{id}/upload    upload files (source_type='upload' only)
     POST /admin/sources/{id}/approve   pending -> active
     POST /admin/sources/{id}/reject    pending -> rejected
     GET  /admin/login                  login form (unauthenticated)
@@ -41,16 +42,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 import psycopg
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
-from . import sources_repo, store
+from . import sources_repo, store, upload_zip, uploads
 from .config import SUPPORTED_FTS_LANGUAGES, ConfigError, SourceConfig
 from .logging_config import get_logger
 from .source_defaults import apply_creation_defaults
 from .sources_repo import SourceRecord
+from .uploads import UploadedDoc, UploadError
 
 logger = get_logger(component="admin")
 
@@ -398,6 +400,79 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
                     "error": exc_message or _sync_status.get("message", "Sync failed unexpectedly"),
+                    "finished_at": time.time(),
+                }
+            _sync_status["message"] = ""
+        finally:
+            release_sync_lock()
+
+
+def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factory: Callable[[], Any], source_id: int) -> None:
+    """Worker for background upload ingestion — mirrors `_bg_sync_single`
+    exactly, swapping `store.sync_source_with_metrics` for
+    `store.ingest_uploaded_docs`. Only reached in production (non-pytest,
+    non-`SYNC_RUNNER_SYNC`) requests via `run_sync_task`; the lock acquired
+    by `upload_source_submit` before calling this is released here, in the
+    background thread, once ingestion completes (or fails)."""
+    _sync_status["running"] = True
+    _sync_status["source"] = record.name
+    _sync_status["started_at"] = time.time()
+    _sync_status["completed_at"] = None
+    _sync_status["message"] = f"Uploading to {record.name}..."
+    _sync_status["pages_fetched"] = 0
+    _sync_status["chunks_indexed"] = 0
+    _sync_status["pages_skipped"] = 0
+    _sync_status["pages_failed"] = 0
+    _sync_status["shell_suspected_count"] = 0
+    _sync_status["pages_js_rendered"] = 0
+    _sync_status["last_url"] = ""
+    outcome: store.SourceOutcome | None = None
+    exc_message: str | None = None
+    try:
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
+            conn = conn_factory()
+            outcome = store.ingest_uploaded_docs(conn, record, docs, progress_cb=_on_sync_progress)
+        else:
+            conn = store.get_connection()
+            try:
+                outcome = store.ingest_uploaded_docs(conn, record, docs, progress_cb=_on_sync_progress)
+            finally:
+                conn.close()
+        logger.info("admin_upload_ingest_complete", source_id=source_id, name=record.name, status=outcome.status)
+    except Exception as exc:
+        exc_message = str(exc)
+        logger.error("admin_upload_ingest_failed", source_id=source_id, name=record.name, error=str(exc))
+    finally:
+        try:
+            _sync_status["running"] = False
+            _sync_status["source"] = ""
+            _sync_status["started_at"] = None
+            _sync_status["completed_at"] = time.time()
+            if outcome is not None:
+                status_str = _safe_str(outcome, "status") or "ok"
+                _sync_status["last_completed_summary"] = {
+                    "source": record.name,
+                    "status": status_str,
+                    "pages_fetched": _safe_int(outcome, "pages_fetched"),
+                    "chunks_indexed": _safe_int(outcome, "chunks_indexed"),
+                    "pages_skipped": _safe_int(outcome, "pages_skipped"),
+                    "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
+                    "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
+                    "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                    "error": _safe_str(outcome, "error"),
+                    "finished_at": time.time(),
+                }
+            else:
+                _sync_status["last_completed_summary"] = {
+                    "source": record.name,
+                    "status": "failed",
+                    "pages_fetched": _sync_status.get("pages_fetched", 0),
+                    "chunks_indexed": _sync_status.get("chunks_indexed", 0),
+                    "pages_skipped": _sync_status.get("pages_skipped", 0),
+                    "pages_failed": _sync_status.get("pages_failed", 0) + 1,
+                    "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
+                    "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "error": exc_message or _sync_status.get("message", "Upload ingestion failed unexpectedly"),
                     "finished_at": time.time(),
                 }
             _sync_status["message"] = ""
@@ -1191,6 +1266,131 @@ def refresh_source_submit(
         status_code=303,
         headers={"HX-Trigger": "syncStatusUpdated"},
     )
+
+
+# --- Upload (source_type='upload' only) -----------------------------------------------------
+
+
+def _upload_edit_values(record: SourceRecord) -> dict:
+    """Rebuild the same `values` dict `edit_source_form` renders for
+    `record`, for re-rendering `admin/form.html` (the edit view) with an
+    error after a failed upload — mirrors `edit_source_form`'s dict
+    construction exactly so the re-rendered form looks identical to a fresh
+    GET of the edit page."""
+    return {
+        "name": record.name,
+        "base_url": record.base_url,
+        "sitemap": record.sitemap or "",
+        "include_prefixes": _join_prefixes(record.include_prefixes),
+        "exclude_prefixes": _join_prefixes(record.exclude_prefixes),
+        "max_pages": str(record.max_pages) if record.max_pages is not None else "",
+        "language": record.language,
+        "rate_limit_rps": str(record.rate_limit_rps),
+        "llms_txt": record.llms_txt or "auto",
+        "js_render": record.js_render,
+        "schedule_cron": record.schedule_cron or "",
+        "enabled": record.enabled,
+    }
+
+
+@router.post("/sources/{source_id}/upload", response_class=HTMLResponse)
+def upload_source_submit(
+    source_id: int,
+    request: Request,
+    files: list[UploadFile] = File(...),
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    """Parse uploaded files (Markdown/text, HTML, PDF, zip bundles) and
+    index them into an existing `source_type='upload'` source.
+
+    Raw bytes are read here (via the blocking `upload.file.read()` sync
+    file handle FastAPI provides to a `def` route) and handed to parsers
+    that return in-memory `UploadedDoc`s — never written to disk. `.zip`
+    uploads go through `upload_zip.expand_zip` directly (not the thin
+    `uploads.parse_upload` registry wrapper) so per-member failures can be
+    surfaced individually; every other supported suffix goes through
+    `uploads.parse_upload`.
+    """
+    record = sources_repo.get_source(conn, source_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    if record.source_type != "upload":
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Cannot upload",
+                "message": f"source {record.name!r} is source_type={record.source_type!r}, not 'upload' — uploads only apply to upload-type sources.",
+            },
+            status_code=409,
+        )
+
+    acquired = try_acquire_sync_lock()
+    if not acquired:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Sync already running",
+                "message": "another sync/upload is already in progress; try again shortly.",
+            },
+            status_code=409,
+        )
+
+    # Ownership of the lock transfers to the background thread once handed
+    # off via `run_sync_task`; every OTHER return path below (the no-docs
+    # 400, the inline-ingest success path, and any exception raised while
+    # reading/parsing files) must release it itself before returning or
+    # re-raising — hence `handed_off` gating the `finally` below, mirroring
+    # `sync_source_submit`'s acquire/hand-off/release pattern.
+    handed_off = False
+    try:
+        docs: list[UploadedDoc] = []
+        errors: list[str] = []
+        for upload in files:
+            filename = upload.filename or ""
+            data = upload.file.read()
+            try:
+                if filename.lower().endswith(".zip"):
+                    result = upload_zip.expand_zip(filename, data)
+                    docs.extend(result.docs)
+                    errors.extend(f"{failure.member}: {failure.reason}" for failure in result.failures)
+                else:
+                    docs.extend(uploads.parse_upload(filename, data))
+            except UploadError as e:
+                errors.append(str(e))
+
+        if not docs:
+            error_message = errors[0] if errors else "No parsable content found in the uploaded file(s)."
+            return templates.TemplateResponse(
+                request,
+                "admin/form.html",
+                _form_context(request, record=record, error=error_message, values=_upload_edit_values(record)),
+                status_code=400,
+            )
+
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
+            outcome = store.ingest_uploaded_docs(conn, record, docs, progress_cb=_on_sync_progress)
+            logger.info("admin_upload_ingest_complete", source_id=source_id, name=record.name, status=outcome.status)
+            return RedirectResponse(
+                url=f"/admin/sources/{source_id}?msg=uploaded+{record.name}:+{outcome.status}",
+                status_code=303,
+                headers={"HX-Trigger": "syncStatusUpdated"},
+            )
+
+        handed_off = True
+        run_sync_task(_bg_ingest_upload, record, docs, lambda: conn, source_id)
+        return RedirectResponse(
+            url=f"/admin/sources/{source_id}?msg=upload_started+{record.name}",
+            status_code=303,
+            headers={"HX-Trigger": "syncStatusUpdated"},
+        )
+    finally:
+        if not handed_off:
+            release_sync_lock()
 
 
 @router.post("/sync-all", response_class=HTMLResponse)
