@@ -155,6 +155,22 @@ def test_upload_text_rejects_oversized_content():
         upload_text(source="whatever", title="T", content=oversized_content)
 
 
+def test_upload_text_rejects_oversized_content_measured_in_utf8_bytes_not_chars():
+    # '€' (U+20AC) is a single Python character but 3 bytes in UTF-8.
+    # Choose a char count whose *character* length is comfortably under
+    # MAX_UPLOAD_CONTENT_BYTES but whose UTF-8 *byte* length exceeds it —
+    # this differentiates the documented "measured in UTF-8 bytes" behavior
+    # from a buggy len(content) char-count check, which this content would
+    # slip past undetected.
+    n_chars = (MAX_UPLOAD_CONTENT_BYTES // 3) + 10
+    content = "€" * n_chars
+    assert len(content) < MAX_UPLOAD_CONTENT_BYTES  # char count alone would NOT be rejected
+    assert len(content.encode("utf-8")) > MAX_UPLOAD_CONTENT_BYTES  # byte count IS over the cap
+
+    with pytest.raises(UploadError, match="byte"):
+        upload_text(source="whatever", title="T", content=content)
+
+
 def test_upload_text_rejects_no_partial_processing_on_oversized_content(monkeypatch):
     # Confirms the size check happens BEFORE get_pool() is ever called —
     # "no partial processing" means an oversized call must not touch the DB

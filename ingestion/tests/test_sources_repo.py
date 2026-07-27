@@ -535,6 +535,40 @@ def test_due_sources_excludes_pending_and_disabled(db_conn: psycopg.Connection) 
 
 
 @pytestmark_live
+def test_due_sources_excludes_upload_type_at_sql_layer(db_conn: psycopg.Connection) -> None:
+    """`due_sources()`'s SQL WHERE clause carries its own
+    `AND source_type = 'crawl'` filter (see the module docstring on
+    `due_sources`), independent of the `enabled`/`status`/`schedule_cron`
+    filters already covered by `test_due_sources_excludes_pending_and_
+    disabled`. An upload-type source with every OTHER due-condition
+    satisfied (enabled, active, a matching schedule_cron) must still never
+    be returned -- proving the exclusion happens at the SQL layer itself,
+    not merely as an accidental side effect of upload sources typically
+    lacking a schedule."""
+    now = datetime(2026, 7, 19, 3, 0)
+
+    crawl_id = sources_repo.create_source(db_conn, _make_cfg(name="due-crawl-control"), status="active")
+    upload_cfg = SourceConfig.model_validate(
+        {
+            "name": "due-upload-excluded",
+            "source_type": "upload",
+            "base_url": "upload://due-upload-excluded",
+        }
+    )
+    upload_id = sources_repo.create_source(db_conn, upload_cfg, status="active")
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE doc_sources SET schedule_cron = %s WHERE id = %s", ("0 3 * * *", crawl_id))
+        # Same matching schedule_cron, same enabled/status as the crawl
+        # control -- the only difference is source_type='upload'.
+        cur.execute("UPDATE doc_sources SET schedule_cron = %s WHERE id = %s", ("0 3 * * *", upload_id))
+
+    due_ids = {r.id for r in sources_repo.due_sources(db_conn, now)}
+    assert crawl_id in due_ids
+    assert upload_id not in due_ids
+
+
+@pytestmark_live
 def test_set_schedule_validates_before_writing(db_conn: psycopg.Connection) -> None:
     source_id = sources_repo.create_source(db_conn, _make_cfg(name="schedule-target"))
 
