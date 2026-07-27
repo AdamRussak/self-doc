@@ -37,6 +37,7 @@ def _make_record(
     status: str = "active",
     base_url: str | None = None,
     proposed_by: str | None = None,
+    source_type: str = "crawl",
 ):
     """Build a `SourceRecord` with plausible defaults for tests that don't
     care about most fields — only `id`/`name`/`status` typically matter."""
@@ -61,6 +62,7 @@ def _make_record(
         last_status=None,
         llms_txt="auto",
         js_render=False,
+        source_type=source_type,
     )
 
 
@@ -310,6 +312,32 @@ def test_sync_default_all_sources_excludes_pending(app_module, monkeypatch):
         resp = client.post("/sync", headers={"Authorization": "Bearer test-token-123"})
         assert resp.status_code == 200
         assert resp.json()["sources"] == ["active-a"]
+
+
+def test_sync_default_all_sources_excludes_upload_sources(app_module, monkeypatch):
+    """T19_FIX: an unscoped "sync everything" call must also exclude
+    `source_type='upload'` sources -- they have no URL to crawl. Previously
+    `_resolve_sync_targets` had no `source_type` filter, so an upload source
+    was swept into the unscoped `/sync` sweep, `_record_to_config` built a
+    valid-but-uncrawlable config for it (once source_type is threaded
+    through), `store.sync_source` refused to run it, and
+    `_run_sync_blocking`'s per-source exception handler called
+    `store.mark_source_failed()` -- marking it `last_status='failed'` and
+    emitting a failed-sync metric on every single run. A mix of crawl +
+    upload sources must only ever target the crawl sources."""
+    import app.sources_repo as sources_repo
+
+    records = [
+        _make_record(1, "active-crawl", status="active", source_type="crawl"),
+        _make_record(2, "active-upload", status="active", source_type="upload", base_url="upload://active-upload"),
+    ]
+    monkeypatch.setattr(sources_repo, "list_sources", lambda conn: records)
+    monkeypatch.setattr(app_module, "_run_sync_blocking", lambda names, sources_by_name: None)
+
+    with TestClient(app_module.app) as client:
+        resp = client.post("/sync", headers={"Authorization": "Bearer test-token-123"})
+        assert resp.status_code == 200
+        assert resp.json()["sources"] == ["active-crawl"]
 
 
 def test_sync_source_crash_marks_status_failed_on_fresh_connection(app_module, monkeypatch):
@@ -1235,6 +1263,93 @@ def test_middleware_skips_non_post_put_patch_with_zero_overhead(app_module):
 
     assert seen["receive"] is receive  # unwrapped: identity, not `buffered_receive`
     assert sent == []
+
+
+def test_middleware_bounds_aggregate_inflight_bytes_across_concurrent_requests(app_module, monkeypatch):
+    """T20 MEDIUM fix: the per-request `max_bytes` cap alone does not bound
+    memory across CONCURRENT requests -- N concurrent requests could each
+    buffer up to `max_bytes` at once. `_INFLIGHT_CAP_BYTES` (a module-level
+    counter shared by every in-flight request, see the class docstring)
+    must keep the AGGREGATE buffered total bounded regardless of how many
+    requests arrive at once: with the cap set low enough that only 2 of 5
+    concurrent 5-byte-chunk requests can fit, the other 3 must be rejected
+    (503) rather than being allowed to buffer on top of the first two, and
+    the aggregate counter must never exceed the cap while they're all
+    in-flight, returning to exactly 0 once every request has finished."""
+    import app.main as main_module
+
+    cap = 12  # room for exactly 2 requests worth of 5-byte chunks
+    monkeypatch.setattr(main_module, "_INFLIGHT_CAP_BYTES", cap)
+    monkeypatch.setattr(main_module, "_inflight_buffered_bytes", 0)
+
+    hold = asyncio.Event()
+    n_requests = 5
+    chunk = b"x" * 5
+
+    def make_receive():
+        state = {"n": 0}
+
+        async def receive():
+            state["n"] += 1
+            if state["n"] == 1:
+                await asyncio.sleep(0)
+                return {"type": "http.request", "body": chunk, "more_body": True}
+            await hold.wait()
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return receive
+
+    async def downstream_app(scope, receive, send):
+        while True:
+            message = await receive()
+            if not message.get("more_body", False):
+                break
+
+    mw = main_module.MaxBodySizeMiddleware(downstream_app, max_bytes=1000)
+
+    async def run_one():
+        scope = {"type": "http", "method": "POST", "headers": []}
+        sent, send = _make_asgi_send_recorder()
+        await mw(scope, make_receive(), send)
+        return sent
+
+    async def scenario():
+        tasks = [asyncio.ensure_future(run_one()) for _ in range(n_requests)]
+        # Pump the event loop until every task has either finished (rejected)
+        # or settled into awaiting `hold` (admitted) -- no fixed sleep, just
+        # cooperative yields until nothing changes anymore.
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+        pending = [t for t in tasks if not t.done()]
+        done = [t for t in tasks if t.done()]
+
+        # Invariant under test: with cap=12 and 5-byte chunks, exactly
+        # floor(12 / 5) == 2 requests can be admitted (10 <= 12; a 3rd would
+        # need 15 > 12) -- regardless of which 2 of the 5 concurrent
+        # requests happened to reserve first. The other 3 must be rejected
+        # rather than piling their bytes on top of the first two.
+        assert len(pending) == 2
+        assert len(done) == 3
+        assert main_module._inflight_buffered_bytes == len(pending) * len(chunk) == 10
+        assert main_module._inflight_buffered_bytes <= cap
+        # Anything already finished at this point was rejected for being
+        # over the aggregate cap (busy), not the per-request cap (too big).
+        for t in done:
+            sent = t.result()
+            start = next(m for m in sent if m["type"] == "http.response.start")
+            assert start["status"] == 503
+
+        hold.set()
+        remaining = await asyncio.gather(*pending)
+        for sent in remaining:
+            # Admitted requests were never rejected.
+            assert sent == []
+
+        # No leaked reservations once every request has finished.
+        assert main_module._inflight_buffered_bytes == 0
+
+    asyncio.run(scenario())
 
 
 def test_post_sync_with_content_length_over_max_upload_bytes_returns_413(app_module):

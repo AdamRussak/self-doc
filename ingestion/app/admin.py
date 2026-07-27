@@ -481,7 +481,18 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
 
 
 def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -> None:
-    """Worker for background full sync across all active sources."""
+    """Worker for background full sync across all active sources.
+
+    `sources` is filtered to exclude `source_type == 'upload'` records
+    UP FRONT, before either branch below builds any `SourceConfig` --
+    previously a single upload source in the batch made `_record_to_config`
+    raise (see its docstring) and aborted the ENTIRE full sync at the
+    `except Exception` below, so no crawl source synced at all (T19_FIX).
+    This mirrors `store.sync_all`'s own upload-skip guard, but is enforced
+    here too since the `PYTEST_CURRENT_TEST`/`SYNC_RUNNER_SYNC` branch below
+    calls `sync_source_with_metrics` directly per source rather than going
+    through `store.sync_all`, so that guard alone would not have covered it."""
+    sources = [s for s in sources if s.source_type != "upload"]
     _sync_cancel_event.clear()
     _sync_status["running"] = True
     _sync_status["source"] = "All Active Sources"
@@ -688,9 +699,23 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
     Pure, no DB. The `SourceConfig`-shaped columns are re-validated here
     (not merely trusted) because they last passed validation at whatever
     time they were written; re-validating on the sync path is cheap and
-    catches a hand-edited-in-SQL row before it reaches the crawler."""
+    catches a hand-edited-in-SQL row before it reaches the crawler.
+
+    `source_type` MUST be threaded through from `record` here: omitting it
+    silently defaulted to `'crawl'`, so an upload-type record's
+    `base_url='upload://{name}'` sentinel got validated against the crawl
+    URL-scheme rule and raised `pydantic.ValidationError` before any of the
+    upload-aware guards in the callers below ever ran (see T19_FIX). Every
+    crawl entrypoint below now checks `record.source_type == 'upload'` and
+    refuses BEFORE calling this function, so this is defense in depth, not
+    the primary guard -- but it also means a caller that forgets to check
+    first fails with a clean, correctly-typed `SourceConfig` (which
+    `store.sync_source` itself still refuses to crawl) rather than a
+    validation crash.
+    """
     return SourceConfig(
         name=record.name,
+        source_type=record.source_type,
         base_url=record.base_url,
         sitemap=record.sitemap,
         include_prefixes=record.include_prefixes,
@@ -1042,6 +1067,26 @@ def sync_source_submit(
             },
             status_code=409,
         )
+    # T19_FIX: this MUST be checked before `_record_to_config`/lock
+    # acquisition below -- an upload-type source's `base_url` is the
+    # `upload://{name}` sentinel, which is not a crawlable URL at all
+    # ("cannot sync" is correct, not a pending-crawl-config bug). Checking
+    # here (before `try_acquire_sync_lock()`) means the lock is never even
+    # acquired for this rejection, so there is nothing to leak.
+    if record.source_type == "upload":
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Cannot sync",
+                "message": (
+                    f"source {record.name!r} is source_type='upload' — it has no URL to crawl; "
+                    "use the upload form on its edit page instead."
+                ),
+            },
+            status_code=409,
+        )
 
     acquired = try_acquire_sync_lock()
     if not acquired:
@@ -1182,6 +1227,27 @@ def refresh_source_submit(
             },
             status_code=409,
         )
+    # T19_FIX: checked before ANY lock acquisition or `store.purge_source`
+    # call below. "Refresh" = purge-then-recrawl; an upload-type source has
+    # nothing to recrawl (no URL, no `_record_to_config` beyond the
+    # sentinel), so purging it here would permanently delete its content
+    # with no way to get it back -- there is no crawl standing by to
+    # re-populate it, unlike a real crawl source's refresh.
+    if record.source_type == "upload":
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Cannot refresh",
+                "message": (
+                    f"source {record.name!r} is source_type='upload' — refresh (purge + recrawl) does not "
+                    "apply to upload sources, since there is no crawl to re-populate them; "
+                    "use Purge if you want to clear it, then re-upload."
+                ),
+            },
+            status_code=409,
+        )
 
     acquired = try_acquire_sync_lock()
     if not acquired:
@@ -1312,11 +1378,15 @@ def upload_source_submit(
 
     Raw bytes are read here (via the blocking `upload.file.read()` sync
     file handle FastAPI provides to a `def` route) and handed to parsers
-    that return in-memory `UploadedDoc`s — never written to disk. `.zip`
-    uploads go through `upload_zip.expand_zip` directly (not the thin
-    `uploads.parse_upload` registry wrapper) so per-member failures can be
-    surfaced individually; every other supported suffix goes through
-    `uploads.parse_upload`.
+    that return in-memory `UploadedDoc`s — no application code in this
+    route writes them to disk (the ASGI multipart parser may transiently
+    spool a large file part to an OS temp file before `upload.file.read()`
+    ever runs — `SpooledTemporaryFile`, framework-layer behavior, not
+    something this route's code does; that file is cleaned up automatically
+    at request end). `.zip` uploads go through `upload_zip.expand_zip`
+    directly (not the thin `uploads.parse_upload` registry wrapper) so
+    per-member failures can be surfaced individually; every other supported
+    suffix goes through `uploads.parse_upload`.
     """
     record = sources_repo.get_source(conn, source_id)
     if record is None:
@@ -1406,14 +1476,26 @@ def sync_all_submit(
     conn=Depends(get_conn),
 ):
     active_sources = sources_repo.list_sources(conn, status="active")
-    if not active_sources:
+    # T19_FIX: upload-type sources have no URL to crawl (`_record_to_config`
+    # re-validates `base_url` and refuses to build a crawlable config for
+    # one) -- exclude them from the "sync everything" set up front, the same
+    # way `store.sync_all`/`sources_repo.due_sources` already do at the
+    # store layer. Previously a single upload source anywhere in
+    # `active_sources` made `_record_to_config` raise inside the loop below,
+    # aborting the ENTIRE full sync (every crawl source included) instead of
+    # being skipped cleanly.
+    crawl_sources = [s for s in active_sources if s.source_type != "upload"]
+    if not crawl_sources:
         return templates.TemplateResponse(
             request,
             "admin/message.html",
             {
                 "request": request,
                 "heading": "Cannot sync",
-                "message": "no active sources configured to sync.",
+                "message": (
+                    "no active crawl sources configured to sync "
+                    "(upload-type sources are indexed via their own upload form, not sync)."
+                ),
             },
             status_code=409,
         )
@@ -1445,7 +1527,7 @@ def sync_all_submit(
         _sync_status["last_url"] = ""
         results: dict[str, store.SourceOutcome] = {}
         try:
-            for rec in active_sources:
+            for rec in crawl_sources:
                 cfg = _record_to_config(rec)
                 results[cfg.name] = store.sync_source_with_metrics(cfg, conn, progress_cb=_on_sync_progress)
         finally:
@@ -1463,7 +1545,7 @@ def sync_all_submit(
                 any_failed = any(_safe_str(o, "status") == "failed" for o in results.values())
                 errors = [_safe_str(o, "error") for o in results.values() if _safe_str(o, "error")]
                 _sync_status["last_completed_summary"] = {
-                    "source": f"All Active Sources ({len(active_sources)})",
+                    "source": f"All Active Sources ({len(crawl_sources)})",
                     "status": "failed" if any_failed else "ok",
                     "pages_fetched": total_fetched,
                     "chunks_indexed": total_chunks,
@@ -1476,14 +1558,14 @@ def sync_all_submit(
                 }
             finally:
                 release_sync_lock()
-        logger.info("admin_full_sync_complete", count=len(active_sources))
+        logger.info("admin_full_sync_complete", count=len(crawl_sources))
         return RedirectResponse(
             url="/admin?msg=full_sync_completed",
             status_code=303,
             headers={"HX-Trigger": "syncStatusUpdated"},
         )
 
-    run_sync_task(_bg_sync_all, active_sources, lambda: conn)
+    run_sync_task(_bg_sync_all, crawl_sources, lambda: conn)
     return RedirectResponse(
         url="/admin?msg=full_sync_started",
         status_code=303,

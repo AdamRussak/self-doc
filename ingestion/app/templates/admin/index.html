@@ -111,8 +111,9 @@
   <table class="table">
     <thead>
       <tr>
-        <th style="width: 16%;">name</th>
-        <th style="width: 32%;">base_url</th>
+        <th style="width: 14%;">name</th>
+        <th style="width: 8%;">type</th>
+        <th style="width: 26%;">base_url</th>
         <th style="width: 14%;">schedule</th>
         <th style="width: 18%;">last synced</th>
         <th style="width: 10%;">last status</th>
@@ -123,8 +124,19 @@
       {% for s in active %}
       <tr>
         <td><strong style="color: var(--color-primary-tint); font-size: 0.9rem;">{{ s.name }}</strong></td>
+        <td>
+          {% if s.source_type == 'upload' %}
+            <span class="badge badge-primary" title="indexed via file upload, not crawled">upload</span>
+          {% else %}
+            <span class="badge" title="indexed by crawling base_url">crawl</span>
+          {% endif %}
+        </td>
         <td style="font-family: var(--font-mono); font-size: 0.8rem; word-break: break-all;">
-          <a href="{{ s.base_url }}" target="_blank" rel="noopener" style="color: var(--color-text);">{{ s.base_url }}</a>
+          {% if s.source_type == 'upload' %}
+            {{ s.base_url }}
+          {% else %}
+            <a href="{{ s.base_url }}" target="_blank" rel="noopener" style="color: var(--color-text);">{{ s.base_url }}</a>
+          {% endif %}
         </td>
         <td style="font-family: var(--font-mono); font-size: 0.8rem;">
           {{ s.schedule_cron or "(manual only)" }}
@@ -151,6 +163,7 @@
         <td class="actions">
           <div class="btn-group">
             <a class="btn" href="/admin/sources/{{ s.id }}">edit</a>
+            {% if s.source_type != 'upload' %}
             <form method="post" action="/admin/sources/{{ s.id }}/sync">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button type="submit" class="btn" {% if sync_status and sync_status.running %}disabled{% endif %}>
@@ -166,6 +179,7 @@
                 Refresh
               </button>
             </form>
+            {% endif %}
             <form method="post" action="/admin/sources/{{ s.id }}/purge"
                   data-confirm-purge
                   data-source-name="{{ s.name }}">
@@ -185,7 +199,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted" style="text-align: center; padding: 2rem;">No active sources configured yet.</td></tr>
+      <tr><td colspan="7" class="muted" style="text-align: center; padding: 2rem;">No active sources configured yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>

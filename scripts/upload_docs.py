@@ -26,6 +26,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     import httpx
@@ -53,6 +54,33 @@ FileEntry = tuple[Path, str]
 
 _ERROR_DIV_PATTERN = re.compile(r'<div class="error">(.*?)</div>', re.DOTALL)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def warn_if_insecure_remote(url: str) -> None:
+    """Print a clear warning (not a hard block) to stderr when `url` is
+    plain `http://` to a non-loopback host.
+
+    `main()` below sends both `SYNC_TOKEN` (in the login POST body) and,
+    immediately after, the session cookie (set manually as a `Cookie`
+    header specifically so httpx will attach it even over unencrypted
+    `http://` -- see the comment at that call site) on every subsequent
+    request. Over plain `http://` to anything other than loopback, both of
+    those cross the network in cleartext. An operator might have a
+    legitimate reason to do this anyway (e.g. an isolated docker network),
+    so this warns rather than refusing -- but they should see it before any
+    request goes out."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        print(
+            f"WARNING: --url {url!r} is unencrypted http:// to a non-loopback host. "
+            "SYNC_TOKEN and the session cookie will be sent in cleartext over the network. "
+            "Use https:// or a loopback host (127.0.0.1/localhost) if possible.",
+            file=sys.stderr,
+        )
 
 
 def compute_csrf_token(sync_token: str) -> str:
@@ -180,6 +208,8 @@ def main() -> int:
     parser.add_argument("--continue-on-error", action="store_true", help="Keep uploading remaining batches after a failure instead of aborting immediately.")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds (default: 30.0).")
     args = parser.parse_args()
+
+    warn_if_insecure_remote(args.url)
 
     sync_token = args.token or os.environ.get("SYNC_TOKEN")
     if not sync_token:

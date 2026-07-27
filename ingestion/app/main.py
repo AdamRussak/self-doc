@@ -313,6 +313,66 @@ def is_sync_locked() -> bool:
 # on the very first line, with zero header parsing or receive-wrapping --
 # `GET /health` and `GET /metrics` never enter the size-check branch at
 # all.
+#
+# --- T20 MEDIUM fix: bound AGGREGATE memory across CONCURRENT requests ------------------
+#
+# The per-request `max_bytes` cap above only bounds what a SINGLE request can
+# buffer. It does nothing to stop N concurrent requests from each streaming
+# up to `max_bytes` at once -- worst case, N * max_bytes resident at the same
+# time, and since this middleware runs BEFORE routing and BEFORE auth
+# (`require_session`/`require_csrf` haven't run yet for any POST/PUT/PATCH),
+# an unauthenticated caller can drive that worst case simply by opening many
+# concurrent large POSTs, even to a path that will ultimately 404 and never
+# reads its body itself. Measured: 6 concurrent 49 MiB unauthenticated POSTs
+# to a nonexistent path drove RSS from ~211 MiB to ~446 MiB and it stayed
+# there.
+#
+# Fix: a module-level counter tracks the TOTAL bytes currently buffered by
+# this middleware across every in-flight request in this process. Each chunk
+# is reserved against `_INFLIGHT_CAP_BYTES` as it arrives (before being
+# appended to this request's own `buffered` list); if reserving would push
+# the aggregate over the cap, THIS request is rejected immediately (503,
+# before consuming any more of the stream) rather than being allowed to pile
+# on top of what's already buffered. Every request's reservation is released
+# (in a `finally`) once its own buffered data is no longer needed -- either
+# because it was rejected, or because the downstream app has finished
+# reading it via `buffered_receive`. This bounds worst-case resident memory
+# from this middleware to a fixed ceiling REGARDLESS of how many requests
+# arrive concurrently, closing the gap the per-request cap alone left open.
+_INFLIGHT_CAP_BYTES = int(os.environ.get("MAX_BODY_INFLIGHT_BYTES", str(4 * uploads.MAX_UPLOAD_BYTES)))
+_inflight_bytes_lock = threading.Lock()
+_inflight_buffered_bytes = 0
+
+
+def _reserve_inflight_bytes(n: int) -> bool:
+    """Atomically reserve `n` bytes against `_INFLIGHT_CAP_BYTES`, the
+    process-wide cap on how much request-body data `MaxBodySizeMiddleware`
+    may hold buffered at once, summed across every concurrent request.
+    Returns True (and increments the counter) if there is room; returns
+    False (counter left untouched) if admitting `n` more bytes would push
+    the aggregate over the cap -- the caller must reject that request
+    without buffering the bytes it was about to reserve for."""
+    global _inflight_buffered_bytes
+    with _inflight_bytes_lock:
+        if _inflight_buffered_bytes + n > _INFLIGHT_CAP_BYTES:
+            return False
+        _inflight_buffered_bytes += n
+        return True
+
+
+def _release_inflight_bytes(n: int) -> None:
+    """Undo a prior `_reserve_inflight_bytes(n)` once those bytes are no
+    longer held (request finished, rejected, or errored) -- always paired
+    with a reservation via `finally` in `__call__`, so a leaked reservation
+    (which would permanently shrink the effective cap) is not possible on
+    any code path."""
+    global _inflight_buffered_bytes
+    if n <= 0:
+        return
+    with _inflight_bytes_lock:
+        _inflight_buffered_bytes = max(0, _inflight_buffered_bytes - n)
+
+
 class MaxBodySizeMiddleware:
     def __init__(self, app, max_bytes: int = uploads.MAX_UPLOAD_BYTES) -> None:
         self.app = app
@@ -337,31 +397,49 @@ class MaxBodySizeMiddleware:
         # Stream/accumulate: covers both "no Content-Length at all" and a
         # Content-Length that lied (understated the true body size) -- the
         # running total, not the declared header, is what's enforced here.
+        # `reserved` tracks how many bytes THIS request currently holds
+        # against the global `_INFLIGHT_CAP_BYTES` cap (see above) so the
+        # `finally` below can release exactly that many, regardless of which
+        # return path is taken.
         buffered: list[dict] = []
         total = 0
-        while True:
-            message = await receive()
-            buffered.append(message)
-            if message["type"] != "http.request":
-                break
-            total += len(message.get("body", b"") or b"")
-            if total > self.max_bytes:
-                await self._reject(send)
-                return
-            if not message.get("more_body", False):
-                break
+        reserved = 0
+        try:
+            while True:
+                message = await receive()
+                buffered.append(message)
+                if message["type"] != "http.request":
+                    break
+                chunk_len = len(message.get("body", b"") or b"")
+                total += chunk_len
+                if total > self.max_bytes:
+                    await self._reject(send)
+                    return
+                if chunk_len:
+                    if not _reserve_inflight_bytes(chunk_len):
+                        # The per-request cap isn't exceeded -- the
+                        # AGGREGATE across all in-flight requests is. Reject
+                        # this one rather than let it pile on top of what's
+                        # already buffered elsewhere.
+                        await self._reject_busy(send)
+                        return
+                    reserved += chunk_len
+                if not message.get("more_body", False):
+                    break
 
-        index = 0
+            index = 0
 
-        async def buffered_receive():
-            nonlocal index
-            if index < len(buffered):
-                message = buffered[index]
-                index += 1
-                return message
-            return await receive()
+            async def buffered_receive():
+                nonlocal index
+                if index < len(buffered):
+                    message = buffered[index]
+                    index += 1
+                    return message
+                return await receive()
 
-        await self.app(scope, buffered_receive, send)
+            await self.app(scope, buffered_receive, send)
+        finally:
+            _release_inflight_bytes(reserved)
 
     @staticmethod
     async def _reject(send) -> None:
@@ -370,6 +448,23 @@ class MaxBodySizeMiddleware:
             {
                 "type": "http.response.start",
                 "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    @staticmethod
+    async def _reject_busy(send) -> None:
+        body = json.dumps(
+            {"detail": "server busy: too many large requests in flight, try again shortly"}
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 503,
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode("ascii")),
@@ -489,8 +584,22 @@ def _resolve_sync_targets(
         return names
 
     # Default: every ACTIVE source. A pending/rejected source is never swept
-    # up in an unscoped "sync everything" call.
-    return [name for name, record in sources_by_name.items() if record.status == "active"]
+    # up in an unscoped "sync everything" call -- and neither is an
+    # upload-type source (T19_FIX): it has no URL to crawl (`base_url` is
+    # the `upload://{name}` sentinel), so `admin._record_to_config` builds a
+    # valid-but-uncrawlable `SourceConfig` for it, `store.sync_source`
+    # refuses to run, `_run_sync_blocking` catches that as a per-source
+    # failure and calls `store.mark_source_failed()` -- meaning every
+    # unscoped `/sync` call (including the scheduler and `make sync`) would
+    # otherwise mark every upload source `last_status='failed'` and emit a
+    # failed-sync metric on every single run. This mirrors the same
+    # exclusion `sources_repo.due_sources()`/`store.sync_all()` already
+    # apply at the store layer.
+    return [
+        name
+        for name, record in sources_by_name.items()
+        if record.status == "active" and record.source_type != "upload"
+    ]
 
 
 def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord]) -> None:

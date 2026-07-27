@@ -4,8 +4,11 @@ Pure-function core for the upload ingestion path (admin UI / CLI / MCP
 tool). No DB access, no filesystem writes, no network calls: every function
 here operates on already-read bytes and returns in-memory dataclasses.
 Callers are responsible for persisting the parsed markdown via the existing
-chunker/embedder pipeline; raw uploaded bytes are never written to disk or
-the database.
+chunker/embedder pipeline; no code in this module writes uploaded bytes to
+disk or the database (the ASGI multipart parser upstream of this module may
+transiently spool a large file part to an OS temp file before its bytes
+ever reach here — `SpooledTemporaryFile`, framework-layer behavior, cleaned
+up automatically at request end, not something this module's code does).
 
 This module is a shared contract: PDF parsing (T4) and zip-bundle expansion
 (T5) register additional parsers into `PARSERS` via `register_parser` and

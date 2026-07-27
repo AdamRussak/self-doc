@@ -851,6 +851,64 @@ def test_sync_missing_source_is_404(client, csrf_token, monkeypatch):
     assert resp.status_code == 404
 
 
+# --- T19_FIX: crawl-only entrypoints must refuse upload-type sources cleanly -------------
+
+
+def test_sync_upload_source_returns_409_no_lock_leak(client, csrf_token, monkeypatch):
+    """The original bug (T19): POSTing to the manual-sync route for an
+    upload-type source used to build an invalid `SourceConfig`
+    (`_record_to_config` didn't pass `source_type` through), raise a
+    `pydantic.ValidationError` -> uncaught 500, AFTER the sync lock had
+    already been acquired -- permanently leaking it. Must now be a clean
+    409, with the lock never even acquired (checked before
+    `try_acquire_sync_lock()`, not after)."""
+    _login(client)
+    record = _make_record(id=7, name="widget-uploads", source_type="upload", base_url="upload://widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    sync_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "sync_source", sync_mock)
+    record_to_config_spy = MagicMock(wraps=admin._record_to_config)
+    monkeypatch.setattr(admin, "_record_to_config", record_to_config_spy)
+
+    assert not admin._manual_sync_lock.locked()
+    resp = client.post("/admin/sources/7/sync", data={"csrf_token": csrf_token})
+
+    assert resp.status_code == 409
+    assert "upload" in resp.text.lower()
+    assert "Traceback" not in resp.text
+    sync_mock.assert_not_called()
+    # The lock must never have been touched at all for this rejection -- not
+    # just released, never acquired in the first place.
+    record_to_config_spy.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_refresh_upload_source_returns_409_no_purge_no_lock_leak(client, csrf_token, monkeypatch):
+    """The original bug (T19): `refresh_source_submit` acquired the lock,
+    then called `store.purge_source()` (deleting the upload source's
+    doc_pages/doc_chunks) and committed BEFORE `_record_to_config` raised --
+    permanently destroying uploaded content with no crawl to re-fetch it,
+    plus leaking the lock. Must now be a clean 409 with purge/commit never
+    reached and the lock never acquired."""
+    _login(client)
+    record = _make_record(id=7, name="widget-uploads", source_type="upload", base_url="upload://widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    purge_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "purge_source", purge_mock)
+    sync_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "sync_source", sync_mock)
+
+    assert not admin._manual_sync_lock.locked()
+    resp = client.post("/admin/sources/7/refresh", data={"csrf_token": csrf_token})
+
+    assert resp.status_code == 409
+    assert "upload" in resp.text.lower()
+    assert "Traceback" not in resp.text
+    purge_mock.assert_not_called()
+    sync_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
 # --- Upload (T9) -------------------------------------------------------------------------
 
 
@@ -1144,6 +1202,65 @@ def test_sync_all_submit(client, csrf_token, monkeypatch):
     assert resp.status_code == 303
     assert resp.headers["location"] == "/admin?msg=full_sync_completed"
     assert sync_mock.call_count == 2
+
+
+def test_sync_all_submit_skips_upload_sources_cleanly(client, csrf_token, monkeypatch):
+    """T19_FIX: `_bg_sync_all` (and `sync_all_submit`'s own synchronous
+    pytest-branch) must filter out `source_type='upload'` records BEFORE
+    building any `SourceConfig` -- previously a single upload source
+    anywhere in the active set made `_record_to_config` raise, aborting the
+    entire full sync (crawl sources included). A mix of crawl + upload
+    sources must still sync every crawl source and skip the upload source
+    without error."""
+    _login(client)
+    active_sources = [
+        _make_record(id=1, name="src-a", status="active"),
+        _make_record(id=2, name="widget-uploads", status="active", source_type="upload", base_url="upload://widget-uploads"),
+        _make_record(id=3, name="src-b", status="active"),
+    ]
+    monkeypatch.setattr(admin.sources_repo, "list_sources", MagicMock(return_value=active_sources))
+    sync_mock = MagicMock(return_value=SourceOutcome(name="src", status="ok"))
+    monkeypatch.setattr(admin.store, "sync_source", sync_mock)
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post("/admin/sync-all", data={"csrf_token": csrf_token}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin?msg=full_sync_completed"
+    # Only the two crawl sources were synced -- the upload source was
+    # skipped, not attempted and not errored on.
+    assert sync_mock.call_count == 2
+    synced_names = {call.args[0].name for call in sync_mock.call_args_list}
+    assert synced_names == {"src-a", "src-b"}
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_bg_sync_all_filters_upload_sources_before_building_configs(monkeypatch):
+    """Unit-level check on `_bg_sync_all` itself (called directly, the way
+    `test_sync_health.py` already does, and the way the real background
+    path -- `run_sync_task(_bg_sync_all, ...)` -- calls it outside pytest):
+    a `source_type='upload'` record must never reach `_record_to_config`."""
+    sources = [
+        _make_record(id=1, name="src-a", status="active"),
+        _make_record(id=2, name="widget-uploads", status="active", source_type="upload", base_url="upload://widget-uploads"),
+    ]
+    record_to_config_spy = MagicMock(wraps=admin._record_to_config)
+    monkeypatch.setattr(admin, "_record_to_config", record_to_config_spy)
+    sync_all_mock = MagicMock(return_value={"src-a": SourceOutcome(name="src-a", status="ok")})
+    monkeypatch.setattr(admin.store, "sync_all", sync_all_mock)
+    # Force the non-pytest branch (real `store.sync_all` call path) even
+    # though this runs under pytest.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("SYNC_RUNNER_SYNC", "0")
+
+    admin._bg_sync_all(sources, conn_factory=lambda: object())
+
+    record_to_config_spy.assert_called_once()
+    assert record_to_config_spy.call_args.args[0].name == "src-a"
+    sync_all_mock.assert_called_once()
+    (cfgs_arg,) = sync_all_mock.call_args.args
+    assert [c.name for c in cfgs_arg] == ["src-a"]
 
 
 def test_sync_target_submit(client, csrf_token, monkeypatch):

@@ -2,8 +2,12 @@
 
 Registers a `.zip` parser into `uploads.PARSERS` so that
 `uploads.parse_upload()` can dispatch zip archives the same way it dispatches
-any other upload suffix. All zip handling is in-memory only (`io.BytesIO`
-over already-read bytes) — nothing is ever written to disk.
+any other upload suffix. All zip handling in this module is in-memory only
+(`io.BytesIO` over already-read bytes) — no code here writes to disk (the
+ASGI multipart parser upstream may transiently spool a large uploaded part
+to an OS temp file before this module ever receives its bytes —
+`SpooledTemporaryFile`, framework-layer behavior, cleaned up automatically
+at request end, not something this module does).
 
 PARSERS-vs-ALLOWED_SUFFIXES: `uploads.parse_upload()` dispatches purely via
 `uploads.PARSERS.get(suffix)` and never consults `uploads.ALLOWED_SUFFIXES`.
