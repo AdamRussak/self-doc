@@ -125,11 +125,12 @@ SELECT
     ds.name,
     ds.last_synced,
     ds.last_status,
-    COUNT(dc.id) AS chunk_count
+    COUNT(dc.id) AS chunk_count,
+    ds.source_type
 FROM doc_sources ds
 LEFT JOIN doc_pages dp ON dp.source_id = ds.id
 LEFT JOIN doc_chunks dc ON dc.page_id = dp.id
-GROUP BY ds.id, ds.name, ds.last_synced, ds.last_status
+GROUP BY ds.id, ds.name, ds.last_synced, ds.last_status, ds.source_type
 ORDER BY ds.name;
 """
 
@@ -201,9 +202,20 @@ def _embed_passage(text: str) -> str:
 
 def format_hit(heading_path: str | None, url: str, content: str) -> str:
     """Format a single search hit exactly per the MCP tool contract:
-    "### {heading_path}\\n[{url}]({url})\\n\\n{content}"."""
+    "### {heading_path}\\n[{url}]({url})\\n\\n{content}".
+
+    Exception: a non-http(s) `url` (i.e. one that doesn't start with
+    `http://` or `https://` — this covers the `upload://{source}/{path}`
+    sentinel scheme written by `upload_text`) renders as plain text instead
+    of a markdown link. A markdown link whose target isn't a fetchable
+    http(s) URL is a dead/unusable link in an AI agent's output, so the
+    sentinel is shown as bare text instead."""
     heading = heading_path or ""
-    return f"### {heading}\n[{url}]({url})\n\n{content}"
+    if url.startswith("http://") or url.startswith("https://"):
+        url_line = f"[{url}]({url})"
+    else:
+        url_line = url
+    return f"### {heading}\n{url_line}\n\n{content}"
 
 
 def search(query: str, source: str | None = None, limit: int = 5) -> str:
@@ -256,12 +268,15 @@ def list_sources() -> str:
     if not rows:
         return "No documentation sources indexed yet."
 
-    lines = ["| source | last_synced | last_status | chunks |", "|---|---|---|---|"]
+    lines = [
+        "| source | last_synced | last_status | chunks | source_type |",
+        "|---|---|---|---|---|",
+    ]
     for row in rows:
         last_synced = row["last_synced"].isoformat() if row["last_synced"] else "never"
         lines.append(
             f"| {row['name']} | {last_synced} | {row['last_status'] or 'unknown'} "
-            f"| {row['chunk_count']} |"
+            f"| {row['chunk_count']} | {row['source_type']} |"
         )
     return "\n".join(lines)
 

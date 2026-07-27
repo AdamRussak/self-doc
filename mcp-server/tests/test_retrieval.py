@@ -1,7 +1,9 @@
 import pytest
+from app import retrieval
 from app.retrieval import (
     ARM_CANDIDATE_LIMIT,
     HYBRID_SEARCH_SQL,
+    LIST_SOURCES_SQL,
     MAX_UPLOAD_CONTENT_BYTES,
     MAX_UPLOAD_TITLE_CHARS,
     RRF_K,
@@ -27,6 +29,37 @@ def test_format_hit_matches_contract():
 def test_format_hit_handles_missing_heading():
     result = format_hit(None, "https://example.com/x", "content")
     assert result.startswith("### \n")
+
+
+def test_format_hit_renders_http_url_as_markdown_link_byte_for_byte():
+    # Snapshot-style before/after: this exact string is what format_hit
+    # produced for an http(s) URL before the upload:// plain-text branch was
+    # added, and must remain byte-for-byte identical after it.
+    before = (
+        "### Guide > Routing > Dynamic Routes\n"
+        "[https://example.com/x](https://example.com/x)\n\n"
+        "some content"
+    )
+    after = format_hit("Guide > Routing > Dynamic Routes", "https://example.com/x", "some content")
+    assert after == before
+
+
+def test_format_hit_renders_https_url_as_markdown_link():
+    result = format_hit("H", "https://docs.example.org/page", "body")
+    assert result == "### H\n[https://docs.example.org/page](https://docs.example.org/page)\n\nbody"
+
+
+def test_format_hit_renders_upload_url_as_plain_text_not_markdown_link():
+    result = format_hit("Guide", "upload://sourcename/path.md", "some content")
+    assert "](" not in result
+    assert "upload://sourcename/path.md" in result
+    assert result == "### Guide\nupload://sourcename/path.md\n\nsome content"
+
+
+def test_format_hit_upload_url_missing_heading():
+    result = format_hit(None, "upload://sourcename/notes.md", "content")
+    assert "](" not in result
+    assert result.startswith("### \nupload://sourcename/notes.md\n\n")
 
 
 def test_format_vector_literal():
@@ -159,3 +192,82 @@ def test_chunk_upload_content_respects_char_budget():
 def test_chunk_upload_content_empty_input_yields_no_chunks():
     assert _chunk_upload_content("") == []
     assert _chunk_upload_content("   \n\n  ") == []
+
+
+# ---------------------------------------------------------------------------
+# list_sources / LIST_SOURCES_SQL — source_type column
+# ---------------------------------------------------------------------------
+
+
+def test_list_sources_sql_selects_source_type():
+    assert "ds.source_type" in LIST_SOURCES_SQL
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        assert sql is LIST_SOURCES_SQL or sql == LIST_SOURCES_SQL
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return _FakeCursor(self._rows)
+
+
+class _FakePool:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def connection(self):
+        return _FakeConn(self._rows)
+
+
+def test_list_sources_renders_source_type_column_for_crawl_and_upload(monkeypatch):
+    rows = [
+        {
+            "name": "crawl-source",
+            "last_synced": None,
+            "last_status": "ok",
+            "chunk_count": 3,
+            "source_type": "crawl",
+        },
+        {
+            "name": "upload-source",
+            "last_synced": None,
+            "last_status": None,
+            "chunk_count": 1,
+            "source_type": "upload",
+        },
+    ]
+    monkeypatch.setattr(retrieval, "get_pool", lambda: _FakePool(rows))
+
+    result = retrieval.list_sources()
+
+    lines = result.splitlines()
+    header = lines[0]
+    assert "source_type" in header
+
+    crawl_line = next(line for line in lines if "crawl-source" in line)
+    upload_line = next(line for line in lines if "upload-source" in line)
+    assert crawl_line.rstrip().endswith("| crawl |")
+    assert upload_line.rstrip().endswith("| upload |")
