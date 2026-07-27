@@ -1,9 +1,8 @@
 
 import os
 
-import onnxruntime as ort
-
 import app.embedder as embedder
+import onnxruntime as ort
 from app.embedder import DEFAULT_ORT_THREADS, EMBEDDING_DIM, embed_chunks
 
 

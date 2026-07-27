@@ -152,7 +152,7 @@ def resolve_source_id(html: str, name: str) -> int | None:
     return None
 
 
-def extract_error_message(resp: "httpx.Response") -> str:
+def extract_error_message(resp: httpx.Response) -> str:
     """Best-effort extraction of a human-readable error from a non-2xx/303
     admin response — never surfaces a raw traceback or full HTML dump."""
     content_type = resp.headers.get("content-type", "")

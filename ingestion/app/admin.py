@@ -1253,7 +1253,13 @@ def refresh_source_submit(
                     }
             finally:
                 release_sync_lock()
-        logger.info("admin_manual_refresh_complete", source_id=source_id, name=record.name, status=outcome.status)
+        logger.info(
+            "admin_manual_refresh_complete",
+            source_id=source_id,
+            name=record.name,
+            status=outcome.status,
+            pages_deleted=count,
+        )
         return RedirectResponse(
             url=f"/admin?msg=refreshed+{record.name}:+{outcome.status}",
             status_code=303,

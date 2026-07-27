@@ -11,7 +11,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from scripts import upload_docs
 
-
 # --- compute_csrf_token (copied verbatim from push_sources.py) -------------------------------
 
 

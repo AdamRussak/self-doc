@@ -50,17 +50,22 @@ from pydantic import BaseModel
 
 from . import admin, metrics, scheduler, security, sources_repo, store, uploads
 from .logging_config import get_logger
+
+# Re-exported (not used directly in this module) so existing call sites keep
+# working unchanged, e.g. `main_module.PAGES_FETCHED` in
+# ingestion/tests/test_sync_health.py and ingestion/tests/test_main.py — see
+# the module-level comment above `app = FastAPI(...)` for the full rationale.
 from .metrics import (
-    CHUNKS_INDEXED,
-    PAGES_FAILED,
-    PAGES_FETCHED,
-    PAGES_NOT_MODIFIED,
-    PAGES_SHELL_SUSPECTED,
-    PAGES_SKIPPED,
-    PAGES_SOFT_FAILED,
-    SYNC_DURATION,
-    SYNC_LAST_STATUS,
-    SYNC_LAST_SUCCESS,
+    CHUNKS_INDEXED,  # noqa: F401
+    PAGES_FAILED,  # noqa: F401
+    PAGES_FETCHED,  # noqa: F401
+    PAGES_NOT_MODIFIED,  # noqa: F401
+    PAGES_SHELL_SUSPECTED,  # noqa: F401
+    PAGES_SKIPPED,  # noqa: F401
+    PAGES_SOFT_FAILED,  # noqa: F401
+    SYNC_DURATION,  # noqa: F401
+    SYNC_LAST_STATUS,  # noqa: F401
+    SYNC_LAST_SUCCESS,  # noqa: F401
 )
 from .sources_repo import SourceRecord
 

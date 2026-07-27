@@ -3,10 +3,9 @@ import zipfile
 from unittest.mock import patch
 
 import pytest
-
 from app import upload_zip
 from app.upload_zip import ZipExpansionResult, ZipMemberFailure, expand_zip
-from app.uploads import PARSERS, UploadError, UploadedDoc, parse_upload
+from app.uploads import PARSERS, UploadedDoc, UploadError, parse_upload
 
 HTML_TOO_SHORT = b"<html><body><p>Too short.</p></body></html>"
 

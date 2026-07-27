@@ -14,9 +14,9 @@ reuse `UploadedDoc`, `UploadError`, and `normalize_rel_path` from here.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Callable
 
 from .extract import extract
 
@@ -46,10 +46,10 @@ class UploadedDoc:
     markdown: str
 
 
-PARSERS: dict[str, Callable[[str, bytes], list["UploadedDoc"]]] = {}
+PARSERS: dict[str, Callable[[str, bytes], list[UploadedDoc]]] = {}
 
 
-def register_parser(suffix: str, fn: Callable[[str, bytes], list["UploadedDoc"]]) -> None:
+def register_parser(suffix: str, fn: Callable[[str, bytes], list[UploadedDoc]]) -> None:
     """Register a parser for a lowercase file suffix (e.g. '.pdf').
 
     `fn` takes (filename, data) and returns a list of UploadedDoc. Later

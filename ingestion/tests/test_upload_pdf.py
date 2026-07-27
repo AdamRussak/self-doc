@@ -16,9 +16,8 @@ import pathlib
 import subprocess
 import sys
 
-import pytest
-
 import app.upload_pdf  # noqa: F401 - side effect: registers the .pdf parser into PARSERS
+import pytest
 from app.extract import MIN_EXTRACTED_LENGTH
 from app.uploads import PARSERS, UploadedDoc, UploadError, parse_upload
 

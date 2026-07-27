@@ -1,5 +1,4 @@
 import pytest
-
 from app.uploads import (
     ALLOWED_SUFFIXES,
     MAX_ARCHIVE_MEMBERS,
@@ -112,7 +111,7 @@ class TestParseUploadText:
         assert "�" in docs[0].markdown
 
     def test_is_deterministic(self):
-        data = "# Title\n\nRepeatable content.".encode("utf-8")
+        data = b"# Title\n\nRepeatable content."
         first = parse_upload("notes.md", data)
         second = parse_upload("notes.md", data)
         assert first == second
