@@ -17,8 +17,9 @@ import threading
 
 import psycopg
 import pytest
-from app import store
+from app import sources_repo, store
 from app.config import SourceConfig
+from app.uploads import UploadedDoc
 
 os.environ.setdefault("POSTGRES_HOST", "127.0.0.1")
 os.environ.setdefault("POSTGRES_PORT", "5433")
@@ -44,7 +45,7 @@ pytestmark = pytest.mark.skipif(not _db_available(), reason="no live Postgres re
 # these exact names (instead of wiping the whole doc_sources table) keeps
 # this suite from ever touching genuine indexed sources (fastapi, traefik,
 # docker-compose, pgvector-readme, ...) when run against the live DB.
-_TEST_SOURCE_NAMES = ("test-src",)
+_TEST_SOURCE_NAMES = ("test-src", "test-upload-src")
 
 
 def _purge_test_sources(c) -> None:
@@ -80,6 +81,21 @@ def make_source(name: str = "test-src", max_pages: int = 10) -> SourceConfig:
     return SourceConfig.model_validate(
         {"name": name, "base_url": "https://docs-fixture.dev/", "max_pages": max_pages}
     )
+
+
+def make_upload_source(conn, name: str = "test-upload-src") -> sources_repo.SourceRecord:
+    """Create a real `doc_sources` row with `source_type='upload'` (via
+    `sources_repo.create_source`, the same write path admin.py's upload-source
+    creation route uses) and return its `SourceRecord` — the exact type
+    `ingest_uploaded_docs` expects for its `source` argument."""
+    cfg = SourceConfig.model_validate(
+        {"name": name, "source_type": "upload", "base_url": f"upload://{name}"}
+    )
+    source_id = sources_repo.create_source(conn, cfg)
+    record = sources_repo.get_source(conn, source_id)
+    assert record is not None
+    assert record.source_type == "upload"
+    return record
 
 
 PAGE_MD = """# Intro
@@ -2079,5 +2095,258 @@ def test_sync_source_with_metrics_tolerates_bare_signature_without_extra_calls(m
 
     assert outcome.status == "ok"
     assert call_count == 1
+
+
+# --- ingest_uploaded_docs (T6) ----------------------------------------------
+#
+# Uses the same `_use_fast_chunk_and_embed` fake as the rest of this suite
+# (real fastembed is too slow/network-dependent for a unit test), plus a
+# matching fake for `search_chunks`'s own internal `embedder.get_model()`
+# call so the "findable via search" assertion doesn't need a real model
+# download either. Both fakes emit the same all-zero EMBEDDING_DIM vector, so
+# vector similarity never discriminates between rows — the searchability
+# assertions below rely on the FTS arm of the hybrid RRF query (real, exact
+# word matches) to actually distinguish results.
+
+
+def _use_fake_search_embedding(monkeypatch):
+    from app.embedder import EMBEDDING_DIM
+
+    class _FakeModel:
+        def embed(self, texts):
+            return [[0.0] * EMBEDDING_DIM for _ in texts]
+
+    monkeypatch.setattr(store.embedder, "get_model", lambda: _FakeModel())
+
+
+def test_ingest_uploaded_docs_happy_path_indexes_and_is_searchable(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+    _use_fake_search_embedding(monkeypatch)
+
+    source = make_upload_source(conn)
+    docs = [
+        UploadedDoc(rel_path="a.md", markdown="Alpha unique gizmo content about widgets."),
+        UploadedDoc(rel_path="b.md", markdown="Beta distinctive gadget content about sprockets."),
+        UploadedDoc(rel_path="sub/c.md", markdown="Gamma singular thingamajig content about cogs."),
+    ]
+
+    outcome = store.ingest_uploaded_docs(conn, source, docs)
+
+    assert outcome.status == "ok"
+    assert outcome.pages_fetched == 3
+    assert outcome.pages_skipped == 0
+    assert outcome.pages_failed == 0
+    assert outcome.chunks_indexed == 3
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT url FROM doc_pages WHERE source_id = %s ORDER BY url", (source.id,))
+        urls = [r[0] for r in cur.fetchall()]
+    assert urls == [
+        f"upload://{source.name}/a.md",
+        f"upload://{source.name}/b.md",
+        f"upload://{source.name}/sub/c.md",
+    ]
+
+    results = store.search_chunks(conn, "sprockets", source=source.name)
+    assert any(r["url"] == f"upload://{source.name}/b.md" for r in results)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_status FROM doc_sources WHERE id = %s", (source.id,))
+        (last_status,) = cur.fetchone()
+    assert last_status == "ok"
+
+
+def test_ingest_uploaded_docs_reingest_identical_docs_skips_all(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    source = make_upload_source(conn)
+    docs = [
+        UploadedDoc(rel_path="a.md", markdown="Alpha content, unchanged across both runs."),
+        UploadedDoc(rel_path="b.md", markdown="Beta content, unchanged across both runs."),
+    ]
+
+    outcome1 = store.ingest_uploaded_docs(conn, source, docs)
+    assert outcome1.status == "ok"
+    assert outcome1.pages_fetched == len(docs)
+    assert outcome1.pages_skipped == 0
+
+    outcome2 = store.ingest_uploaded_docs(conn, source, docs)
+    assert outcome2.status == "ok"
+    assert outcome2.pages_fetched == 0
+    assert outcome2.pages_skipped == len(docs)
+
+
+def test_ingest_uploaded_docs_partial_status_on_hard_doc_failure(conn, monkeypatch):
+    # Realistic partial-failure trigger: one document's write hits a hard
+    # pipeline exception (mirrors test_source_status_partial_on_hard_page_
+    # failures' idiom for sync_source above) while the other succeeds.
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    source = make_upload_source(conn)
+    docs = [
+        UploadedDoc(rel_path="good.md", markdown="Good content indexes fine."),
+        UploadedDoc(rel_path="bad.md", markdown="Bad content triggers a hard failure."),
+    ]
+
+    orig_replace_page = store.replace_page
+
+    def fake_replace_page(conn_arg, source_id, url, content_hash, chunks, **kwargs):
+        if url.endswith("/bad.md"):
+            raise RuntimeError("simulated hard DB write error")
+        return orig_replace_page(conn_arg, source_id, url, content_hash, chunks, **kwargs)
+
+    monkeypatch.setattr(store, "replace_page", fake_replace_page)
+
+    outcome = store.ingest_uploaded_docs(conn, source, docs)
+
+    assert outcome.status == "partial"
+    assert outcome.pages_fetched == 1
+    assert outcome.pages_failed == 1
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT last_status FROM doc_sources WHERE id = %s", (source.id,))
+        (last_status,) = cur.fetchone()
+    assert last_status == "partial"
+
+
+def test_ingest_uploaded_docs_all_docs_fail_reports_status_failed(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    source = make_upload_source(conn)
+    docs = [UploadedDoc(rel_path="bad.md", markdown="Bad content triggers a hard failure.")]
+
+    def raising_replace_page(*args, **kwargs):
+        raise RuntimeError("simulated hard DB write error")
+
+    monkeypatch.setattr(store, "replace_page", raising_replace_page)
+
+    outcome = store.ingest_uploaded_docs(conn, source, docs)
+
+    assert outcome.status == "failed"
+    assert outcome.pages_fetched == 0
+    assert outcome.pages_failed == 1
+
+
+def test_ingest_uploaded_docs_raises_for_crawl_source_type(conn):
+    cfg = make_source()
+    source_id = sources_repo.create_source(conn, cfg)
+    record = sources_repo.get_source(conn, source_id)
+    assert record is not None
+    assert record.source_type == "crawl"
+
+    with pytest.raises(ValueError, match="source_type"):
+        store.ingest_uploaded_docs(conn, record, [UploadedDoc(rel_path="a.md", markdown="x")])
+
+
+def test_ingest_uploaded_docs_never_calls_delete_missing_pages(conn, monkeypatch):
+    # Structural proof (per T6's acceptance criteria): a page from a prior,
+    # larger upload batch must survive a second, smaller batch untouched —
+    # if `ingest_uploaded_docs` ever called `_delete_missing_pages`, this
+    # page would be purged as "missing" from the second batch.
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    calls: list[tuple] = []
+    orig_delete_missing = store._delete_missing_pages
+
+    def spy_delete_missing(*args, **kwargs):
+        calls.append((args, kwargs))
+        return orig_delete_missing(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_delete_missing_pages", spy_delete_missing)
+
+    source = make_upload_source(conn)
+    first_batch = [
+        UploadedDoc(rel_path="a.md", markdown="Alpha content from the first batch."),
+        UploadedDoc(rel_path="b.md", markdown="Beta content from the first batch."),
+    ]
+    store.ingest_uploaded_docs(conn, source, first_batch)
+
+    second_batch = [UploadedDoc(rel_path="a.md", markdown="Alpha content, revised in the second batch.")]
+    store.ingest_uploaded_docs(conn, source, second_batch)
+
+    assert calls == []  # _delete_missing_pages is never invoked by ingest_uploaded_docs
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT url FROM doc_pages WHERE source_id = %s ORDER BY url", (source.id,))
+        urls = [r[0] for r in cur.fetchall()]
+    # b.md was absent from the second (smaller) batch entirely, yet survives:
+    # an upload batch is never a complete view of the source's pages.
+    assert urls == [f"upload://{source.name}/a.md", f"upload://{source.name}/b.md"]
+
+
+def test_ingest_uploaded_docs_progress_cb_called_per_doc(conn, monkeypatch):
+    _use_fast_chunk_and_embed(monkeypatch)
+
+    source = make_upload_source(conn)
+    docs = [
+        UploadedDoc(rel_path="a.md", markdown="Alpha content for progress callback test."),
+        UploadedDoc(rel_path="b.md", markdown="Beta content for progress callback test."),
+    ]
+
+    seen_urls: list[str] = []
+
+    def progress_cb(outcome, url):
+        seen_urls.append(url)
+
+    store.ingest_uploaded_docs(conn, source, docs, progress_cb=progress_cb)
+
+    assert seen_urls == [f"upload://{source.name}/a.md", f"upload://{source.name}/b.md"]
+
+
+def test_sync_source_raises_for_upload_source_type(conn):
+    cfg = SourceConfig.model_validate(
+        {"name": "test-upload-src", "source_type": "upload", "base_url": "upload://test-upload-src"}
+    )
+    with pytest.raises(ValueError, match="cannot crawl-sync"):
+        store.sync_source(cfg, conn)
+
+
+def test_ensure_source_preserves_upload_base_url_on_conflict(conn):
+    upload_cfg = SourceConfig.model_validate(
+        {"name": "test-upload-src", "source_type": "upload", "base_url": "upload://test-upload-src"}
+    )
+    source_id = sources_repo.create_source(conn, upload_cfg)
+
+    # A stale/derived crawl-shaped SourceConfig for the same name must never
+    # clobber the upload sentinel base_url.
+    stale_cfg = make_source(name="test-upload-src")
+    same_id = store.ensure_source(conn, stale_cfg)
+    assert same_id == source_id
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT base_url, source_type FROM doc_sources WHERE id = %s", (source_id,))
+        row = cur.fetchone()
+    assert row == ("upload://test-upload-src", "upload")
+
+
+def test_sync_all_skips_upload_sources_without_touching_crawler(conn, monkeypatch):
+    crawl_cfg = make_source()
+    upload_cfg = SourceConfig.model_validate(
+        {"name": "test-upload-src", "source_type": "upload", "base_url": "upload://test-upload-src"}
+    )
+
+    crawl_calls: list[str] = []
+
+    def fake_crawl(source, client=None):
+        crawl_calls.append(source.name)
+        return []
+
+    from app.extract import ExtractionResult
+
+    def fake_extract(url, html):
+        return ExtractionResult(url=url, markdown=html, status="ok")
+
+    monkeypatch.setattr(store.crawler, "crawl", fake_crawl)
+    monkeypatch.setattr(store.extract, "extract", fake_extract)
+
+    results = store.sync_all([crawl_cfg, upload_cfg])
+
+    assert "test-upload-src" not in results
+    assert crawl_calls == ["test-src"]  # the upload source never reaches crawler.crawl at all
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM doc_sources WHERE name = %s", ("test-upload-src",))
+        row = cur.fetchone()
+    assert row is None  # sync_all never even calls ensure_source for it
 
 

@@ -57,6 +57,8 @@ import psycopg
 from . import chunker, crawler, embedder, extract, metrics, renderer
 from .config import SourceConfig
 from .logging_config import get_logger
+from .sources_repo import SourceRecord
+from .uploads import UploadedDoc
 
 logger = get_logger(component="store")
 
@@ -331,13 +333,28 @@ def classify_sync(
 
 
 def ensure_source(conn: psycopg.Connection, source: SourceConfig) -> int:
-    """Ensure a `doc_sources` row exists for `source`, returning its id."""
+    """Ensure a `doc_sources` row exists for `source`, returning its id.
+
+    `base_url` is only ever overwritten from `EXCLUDED.base_url` (the value
+    passed in `source`) when the EXISTING row is itself a crawl-type source.
+    An existing upload-type row's `base_url` (the fixed `upload://{name}`
+    sentinel — see `SourceConfig._base_url_matches_source_type`) is always
+    preserved as-is, never clobbered by whatever `source.base_url` happens to
+    be on this call — this function is called on every crawl sync (see
+    `sync_source`, which itself refuses to run at all for an upload-type
+    source, so in practice `source` here is always crawl-shaped; this guard
+    is defense in depth against a stale/derived `SourceConfig` for the same
+    `name` being passed in some other call path).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO doc_sources (name, base_url)
             VALUES (%s, %s)
-            ON CONFLICT (name) DO UPDATE SET base_url = EXCLUDED.base_url
+            ON CONFLICT (name) DO UPDATE SET base_url = CASE
+                WHEN doc_sources.source_type = 'upload' THEN doc_sources.base_url
+                ELSE EXCLUDED.base_url
+            END
             RETURNING id
             """,
             (source.name, str(source.base_url)),
@@ -645,7 +662,20 @@ def sync_source(
     `seen_urls` (protecting the existing row from purge by `_delete_missing_pages`),
     increments `pages_soft_failed`, logs a distinct `page_fetch_skipped` event, and
     continues without touching the existing row in the database.
+
+    Raises `ValueError` immediately (before touching the database or the
+    network) if `source.source_type == 'upload'` — an upload-type source has
+    no URL to crawl (`base_url` is the `upload://{name}` sentinel, not a real
+    address); its content is indexed via `ingest_uploaded_docs` instead. This
+    keeps a crawl-only entrypoint from ever trying to fetch an
+    `upload://...` "URL" as if it were real.
     """
+    if source.source_type == "upload":
+        raise ValueError(
+            f"cannot crawl-sync a source with source_type='upload' (source={source.name!r}); "
+            "use ingest_uploaded_docs for upload sources instead"
+        )
+
     outcome = SourceOutcome(name=source.name)
     log = logger.bind(source=source.name)
 
@@ -1102,9 +1132,23 @@ def sync_all(
     progress_cb: Callable[[SourceOutcome, str], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, SourceOutcome]:
-    """Sync each of `sources` in turn, each with its own connection."""
+    """Sync each of `sources` in turn, each with its own connection.
+
+    Any source with `source_type == 'upload'` is SKIPPED entirely — not
+    attempted, not errored on, simply excluded from the batch (and therefore
+    absent from the returned dict). Upload sources have no crawl to run
+    (`sync_source` itself now refuses to run for one — see its docstring);
+    their content is indexed via `ingest_uploaded_docs` instead, on a
+    completely separate call path (the admin upload route). This mirrors
+    `sources_repo.due_sources()`'s exclusion at the SQL layer, but is
+    enforced explicitly here too since `sync_all`'s caller may build its
+    `sources` list a different way than `due_sources` does.
+    """
     results: dict[str, SourceOutcome] = {}
     for source in sources:
+        if source.source_type == "upload":
+            logger.info("sync_all_skipped_upload_source", source=source.name)
+            continue
         if cancel_event and cancel_event.is_set():
             results[source.name] = SourceOutcome(name=source.name, status="failed", error="Aborted by user")
             continue
@@ -1116,6 +1160,113 @@ def sync_all(
         finally:
             conn.close()
     return results
+
+
+def ingest_uploaded_docs(
+    conn: psycopg.Connection,
+    source: SourceRecord,
+    docs: list[UploadedDoc],
+    *,
+    progress_cb: Callable[[SourceOutcome, str], None] | None = None,
+) -> SourceOutcome:
+    """Index a batch of already-parsed `UploadedDoc`s (from `app.uploads`)
+    into `source`'s `doc_pages`/`doc_chunks`, using the same hash-diff
+    skip/re-embed idiom `sync_source` uses per page, but over an in-memory
+    document batch instead of a live crawl.
+
+    Per doc: the page URL is the sentinel `upload://{source.name}/{doc.rel_path}`.
+    `hash_markdown(doc.markdown)` is compared against the existing
+    `doc_pages.content_hash` for that URL (via `get_existing_page_hash`) —
+    unchanged content is skipped (`pages_skipped` +1, no re-chunk/re-embed,
+    same as `sync_source`'s unchanged-page path); new or changed content is
+    run through `chunker.chunk_markdown` -> `embedder.embed_chunks` ->
+    `replace_page`, exactly the same call shapes `sync_source` uses.
+
+    Raises `ValueError` immediately (before touching anything) if
+    `source.source_type != 'upload'` — this function must never be pointed
+    at a crawl source; use `sync_source`/`sync_source_with_metrics` for
+    those.
+
+    Deliberately NEVER calls `_delete_missing_pages`: unlike a crawl, one
+    upload batch is never a complete enumeration of the source's pages (a
+    user can upload a handful of files at a time, across many separate
+    batches), so a page's absence from THIS batch is never evidence it was
+    removed. Any page from a prior batch simply survives untouched.
+
+    Status classification reuses `classify_sync` with its default
+    (crawl-only) signals all left at their defaults (`crawl_aborted_early`/
+    `purge_guard_refused`/`crawl_truncated` all False, which don't apply to
+    an upload batch) — this already yields exactly the required semantics
+    for an upload batch: `pages_fetched + pages_skipped == 0` (nothing
+    succeeded) -> "failed"; `pages_failed > 0` with at least one success ->
+    "partial"; otherwise -> "ok".
+
+    `progress_cb`, when given, is called as `progress_cb(outcome, url)`
+    after every doc (success, skip, or failure) — identical signature and
+    per-item cadence to `sync_source`'s `progress_cb`, so a caller (the admin
+    upload route) can wire live progress into the same `_sync_status` widget
+    used for crawl syncs.
+    """
+    if source.source_type != "upload":
+        raise ValueError(
+            f"ingest_uploaded_docs cannot be called for source {source.name!r}: "
+            f"source_type={source.source_type!r} (must be 'upload')"
+        )
+
+    start = time.monotonic()
+    outcome = SourceOutcome(name=source.name)
+    log = logger.bind(source=source.name)
+
+    for doc in docs:
+        url = f"upload://{source.name}/{doc.rel_path}"
+        try:
+            content_hash = hash_markdown(doc.markdown)
+            existing_hash = get_existing_page_hash(conn, url)
+            if existing_hash == content_hash:
+                outcome.pages_skipped += 1
+                log.debug("page_unchanged_skip", url=url)
+                if progress_cb:
+                    progress_cb(outcome, url)
+                continue
+
+            chunks = chunker.chunk_markdown(url, doc.markdown)
+            chunks = embedder.embed_chunks(chunks)
+            n = replace_page(
+                conn,
+                source.id,
+                url,
+                content_hash,
+                chunks,
+                fts_config=source.language,
+            )
+            outcome.pages_fetched += 1
+            outcome.chunks_indexed += n
+            log.info("page_indexed", url=url, chunks=n, changed=existing_hash is not None)
+            if progress_cb:
+                progress_cb(outcome, url)
+        except Exception as e:  # noqa: BLE001 - isolate per-doc failures, mirrors sync_source
+            if not conn.autocommit:
+                conn.rollback()
+            outcome.pages_failed += 1
+            log.error("page_index_failed", url=url, error=str(e))
+            if progress_cb:
+                progress_cb(outcome, url)
+
+    outcome.status = classify_sync(outcome)
+    _update_source_status(conn, source.name, outcome.status)
+
+    duration = time.monotonic() - start
+    metrics.record_sync_outcome(source.name, outcome, duration)
+
+    log.info(
+        "source_sync_complete",
+        status=outcome.status,
+        pages_fetched=outcome.pages_fetched,
+        pages_skipped=outcome.pages_skipped,
+        pages_failed=outcome.pages_failed,
+        chunks_indexed=outcome.chunks_indexed,
+    )
+    return outcome
 
 
 @dataclass(frozen=True)
