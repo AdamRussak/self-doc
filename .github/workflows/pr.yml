@@ -1,0 +1,17 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  # Key on the PR number, not github.head_ref (branch name): head_ref is not
+  # unique across forks, so two PRs from different forks sharing a common
+  # branch name (e.g. "patch-1") would collide into the same group and
+  # cancel each other's runs. PR number is unique per PR.
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    uses: ./.github/workflows/test.yml

@@ -4,7 +4,7 @@
 **Date:** 2026-07-21
 **Decision makers:** Project owner + architect
 
-> **Status update (post-2026-07-26):** the "default moves to
+> **Status update (2026-07-26, commit `1c8d8ba`):** the "default moves to
 > `mixedbread-ai/mxbai-embed-large-v1`" decision below was subsequently
 > reverted — `config/models.yaml`'s `default:` row is now back to
 > `BAAI/bge-small-en-v1.5` (384-dim), matching the committed
