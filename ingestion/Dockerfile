@@ -26,9 +26,14 @@ RUN pip install --no-cache-dir uv \
 # Pre-download the FastEmbed embedding model and its tokenizer at build time so
 # the first real sync doesn't pay a cold-start download. Cached under
 # /home/ingest/.cache, owned by the runtime user below. The model is a build
-# arg so `make configure` / compose can bake the selected model (default =
-# config/models.yaml registry default); the runtime env var must match it.
-ARG EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
+# arg so `make configure` / compose can bake the selected model. The default
+# below tracks config/models.yaml's `default:` row — change it THERE, not
+# here, and re-run `make configure` (this ARG default is only a fallback for
+# a plain `docker compose build` with no EMBEDDING_MODEL_NAME set). The
+# runtime EMBEDDING_MODEL_NAME env var must match whatever was baked in here,
+# or the embedding dimension will mismatch the `vector(N)` column in
+# db/init/01_schema.sql.
+ARG EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
 ENV EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
 RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['EMBEDDING_MODEL_NAME'])" \
     && python -c "import os; from tokenizers import Tokenizer; Tokenizer.from_pretrained(os.environ['EMBEDDING_MODEL_NAME'])"

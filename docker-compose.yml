@@ -36,7 +36,11 @@ services:
     build:
       context: ./ingestion
       args:
-        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+        # This default tracks config/models.yaml's `default:` row — change it
+        # THERE, not here, and re-run `make configure`. Build-arg and runtime
+        # env (below) must agree, or the baked-in embedding dimension will
+        # mismatch the `vector(N)` column in db/init/01_schema.sql.
+        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
     container_name: self-docs-ingestion
     restart: unless-stopped
     profiles:
@@ -65,16 +69,19 @@ services:
       OMP_NUM_THREADS: 1
       ORT_NUM_THREADS: 4
       # Embedding model config — resolved by `make configure` into .env from
-      # config/models.yaml. The `:-mixedbread-ai/mxbai-embed-large-v1`
-      # fallback below is a hardcoded compose-level default so `make up`
-      # works even if .env was never written by `make configure` — it does
-      # NOT track config/models.yaml's `default:` row and can drift from it
-      # (e.g. config/models.yaml currently marks `BAAI/bge-small-en-v1.5` as
-      # `default: true`, not mxbai). Always run `make configure` (or set
-      # EMBEDDING_MODEL_NAME/EMBEDDING_DIM in .env yourself) rather than
-      # relying on this fallback to reflect the registry's current default.
-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
-      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      # config/models.yaml. The `:-BAAI/bge-small-en-v1.5` / `:-384` fallbacks
+      # below are hardcoded compose-level defaults so `make up` works even if
+      # .env was never written by `make configure`. EMBEDDING_DIM MUST track
+      # the SAME config/models.yaml row as EMBEDDING_MODEL_NAME (currently
+      # the `default:` row, BAAI/bge-small-en-v1.5 → dim: 384) — change both
+      # THERE, not here, and re-run `make configure` (or set
+      # EMBEDDING_MODEL_NAME/EMBEDDING_DIM in .env yourself). These values
+      # must also agree with the build.args default above and with the
+      # runtime EMBEDDING_MODEL_NAME on mcp-server, or the embedding
+      # dimension will mismatch the `vector(N)` column in
+      # db/init/01_schema.sql.
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
       EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT:-}"
       # T7 (headless-render retry): only ever used for a source that has
       # explicitly set `js_render: true` AND whose crawl this run flagged a
@@ -101,8 +108,16 @@ services:
     deploy:
       resources:
         limits:
-          # Sized per embedding model by `make configure` (config/models.yaml);
-          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
+          # `make configure` writes the selected model's `mem_ingestion` row
+          # from config/models.yaml into .env as INGESTION_MEM_LIMIT — that
+          # resolved value is what normally applies. This ${INGESTION_MEM_LIMIT:-2g}
+          # is only the fallback used when .env hasn't set it. It deliberately
+          # over-provisions the default bge-small-en-v1.5 row
+          # (mem_ingestion: "1500m") for headroom, but is NOT enough for the
+          # heaviest rows — mixedbread-ai/mxbai-embed-large-v1 and
+          # intfloat/multilingual-e5-large both ask for mem_ingestion: "3g" —
+          # so running `make configure` is required, not optional, when
+          # switching to one of those.
           memory: ${INGESTION_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
@@ -183,7 +198,11 @@ services:
     build:
       context: ./mcp-server
       args:
-        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+        # This default tracks config/models.yaml's `default:` row — change it
+        # THERE, not here, and re-run `make configure`. Build-arg and runtime
+        # env (below) must agree, or the baked-in embedding dimension will
+        # mismatch the `vector(N)` column in db/init/01_schema.sql.
+        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
     container_name: self-docs-mcp-server
     restart: unless-stopped
     profiles:
@@ -203,12 +222,15 @@ services:
       ORT_NUM_THREADS: 4
       # Must match the ingestion service's model for vectors to be comparable;
       # `make configure` keeps both in sync via .env. The
-      # `:-mixedbread-ai/mxbai-embed-large-v1` fallback below is a hardcoded
-      # compose-level default, not a live read of config/models.yaml's
-      # `default:` row, so it can drift from the registry's current default
-      # (see the same note on the ingestion service above) — run `make
-      # configure` rather than relying on it.
-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+      # `:-BAAI/bge-small-en-v1.5` fallback below is a hardcoded compose-level
+      # default, not a live read of config/models.yaml — it tracks that
+      # file's `default:` row as of this writing (see the same note on the
+      # ingestion service above); change the default THERE, not here, and
+      # re-run `make configure` rather than relying on this fallback. It must
+      # also agree with the build.args default above, or the baked-in
+      # embedding dimension will mismatch the `vector(N)` column in
+      # db/init/01_schema.sql.
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
       EMBEDDING_QUERY_PROMPT: "${EMBEDDING_QUERY_PROMPT:-Represent this sentence for searching relevant passages: }"
     ports:
       - "127.0.0.1:${DOCS_MCP_HOST_PORT:-8081}:8000"
@@ -217,8 +239,16 @@ services:
     deploy:
       resources:
         limits:
-          # Sized per embedding model by `make configure` (config/models.yaml);
-          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
+          # `make configure` writes the selected model's `mem_mcp` row from
+          # config/models.yaml into .env as MCP_MEM_LIMIT — that resolved
+          # value is what normally applies. This ${MCP_MEM_LIMIT:-2g} is only
+          # the fallback used when .env hasn't set it. It deliberately
+          # over-provisions the default bge-small-en-v1.5 row (mem_mcp: "1g")
+          # for headroom, but only just matches the heaviest rows —
+          # mixedbread-ai/mxbai-embed-large-v1 and
+          # intfloat/multilingual-e5-large both ask for mem_mcp: "2g", with no
+          # spare headroom left — so running `make configure` is required,
+          # not optional, when switching to one of those.
           memory: ${MCP_MEM_LIMIT:-2g}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=3)"]

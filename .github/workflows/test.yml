@@ -54,13 +54,16 @@ jobs:
 
       - name: Configure embedding model (small/fast for CI)
         run: |
-          # Use the small 384-dim model in CI so the suite doesn't download the
-          # 1.2GB production default (mxbai-large) on every run. This also
-          # exercises `make configure`: it writes EMBEDDING_* into .env (which
-          # the Makefile exports to the test venvs) and re-renders 01_schema.sql
-          # to vector(384) so the seeded test vectors match the column width.
-          # Must run before `make test` — db-test reads 01_schema.sql at
-          # first boot via docker-entrypoint-initdb.d.
+          # BAAI/bge-small-en-v1.5 (384-dim) is already config/models.yaml's
+          # `default:` row, but CI configures it explicitly here rather than
+          # relying on an unset .env, which keeps the model small and fast
+          # and keeps the rendered schema in lockstep with the seeded test
+          # vectors. This exercises `make configure`: it writes EMBEDDING_*
+          # into .env (which the Makefile exports to the test venvs) and
+          # re-renders 01_schema.sql to vector(384) so the seeded test
+          # vectors match the column width. Must run before `make test` —
+          # db-test reads 01_schema.sql at first boot via
+          # docker-entrypoint-initdb.d.
           python -m pip install --quiet pyyaml
           make configure MODEL=BAAI/bge-small-en-v1.5
 

@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 from . import llms_txt
 from .config import SourceConfig
 from .logging_config import get_logger
-from .urlscope import parse_sitemap, url_host_is_private
+from .urlscope import canonicalize_url, parse_sitemap, url_host_is_private
 from .urlscope import path_allowed as _path_allowed
 
 USER_AGENT = "self-docs-crawler/0.1"
@@ -120,8 +120,16 @@ def _validate_final_url(
 
 
 def _strip_fragment(url: str) -> str:
-    parsed = urlparse(url)
-    return parsed._replace(fragment="").geturl()
+    """Canonicalize `url` for indexing: drop the fragment AND every
+    locale/tracking query parameter (`urlscope.canonicalize_url`).
+
+    Kept under its original name because it is the crawler's single
+    normalization chokepoint — every URL-admission path already routes
+    through it — but it now does strictly more than strip the fragment.
+    Dropping `?hl=`-style parameters HERE rather than at each call site is
+    what makes `visited` deduplicate a page against its own translations
+    instead of fetching, embedding and storing each one separately."""
+    return canonicalize_url(url)
 
 
 def load_robots(client: httpx.Client, base_url: str) -> urllib.robotparser.RobotFileParser:
@@ -267,12 +275,24 @@ def _discover_sitemap_urls_recursive(
     urls, child_sitemaps = parse_sitemap(resp.content)
 
     filtered: list[str] = []
+    seen_in_level: set[str] = set()
     for u in urls:
+        # Canonicalize BEFORE dedupe and BEFORE the cap. Order is
+        # load-bearing, not stylistic: a sitemap that lists every page once
+        # per supported language (`?hl=ar`, `?hl=de`, ... — Google's docs
+        # sites list ~17) yields ~17 distinct strings per document, all of
+        # which survive a raw `not in filtered` check and each of which
+        # consumes one unit of `max_pages`. Canonicalizing first collapses
+        # them to one entry, so the budget buys distinct DOCUMENTS rather
+        # than translations. Doing it downstream (at fetch time) would be
+        # far too late: the cap has already been spent by then.
+        u = canonicalize_url(u)
         if not _same_host(u, base_url):
             continue
         if not _allowed(urlparse(u).path, include_prefixes, exclude_prefixes):
             continue
-        if u not in filtered:
+        if u not in seen_in_level:
+            seen_in_level.add(u)
             filtered.append(u)
 
     # Sort deterministically BEFORE the cap is applied: sitemap enumeration
@@ -667,12 +687,18 @@ def crawl(
             # mirroring sitemap discovery — instead of a sitemap/BFS crawl. Each
             # URL is still re-validated (host/scope/private/robots) in `_visit`.
             filtered: list[str] = []
+            seen_in_index: set[str] = set()
             for u in llms_index_urls:
+                # Canonicalized before dedupe and before the cap, exactly as
+                # in sitemap discovery — an llms.txt index is just as free to
+                # list per-language URL variants.
+                u = canonicalize_url(u)
                 if not _same_host(u, base_url):
                     continue
                 if not _allowed(urlparse(u).path, source.include_prefixes, source.exclude_prefixes):
                     continue
-                if u not in filtered:
+                if u not in seen_in_index:
+                    seen_in_index.add(u)
                     filtered.append(u)
             candidate_urls = filtered[:page_cap]
             log.info("llms_index_candidates", count=len(candidate_urls))

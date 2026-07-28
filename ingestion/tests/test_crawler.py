@@ -1855,3 +1855,101 @@ def test_discover_sitemap_urls_sitemapindex_children_order_is_deterministic():
         children["https://docs-fixture.dev/sitemaps/b.xml"]
     )[:7]
 
+
+
+def test_sitemap_locale_variants_collapse_before_the_cap():
+    """Regression test for the real ai.google.dev/sitemap.xml case that left
+    gemini-api stuck at `partial`.
+
+    Upstream lists every document once per supported language behind `?hl=`.
+    Before canonicalization those variants were 17 distinct strings per
+    document, each consuming one unit of `max_pages`, so a 100-page budget
+    bought ~6 real documents and reported truncation. Canonicalizing BEFORE
+    the dedupe and BEFORE the cap must collapse them, so the same budget
+    covers all 40 distinct documents and discovery is no longer truncated.
+    """
+    langs = ["ar", "de", "es-419", "fr", "he", "hi", "id", "it", "ja", "ko", "pl", "pt-BR", "th", "tr", "vi", "zh-CN"]
+    locs = []
+    for i in range(40):
+        page = f"https://ai.google.dev/gemini-api/docs/p{i:02d}"
+        locs.append(f"<url><loc>{page}</loc></url>")
+        locs.extend(f"<url><loc>{page}?hl={lang}</loc></url>" for lang in langs)
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{''.join(locs)}"
+        "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://ai.google.dev/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(404)
+
+    truncation: dict = {}
+    urls = discover_sitemap_urls(
+        make_client(handler),
+        "https://ai.google.dev/sitemap.xml",
+        max_pages=100,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://ai.google.dev/gemini-api/docs",
+        include_prefixes=["/gemini-api/docs"],
+        exclude_prefixes=[],
+        truncation_info_out=truncation,
+    )
+
+    # 680 raw <loc> entries collapse to the 40 distinct documents...
+    assert len(urls) == 40
+    assert len(set(urls)) == 40
+    # ...none of which carries a locale parameter...
+    assert not any("hl=" in u for u in urls)
+    # ...and the crawl is no longer truncated, so `store.sync_source` can
+    # trust the enumeration and resume purging stale pages.
+    assert truncation["truncated_at_cap"] is False
+
+
+def test_sitemap_canonicalization_does_not_drop_content_bearing_query_pages():
+    """The collapse must be limited to locale/tracking parameters: two pages
+    differing only by a content-bearing parameter remain two pages."""
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<url><loc>https://cloudinary.com/documentation/image?tech=python</loc></url>"
+        "<url><loc>https://cloudinary.com/documentation/image?tech=ruby</loc></url>"
+        "<url><loc>https://cloudinary.com/documentation/image?tech=ruby&amp;hl=fr</loc></url>"
+        "</urlset>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://cloudinary.com/sitemap.xml":
+            return httpx.Response(200, text=sitemap_xml)
+        return httpx.Response(404)
+
+    urls = discover_sitemap_urls(
+        make_client(handler),
+        "https://cloudinary.com/sitemap.xml",
+        max_pages=100,
+        limiter=_new_limiter(),
+        log=_test_log(),
+        base_url="https://cloudinary.com/documentation",
+        include_prefixes=["/documentation"],
+        exclude_prefixes=[],
+    )
+
+    # ?tech=ruby and ?tech=ruby&hl=fr collapse together; ?tech=python stays
+    # separate.
+    assert sorted(urls) == [
+        "https://cloudinary.com/documentation/image?tech=python",
+        "https://cloudinary.com/documentation/image?tech=ruby",
+    ]
+
+
+def test_bfs_crawl_does_not_refetch_locale_variants_of_a_visited_page():
+    """The BFS path shares the same chokepoint: a page linking to its own
+    translations must not enqueue them as separate documents."""
+    from app.crawler import _strip_fragment
+
+    assert _strip_fragment("https://x.dev/a?hl=fr") == "https://x.dev/a"
+    assert _strip_fragment("https://x.dev/a#frag") == "https://x.dev/a"
+    assert _strip_fragment("https://x.dev/a?tech=python") == "https://x.dev/a?tech=python"

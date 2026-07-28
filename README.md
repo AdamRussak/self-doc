@@ -23,55 +23,8 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 
 ---
 
-## Known issue — a fresh install with default `.env` values is broken
-
-> [!WARNING]
-> **If you are doing a first install, read this before `make up`.** This does
-> **not** affect the existing production deployment (its `doc_chunks.embedding`
-> column and `.env` are already on `BAAI/bge-small-en-v1.5` / 384-dim), and it
-> does **not** affect a normal `cp .env.example .env && make up` — it only
-> affects `docker compose up` run with **no `.env` at all** (or a hand-trimmed
-> one missing `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`).
->
-> `config/models.yaml`'s registry default is `BAAI/bge-small-en-v1.5`
-> (384-dim), matched by `db/init/01_schema.sql` (`doc_chunks.embedding
-> vector(384)`) and by `ingestion/app/embedder.py`, `mcp-server/app/retrieval.py`,
-> and `ingestion/app/chunker.py`'s fallback constants — every code-level
-> default is aligned. The one place still **not** aligned is
-> `docker-compose.yml`'s own shell-level env-var fallbacks:
-> - `EMBEDDING_MODEL_NAME` — `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
-> - `EMBEDDING_DIM` — `${EMBEDDING_DIM:-1024}`
->
-> These only kick in when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in
-> `.env`. The result, only if you skip `.env.example`: an **empty volume**
-> creates a `vector(384)` column, then the services embed at 1024-dim —
-> every `doc_chunks` insert fails at sync time.
->
-> **Workaround — always start from `.env.example`:** it already ships with
-> both lines uncommented at the correct values, so copying it verbatim (the
-> Quickstart below) avoids this entirely. If you hand-edit `.env`, keep these:
-> ```bash
-> EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
-> EMBEDDING_DIM=384
-> ```
-> This must happen **before** the first `docker compose up`, because
-> `db/init/*.sql` only runs against an empty Postgres data directory. If you
-> already ran `make up` with the broken defaults, tear down the volume and
-> start over: `docker compose down -v db && make up`.
->
-> **Separately:** if you are instead upgrading an **existing** 1024-dim
-> database, there is no migration provided for the dimension change on this
-> branch — the `DO` block that used to handle exactly this in
-> `db/init/03_fix_embedding_dim.sql` was removed (that file now only contains
-> unrelated `doc_sources` URL/sitemap fixups). Do not attempt to reconfigure an
-> existing 1024-dim deployment to 384-dim without a manual re-embed plan; see
-> [Runbook → switch the embedding model](docs/runbook.md#switch-the-embedding-model).
-
----
-
 ## Contents
 
-- [Known issue — a fresh install with default `.env` values is broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
 - [Why self-docs](#why-self-docs)
 - [Architecture](#architecture)
 - [Quickstart — Local Development](#quickstart--local-development)
@@ -93,9 +46,10 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
   GPU/torch); documentation never leaves your network. The model is selectable
   from a registry (`config/models.yaml`) — `make configure` derives the vector
   dimension and container memory limits from your choice. Default:
-  `BAAI/bge-small-en-v1.5` (384-dim). *(Note: See the Known issue above —
-  `docker-compose.yml`'s own env-var fallback can still drift from this if
-  `.env` is missing).*
+  `BAAI/bge-small-en-v1.5` (384-dim) — compose defaults, both Dockerfiles'
+  build `ARG`s, both services' code-level fallbacks, and the committed
+  `db/init/01_schema.sql` schema all agree on this out of the box, with no
+  `.env` required.
 - **Hybrid retrieval.** Vector similarity + per-source-language Postgres
   full-text search over `pgvector`, so exact terms and semantic matches both
   surface.
@@ -152,14 +106,6 @@ make configure              # optional — pick an embedding model (see below)
 make up                     # db + ingestion (:8080) + mcp-server (:8081)
 make sync                   # trigger the initial documentation sync
 ```
-
-> [!WARNING]
-> See the [Known issue](#known-issue--a-fresh-install-with-default-env-values-is-broken)
-> above before running `make up` for the first time — an unmodified
-> `.env.example` copy currently ships with the correct `EMBEDDING_MODEL_NAME`/
-> `EMBEDDING_DIM` values already uncommented, but if you hand-edit those lines
-> or skip copying `.env.example` verbatim, double-check they say
-> `BAAI/bge-small-en-v1.5` / `384` before your first `make up`.
 
 `make configure` is optional: with no `.env` overrides both services already use
 the registry default. Run it to choose a different model —

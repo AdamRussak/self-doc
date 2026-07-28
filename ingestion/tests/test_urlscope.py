@@ -2,8 +2,10 @@ import socket
 
 import pytest
 from app.urlscope import (
+    NOISE_QUERY_PARAMS,
     _resolve_host_addrs,
     _resolve_is_private,
+    canonicalize_url,
     parse_sitemap,
     path_allowed,
     url_host_is_private,
@@ -284,3 +286,96 @@ def test_unresolvable_is_not_private_at_validation_time(monkeypatch):
 def test_url_with_no_host_fails_closed():
     assert url_host_is_private("file:///etc/passwd") is True
     assert url_host_is_private("not a url") is True
+
+
+# --- canonicalize_url -----------------------------------------------------
+
+
+def test_canonicalize_strips_locale_parameter():
+    """The gemini-api defect: ai.google.dev lists every doc page once per
+    supported language behind `?hl=`, so 28 real documents enumerated as
+    500 URLs and consumed the entire max_pages budget."""
+    canonical = "https://ai.google.dev/gemini-api/docs/models"
+    for variant in ("?hl=ar", "?hl=de", "?hl=ja", "?hl=pt-BR", "?hl=en"):
+        assert canonicalize_url(canonical + variant) == canonical
+
+
+def test_canonicalize_strips_fragment():
+    assert canonicalize_url("https://x.dev/a#install") == "https://x.dev/a"
+
+
+def test_canonicalize_strips_fragment_and_query_together():
+    assert canonicalize_url("https://x.dev/a?hl=fr#install") == "https://x.dev/a"
+
+
+def test_canonicalize_strips_tracking_parameters():
+    assert canonicalize_url("https://x.dev/a?utm_source=n&gclid=1&referrer=rootllms") == "https://x.dev/a"
+
+
+def test_canonicalize_keeps_ambiguous_attribution_lookalikes():
+    """`ref`/`source`/`l` are attribution on many sites but content-bearing
+    on others (`?ref=main` selects a git branch), so they are deliberately
+    NOT on the deny-list — collapsing two different documents is the exact
+    failure mode the deny-list exists to avoid. This test is the guard
+    against someone 'completing' the list later."""
+    for param in ("ref", "ref_src", "source", "l"):
+        assert param not in NOISE_QUERY_PARAMS
+        url = f"https://x.dev/a?{param}=main"
+        assert canonicalize_url(url) == url
+
+
+def test_canonicalize_is_case_insensitive_on_parameter_names():
+    assert canonicalize_url("https://x.dev/a?HL=fr") == "https://x.dev/a"
+    assert canonicalize_url("https://x.dev/a?Utm_Source=n") == "https://x.dev/a"
+
+
+def test_canonicalize_preserves_content_bearing_parameters():
+    """Deny-list, not allow-list: these four are live in the real corpus and
+    select genuinely different content, so they must survive untouched."""
+    for url in (
+        "https://cloudinary.com/documentation/image?tech=python",
+        "https://developers.google.com/x?apix=true",
+        "https://developers.google.com/x?apix_params=%7B%22a%22%3A1%7D",
+        "https://developers.google.com/x?client_type=rest",
+    ):
+        assert canonicalize_url(url) == url
+
+
+def test_canonicalize_keeps_content_parameters_while_dropping_noise():
+    assert (
+        canonicalize_url("https://x.dev/a?tech=python&hl=fr&utm_source=n&client_type=rest")
+        == "https://x.dev/a?tech=python&client_type=rest"
+    )
+
+
+def test_canonicalize_preserves_order_of_kept_parameters():
+    assert canonicalize_url("https://x.dev/a?b=2&hl=fr&a=1") == "https://x.dev/a?b=2&a=1"
+
+
+def test_canonicalize_preserves_blank_values():
+    """`keep_blank_values=True`: `?tech=` must not be silently dropped, since
+    a blank value can select different content than an absent parameter."""
+    assert canonicalize_url("https://x.dev/a?tech=") == "https://x.dev/a?tech="
+
+
+def test_canonicalize_does_not_mangle_encoded_values():
+    url = "https://x.dev/a?q=a%2Bb%20c&hl=fr"
+    assert canonicalize_url(url) == "https://x.dev/a?q=a%2Bb%20c"
+
+
+def test_canonicalize_returns_url_without_query_or_fragment_unchanged():
+    """Byte-for-byte identity — no re-serialization round-trip for the
+    overwhelming majority of URLs, which have nothing to strip."""
+    url = "https://x.dev/a/b%2Fc/"
+    assert canonicalize_url(url) is url
+
+
+def test_canonicalize_drops_query_string_that_was_entirely_noise():
+    assert canonicalize_url("https://x.dev/a?hl=fr") == "https://x.dev/a"
+    assert "?" not in canonicalize_url("https://x.dev/a?hl=fr")
+
+
+def test_canonicalize_leaves_malformed_input_alone():
+    """A normalizer, not a validator — the host/scope/private gates still
+    refuse it separately."""
+    assert canonicalize_url("not a url") == "not a url"

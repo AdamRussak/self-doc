@@ -1,7 +1,7 @@
-"""Pure helpers for URL scoping and sitemap parsing.
+"""Pure helpers for URL scoping, canonicalization, and sitemap parsing.
 
 No network, no filesystem, no DB access — these functions operate purely on
-their inputs. They exist to fix two production defects:
+their inputs. They exist to fix three production defects:
 
 1. Scope leak: prefix matching via plain `str.startswith` lets an
    `include_prefixes` entry like `/traefik` also match `/traefik-hub/...`,
@@ -14,6 +14,17 @@ their inputs. They exist to fix two production defects:
    files, rather than a `<urlset>` of `<url><loc>` page URLs. `parse_sitemap`
    distinguishes the two and returns both possible lists so a caller can
    recurse into child sitemaps.
+
+3. Locale/tracking query-parameter explosion: include/exclude prefixes only
+   ever match `urlparse(url).path`, so NO source config could express "don't
+   crawl the translated copies." Sites that serve every page in ~20
+   languages behind a `?hl=` parameter therefore enumerated ~20 near-
+   identical URLs per document, and the `max_pages` cap — applied to that
+   inflated list — spent the entire budget on translations of the first
+   handful of documents. `canonicalize_url` strips those parameters so the
+   variants collapse onto one URL and the cap is spent on distinct
+   documents. See `NOISE_QUERY_PARAMS` for the deny-list and why it is a
+   deny-list rather than an allow-list.
 
 INCLUDE vs EXCLUDE matching is deliberately ASYMMETRIC — read this before
 adding a new source's include_prefixes/exclude_prefixes:
@@ -52,7 +63,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 from xml.etree import ElementTree  # kept for ElementTree.ParseError below
 
 from defusedxml import ElementTree as DefusedET
@@ -256,6 +267,113 @@ def path_allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[
     if include_prefixes:
         return any(_matches_prefix(path, p) for p in include_prefixes)
     return True
+
+
+# ---------------------------------------------------------------------------
+# URL canonicalization
+# ---------------------------------------------------------------------------
+
+# Query parameters that select a TRANSLATION or carry ANALYTICS, never
+# content. Stripping them collapses the variants onto the canonical URL.
+#
+# This is deliberately a DENY-list, not an allow-list. Plenty of doc sites
+# put genuinely content-bearing state in the query string — `?tech=python`
+# picks a language-specific code sample, `?apix_params=...` drives an
+# embedded API explorer, `?client_type=...` switches an SDK's reference —
+# and those are all live in the current corpus. An allow-list would have to
+# enumerate every such parameter across every upstream site and would
+# silently drop real documents the moment a site invented a new one. A
+# deny-list fails the safe way instead: an unknown parameter is preserved,
+# so the worst case is a duplicate we already tolerate today rather than a
+# missing page.
+#
+# Note `hl=` is Google's locale parameter and is the specific one that broke
+# the gemini-api and google-search-console-api crawls. `referrer` is on the
+# list because developers.google.com stamps it onto in-page links
+# (`?referrer=rootllms` in the live corpus).
+#
+# Entries are held to the same fail-safe standard the deny-list exists for,
+# which rules out several "obvious" candidates. `ref` is attribution on most
+# sites but selects a git branch/tag on others (`?ref=main`); `source` is
+# attribution on Google properties but arbitrary state elsewhere; a bare `l`
+# is too generic to attribute to anything. Each of those could collapse two
+# genuinely different documents into one — the failure mode this list is
+# supposed to avoid — so they are deliberately EXCLUDED. Only add a
+# parameter here when its value cannot change the rendered content.
+NOISE_QUERY_PARAMS = frozenset(
+    {
+        # Locale / translation selectors
+        "hl",
+        "lang",
+        "language",
+        "locale",
+        "setlang",
+        # Analytics / attribution
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_id",
+        "gclid",
+        "fbclid",
+        "msclkid",
+        "mc_cid",
+        "mc_eid",
+        "igshid",
+        "referrer",
+        "referer",
+        "_ga",
+        "_gl",
+    }
+)
+
+
+def canonicalize_url(url: str) -> str:
+    """Strip the fragment and every `NOISE_QUERY_PARAMS` entry from `url`.
+
+    Returns a URL that is equivalent for indexing purposes, so that
+    `.../docs/models`, `.../docs/models#pricing`, `.../docs/models?hl=fr`
+    and `.../docs/models?hl=ja&utm_source=x` all collapse to the single
+    canonical `.../docs/models`.
+
+    Parameter names are matched CASE-INSENSITIVELY (`?HL=fr` is the same
+    selector as `?hl=fr`). Content-bearing parameters are preserved, in
+    their original order, along with their original encoding of spaces and
+    reserved characters — `parse_qsl(keep_blank_values=True)` +
+    `urlencode(quote_via=quote)` round-trips a parameter that is kept
+    without mangling it, and blank values (`?tech=`) survive as blanks
+    rather than being silently dropped.
+
+    A URL with no query and no fragment is returned UNCHANGED (byte-for-
+    byte, not re-serialized), so canonicalization can never perturb the
+    overwhelming majority of URLs that have nothing to strip. This matters:
+    every URL flows through here, and a re-serialization round-trip is a
+    chance to alter a path's percent-encoding for no benefit.
+
+    Malformed input that `urlparse` rejects is returned unchanged — this is
+    a normalizer, not a validator; the host/scope/private-address gates run
+    separately and still refuse it.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+
+    if not parsed.query and not parsed.fragment:
+        return url
+
+    if parsed.query:
+        kept = [
+            (name, value)
+            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if name.lower() not in NOISE_QUERY_PARAMS
+        ]
+        query = urlencode(kept, quote_via=quote)
+    else:
+        query = ""
+
+    return parsed._replace(query=query, fragment="").geturl()
 
 
 def _strip_ns(tag: str) -> str:

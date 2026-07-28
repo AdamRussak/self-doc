@@ -16,6 +16,14 @@
 # plain embed(). Leave a prompt empty ("") when the model wants no prefix on
 # that side. bge/mxbai want an instruction on the QUERY only; e5 wants a prefix
 # on BOTH sides.
+#
+# image_slug (optional): the GHCR image tag suffix for this model, e.g. the
+# release workflow tags ghcr.io/.../self-docs-ingestion-<image_slug>. Must be
+# unique across rows and a valid Docker tag fragment. Consumed by
+# scripts/models_matrix.py, which generates the CI build matrix from this
+# file so a new row automatically gets its own images. When omitted, the
+# slug is derived from the model name: the basename after the last '/',
+# lowercased, with any character outside [a-z0-9._-] replaced by '-'.
 
 default: BAAI/bge-small-en-v1.5
 
@@ -26,6 +34,7 @@ models:
     mem_mcp: "2g"
     query_prompt: "Represent this sentence for searching relevant passages: "
     passage_prompt: ""
+    image_slug: mxbai-embed-large-v1
 
   intfloat/multilingual-e5-large:
     dim: 1024
@@ -33,6 +42,7 @@ models:
     mem_mcp: "2g"
     query_prompt: "query: "
     passage_prompt: "passage: "
+    image_slug: multilingual-e5-large
 
   BAAI/bge-base-en-v1.5:
     dim: 768
@@ -40,6 +50,7 @@ models:
     mem_mcp: "1g"
     query_prompt: "Represent this sentence for searching relevant passages: "
     passage_prompt: ""
+    image_slug: bge-base-en-v1.5
 
   BAAI/bge-small-en-v1.5:
     dim: 384
@@ -47,3 +58,4 @@ models:
     mem_mcp: "1g"
     query_prompt: "Represent this sentence for searching relevant passages: "
     passage_prompt: ""
+    image_slug: bge-small-en-v1.5

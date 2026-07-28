@@ -4,6 +4,19 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      models:
+        description: >-
+          Comma-separated list of full model names from config/models.yaml
+          (the `model:` value, NOT the `image_slug:`/derived slug) to build
+          images for. Use 'all' (the default) to build every model in the
+          registry. Has no effect on a `push` trigger — GitHub only
+          populates the `inputs` context for workflow_dispatch/workflow_call
+          events, so a plain push always resolves to 'all' regardless of
+          whatever this input was last set to.
+        required: false
+        default: all
+        type: string
 
 concurrency:
   # Literal `release-` prefix, not `${{ github.workflow }}` — inside a
@@ -54,30 +67,108 @@ jobs:
           default_bump: patch
           initial_version: 0.0.1
 
-  build-and-push:
-    needs: [verify, bump-version]
+  # Turns config/models.yaml into the build/merge matrices below. Only
+  # depends on `verify`, not `bump-version` — the tag bump and the matrix
+  # computation are independent facts about this run and shouldn't
+  # serialize behind each other; `build` is what actually needs both.
+  #
+  # The model list is generated here, from the registry, on every run —
+  # and MUST stay that way. Hardcoding model names into this workflow would
+  # let `config/models.yaml` (the single source of truth per CLAUDE.md/the
+  # script's own header) silently drift out of sync with the images that
+  # actually get published: add a row to the registry and forget to touch
+  # this file, and the new model quietly never gets an image.
+  prepare:
+    needs: [verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      models: ${{ steps.matrix.outputs.models }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Generate per-model build matrix from config/models.yaml
+        id: matrix
+        env:
+          # Empty/null on a `push` trigger (inputs.* is only populated for
+          # workflow_dispatch/workflow_call) — `||` treats that falsy value
+          # as unset and falls back to 'all', so push always builds every
+          # model regardless of this expression's own default.
+          MODELS_INPUT: ${{ inputs.models || 'all' }}
+        run: |
+          # Assign the command substitution to a variable first, rather
+          # than embedding it straight in an `echo "models=$(...)"` — under
+          # bash's default `-e`, a failing command inside `$(...)` does NOT
+          # abort the script when it's just interpolated into another
+          # command's argument (echo itself still "succeeds"), but it DOES
+          # abort when the substitution is the right-hand side of a plain
+          # assignment. That distinction is exactly what makes `--only`
+          # naming an unknown model (exit 2, nothing on stdout) fail this
+          # job before any of the 16 build legs start, instead of quietly
+          # writing an empty `models=` output that `fromJSON()` downstream
+          # would choke on with a much less obvious error.
+          models_json=$(python scripts/models_matrix.py --only "$MODELS_INPUT")
+          echo "models=$models_json" >> "$GITHUB_OUTPUT"
+
+  # One job per (service, model, platform) — 2 services x N registry models
+  # x 2 platforms. Each leg builds and pushes ONLY its own single-arch
+  # image, by digest (no tag), to GHCR; `merge` stitches the per-arch
+  # digests for a given (service, model) into one multi-arch manifest list
+  # afterwards. This is the documented pattern for building multi-platform
+  # images across multiple native runners:
+  # https://docs.docker.com/build/ci/github-actions/multi-platform/
+  build:
+    needs: [verify, bump-version, prepare]
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
       packages: write
-      id-token: write
-      attestations: write
+      # No id-token/attestations here: `provenance`/`sbom` below are
+      # buildkit-native attestations embedded directly in the pushed OCI
+      # image index, not GitHub's separate attestation API (that's only
+      # `actions/attest-build-provenance`, which this workflow doesn't
+      # call). Granting id-token/attestations write here would be an
+      # unused, unnecessary privilege.
     strategy:
       fail-fast: false
       matrix:
         service: [ingestion, mcp-server]
+        model: ${{ fromJSON(needs.prepare.outputs.models) }}
+        platform:
+          # arm64 runs on the free, native `ubuntu-24.04-arm` GitHub-hosted
+          # runner instead of amd64 + QEMU emulation. Before this, the
+          # emulated leg was by far the slowest and flakiest part of a
+          # release: `pip install` (wheels with no manylinux aarch64 build
+          # falling back to source compiles under QEMU) and the FastEmbed
+          # ONNX model pre-download/first-run session init both got
+          # dramatically slower under emulation, and occasionally timed
+          # out outright. Native arm64 hosted runners are free ONLY on
+          # PUBLIC repos (this one, per CLAUDE.md/global_context, is
+          # public) and HARD-FAIL the job on private ones with no
+          # automatic fallback — if this repo is ever made private, this
+          # leg must be repointed at a paid larger arm64 runner, or this
+          # whole platform axis reverted to a single amd64+QEMU leg.
+          - { name: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { name: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Normalize repository owner to lowercase
-        id: normalize
         run: |
           REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "REPO_LOWER=${REPO_LOWER}" >> $GITHUB_ENV
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+          echo "REPO_LOWER=${REPO_LOWER}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${REPO_LOWER}/self-docs-${{ matrix.service }}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -89,29 +180,142 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Extract Docker labels (tags are decided later, in `merge`)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ needs.bump-version.outputs.new_tag }}
-            type=raw,value=${{ needs.bump-version.outputs.new_version }}
-            type=sha,format=long
+          images: ${{ env.IMAGE }}
+          labels: |
+            io.self-docs.embedding-model=${{ matrix.model.model }}
+            io.self-docs.embedding-dim=${{ matrix.model.dim }}
 
-      - name: Build and push container image
+      - name: Build and push single-arch image by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.service }}
           file: ./${{ matrix.service }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform.name }}
           build-args: |
-            EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
-          cache-from: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache,mode=max
-          provenance: true
+            EMBEDDING_MODEL_NAME=${{ matrix.model.model }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # push-by-digest, no tag: this leg publishes an untagged,
+          # digest-addressed single-arch image. `merge` later combines the
+          # amd64 + arm64 digests for this (service, model) into one
+          # tagged, multi-arch manifest list via `docker buildx imagetools
+          # create` — NOT `docker manifest create`, because imagetools
+          # correctly re-attaches each arch's provenance/SBOM attestation
+          # manifests into the merged index; the older `docker manifest`
+          # CLI only knows about plain image manifests and would silently
+          # drop them.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # One cache ref per service+model+arch, not one shared
+          # `:buildcache` tag: two legs racing to push the SAME cache
+          # manifest (e.g. this service's two different models' amd64 legs
+          # both writing to `self-docs-<service>:buildcache`) clobber each
+          # other's layers, since a registry cache ref is a single mutable
+          # tag, not an additive store. Each leg needs its own ref so its
+          # cache stays intact and useful across releases.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.model.slug }}-${{ matrix.platform.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.model.slug }}-${{ matrix.platform.arch }},mode=max
+          provenance: mode=max
           sbom: true
+
+      - name: Export digest for the merge job
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Unique per (service, model, arch) so 16 legs never collide on
+          # an artifact name, and so `merge`'s download pattern below can
+          # select exactly one (service, model)'s pair of digests.
+          name: digests-${{ matrix.service }}-${{ matrix.model.slug }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # One job per (service, model) — collects that pair's amd64 + arm64
+  # digests from `build` and fuses them into a single tagged, multi-arch
+  # manifest list.
+  merge:
+    needs: [bump-version, prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ingestion, mcp-server]
+        model: ${{ fromJSON(needs.prepare.outputs.models) }}
+    steps:
+      - name: Normalize repository owner to lowercase
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "REPO_LOWER=${REPO_LOWER}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${REPO_LOWER}/self-docs-${{ matrix.service }}" >> "$GITHUB_ENV"
+
+      - name: Download this (service, model)'s per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          # Anchored on BOTH matrix.service and matrix.model.slug (not just
+          # one), so this can only ever pull in the two digests (amd64,
+          # arm64) belonging to this exact (service, model) pair — never
+          # another service's or another model's digests, even though
+          # every leg's artifact lands in the same workflow run's
+          # artifact namespace.
+          pattern: digests-${{ matrix.service }}-${{ matrix.model.slug }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute the tag set for this (service, model)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ matrix.model.slug }}
+            type=raw,value=${{ needs.bump-version.outputs.new_tag }}-${{ matrix.model.slug }}
+            type=raw,value=${{ needs.bump-version.outputs.new_version }}-${{ matrix.model.slug }}
+            type=raw,value=sha-${{ github.sha }}-${{ matrix.model.slug }}
+            type=raw,value=latest,enable=${{ matrix.model.is_default }}
+            type=raw,value=${{ needs.bump-version.outputs.new_tag }},enable=${{ matrix.model.is_default }}
+            type=raw,value=${{ needs.bump-version.outputs.new_version }},enable=${{ matrix.model.is_default }}
+            type=raw,value=sha-${{ github.sha }},enable=${{ matrix.model.is_default }}
+          # Every model publishes under its own slug-suffixed tags (so all
+          # N models coexist in the registry side by side). Only the
+          # registry-default model (config/models.yaml `default:`, i.e.
+          # `matrix.model.is_default`) ALSO claims the unsuffixed
+          # `latest`/version/sha tags — those are the "if you don't know or
+          # care which embedding model you want, here's the one the
+          # project recommends" pointer, and exactly one model may own it
+          # at a time or `latest` would be ambiguous.
+
+      - name: Create multi-arch manifest list from the per-arch digests
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # `docker buildx imagetools create`, not `docker manifest
+          # create`: imagetools understands (and re-attaches) each
+          # per-arch image's buildkit provenance/SBOM attestation
+          # manifests when it assembles the merged index, whereas the
+          # older `docker manifest` CLI only merges plain image manifests
+          # and would silently drop that attestation data.
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Verify the merged manifest list is well-formed
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ matrix.model.slug }}

@@ -1,0 +1,3186 @@
+diff --git a/.env.example b/.env.example
+index f0a0ed9..23eeba7 100644
+--- a/.env.example
++++ b/.env.example
+@@ -60,19 +60,21 @@ MCP_TOKEN=REPLACE_ME_WITH_A_GENERATED_TOKEN
+ # them from config/models.yaml (the single source of truth). You normally do NOT
+ # edit them by hand — run `make configure` to switch models, then `make reindex`.
+ #
+-# KNOWN ISSUE (see README.md "Known issue" and docs/runbook.md "Switch the
+-# embedding model"): docker-compose.yml's own EMBEDDING_MODEL_NAME/EMBEDDING_DIM
+-# env-var defaults have NOT been updated to match config/models.yaml's registry
+-# default (BAAI/bge-small-en-v1.5, 384-dim) — they still say mxbai/1024. The
+-# ingestion/mcp-server services' DEFAULT_MODEL_NAME/DEFAULT_EMBEDDING_DIM
+-# fallback constants, and db/init/01_schema.sql, already agree with the
+-# registry (BAAI/bge-small-en-v1.5, `vector(384)`). Uncommenting these lines
+-# with the values below is the workaround for the one remaining compose-level
+-# leg: it makes EVERY component agree on bge-small/384 even if `.env` were
+-# otherwise missing these vars. Do this BEFORE your first `make up` — db/init/
+-# only runs against an empty Postgres volume, so fixing this after data exists
+-# means `docker compose down -v db` and re-syncing from scratch. EMBEDDING_DIM
+-# MUST always match db/init/01_schema.sql's vector(N).
++# docker-compose.yml's own EMBEDDING_MODEL_NAME/EMBEDDING_DIM env-var defaults
++# (both `build.args` and `environment`, on both services) track
++# config/models.yaml's `default:` row (BAAI/bge-small-en-v1.5, 384-dim), as do
++# the ingestion/mcp-server services' fallback constants and
++# db/init/01_schema.sql's `vector(384)`. Leaving these lines uncommented (as
++# below) makes every component agree on bge-small/384 even if `.env` were
++# otherwise missing these vars; it is not required for a fresh clone, but is
++# harmless and explicit. If you change config/models.yaml's `default:` row,
++# also update docker-compose.yml's matching fallbacks (they are a static
++# compose-level default, not a live read of the yaml file, so they can drift
++# if edited only in one place) and re-run `make configure`. Do any model
++# switch BEFORE your first `make up` — db/init/ only runs against an empty
++# Postgres volume, so fixing this after data exists means `docker compose down
++# -v db` and re-syncing from scratch. EMBEDDING_DIM MUST always match
++# db/init/01_schema.sql's vector(N).
+ EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+ EMBEDDING_DIM=384                  # MUST match db/init/01_schema.sql's vector(N)
+ EMBEDDING_QUERY_PROMPT=Represent this sentence for searching relevant passages:
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 6c0ed9d..3ff0ada 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -4,6 +4,19 @@ on:
+   push:
+     branches: [main]
+   workflow_dispatch:
++    inputs:
++      models:
++        description: >-
++          Comma-separated list of full model names from config/models.yaml
++          (the `model:` value, NOT the `image_slug:`/derived slug) to build
++          images for. Use 'all' (the default) to build every model in the
++          registry. Has no effect on a `push` trigger — GitHub only
++          populates the `inputs` context for workflow_dispatch/workflow_call
++          events, so a plain push always resolves to 'all' regardless of
++          whatever this input was last set to.
++        required: false
++        default: all
++        type: string
+ 
+ concurrency:
+   # Literal `release-` prefix, not `${{ github.workflow }}` — inside a
+@@ -54,30 +67,108 @@ jobs:
+           default_bump: patch
+           initial_version: 0.0.1
+ 
+-  build-and-push:
+-    needs: [verify, bump-version]
++  # Turns config/models.yaml into the build/merge matrices below. Only
++  # depends on `verify`, not `bump-version` — the tag bump and the matrix
++  # computation are independent facts about this run and shouldn't
++  # serialize behind each other; `build` is what actually needs both.
++  #
++  # The model list is generated here, from the registry, on every run —
++  # and MUST stay that way. Hardcoding model names into this workflow would
++  # let `config/models.yaml` (the single source of truth per CLAUDE.md/the
++  # script's own header) silently drift out of sync with the images that
++  # actually get published: add a row to the registry and forget to touch
++  # this file, and the new model quietly never gets an image.
++  prepare:
++    needs: [verify]
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
++    outputs:
++      models: ${{ steps.matrix.outputs.models }}
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v4
++
++      - name: Set up Python 3.12
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++
++      - name: Install PyYAML
++        run: python -m pip install --quiet pyyaml
++
++      - name: Generate per-model build matrix from config/models.yaml
++        id: matrix
++        env:
++          # Empty/null on a `push` trigger (inputs.* is only populated for
++          # workflow_dispatch/workflow_call) — `||` treats that falsy value
++          # as unset and falls back to 'all', so push always builds every
++          # model regardless of this expression's own default.
++          MODELS_INPUT: ${{ inputs.models || 'all' }}
++        run: |
++          # Assign the command substitution to a variable first, rather
++          # than embedding it straight in an `echo "models=$(...)"` — under
++          # bash's default `-e`, a failing command inside `$(...)` does NOT
++          # abort the script when it's just interpolated into another
++          # command's argument (echo itself still "succeeds"), but it DOES
++          # abort when the substitution is the right-hand side of a plain
++          # assignment. That distinction is exactly what makes `--only`
++          # naming an unknown model (exit 2, nothing on stdout) fail this
++          # job before any of the 16 build legs start, instead of quietly
++          # writing an empty `models=` output that `fromJSON()` downstream
++          # would choke on with a much less obvious error.
++          models_json=$(python scripts/models_matrix.py --only "$MODELS_INPUT")
++          echo "models=$models_json" >> "$GITHUB_OUTPUT"
++
++  # One job per (service, model, platform) — 2 services x N registry models
++  # x 2 platforms. Each leg builds and pushes ONLY its own single-arch
++  # image, by digest (no tag), to GHCR; `merge` stitches the per-arch
++  # digests for a given (service, model) into one multi-arch manifest list
++  # afterwards. This is the documented pattern for building multi-platform
++  # images across multiple native runners:
++  # https://docs.docker.com/build/ci/github-actions/multi-platform/
++  build:
++    needs: [verify, bump-version, prepare]
++    runs-on: ${{ matrix.platform.runner }}
+     permissions:
+       contents: read
+       packages: write
+-      id-token: write
+-      attestations: write
++      # No id-token/attestations here: `provenance`/`sbom` below are
++      # buildkit-native attestations embedded directly in the pushed OCI
++      # image index, not GitHub's separate attestation API (that's only
++      # `actions/attest-build-provenance`, which this workflow doesn't
++      # call). Granting id-token/attestations write here would be an
++      # unused, unnecessary privilege.
+     strategy:
+       fail-fast: false
+       matrix:
+         service: [ingestion, mcp-server]
++        model: ${{ fromJSON(needs.prepare.outputs.models) }}
++        platform:
++          # arm64 runs on the free, native `ubuntu-24.04-arm` GitHub-hosted
++          # runner instead of amd64 + QEMU emulation. Before this, the
++          # emulated leg was by far the slowest and flakiest part of a
++          # release: `pip install` (wheels with no manylinux aarch64 build
++          # falling back to source compiles under QEMU) and the FastEmbed
++          # ONNX model pre-download/first-run session init both got
++          # dramatically slower under emulation, and occasionally timed
++          # out outright. Native arm64 hosted runners are free ONLY on
++          # PUBLIC repos (this one, per CLAUDE.md/global_context, is
++          # public) and HARD-FAIL the job on private ones with no
++          # automatic fallback — if this repo is ever made private, this
++          # leg must be repointed at a paid larger arm64 runner, or this
++          # whole platform axis reverted to a single amd64+QEMU leg.
++          - { name: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
++          - { name: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+     steps:
+       - name: Checkout repository
+         uses: actions/checkout@v4
+ 
+       - name: Normalize repository owner to lowercase
+-        id: normalize
+         run: |
+           REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+-          echo "REPO_LOWER=${REPO_LOWER}" >> $GITHUB_ENV
+-
+-      - name: Set up QEMU
+-        uses: docker/setup-qemu-action@v3
++          echo "REPO_LOWER=${REPO_LOWER}" >> "$GITHUB_ENV"
++          echo "IMAGE=ghcr.io/${REPO_LOWER}/self-docs-${{ matrix.service }}" >> "$GITHUB_ENV"
+ 
+       - name: Set up Docker Buildx
+         uses: docker/setup-buildx-action@v3
+@@ -89,29 +180,142 @@ jobs:
+           username: ${{ github.actor }}
+           password: ${{ secrets.GITHUB_TOKEN }}
+ 
+-      - name: Extract Docker metadata
++      - name: Extract Docker labels (tags are decided later, in `merge`)
+         id: meta
+         uses: docker/metadata-action@v5
+         with:
+-          images: ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}
+-          tags: |
+-            type=raw,value=latest
+-            type=raw,value=${{ needs.bump-version.outputs.new_tag }}
+-            type=raw,value=${{ needs.bump-version.outputs.new_version }}
+-            type=sha,format=long
++          images: ${{ env.IMAGE }}
++          labels: |
++            io.self-docs.embedding-model=${{ matrix.model.model }}
++            io.self-docs.embedding-dim=${{ matrix.model.dim }}
+ 
+-      - name: Build and push container image
++      - name: Build and push single-arch image by digest
++        id: build
+         uses: docker/build-push-action@v6
+         with:
+           context: ./${{ matrix.service }}
+           file: ./${{ matrix.service }}/Dockerfile
+-          platforms: linux/amd64,linux/arm64
+-          push: true
+-          tags: ${{ steps.meta.outputs.tags }}
+-          labels: ${{ steps.meta.outputs.labels }}
++          platforms: ${{ matrix.platform.name }}
+           build-args: |
+-            EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
+-          cache-from: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache
+-          cache-to: type=registry,ref=ghcr.io/${{ env.REPO_LOWER }}/self-docs-${{ matrix.service }}:buildcache,mode=max
+-          provenance: true
++            EMBEDDING_MODEL_NAME=${{ matrix.model.model }}
++          labels: ${{ steps.meta.outputs.labels }}
++          # push-by-digest, no tag: this leg publishes an untagged,
++          # digest-addressed single-arch image. `merge` later combines the
++          # amd64 + arm64 digests for this (service, model) into one
++          # tagged, multi-arch manifest list via `docker buildx imagetools
++          # create` — NOT `docker manifest create`, because imagetools
++          # correctly re-attaches each arch's provenance/SBOM attestation
++          # manifests into the merged index; the older `docker manifest`
++          # CLI only knows about plain image manifests and would silently
++          # drop them.
++          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
++          # One cache ref per service+model+arch, not one shared
++          # `:buildcache` tag: two legs racing to push the SAME cache
++          # manifest (e.g. this service's two different models' amd64 legs
++          # both writing to `self-docs-<service>:buildcache`) clobber each
++          # other's layers, since a registry cache ref is a single mutable
++          # tag, not an additive store. Each leg needs its own ref so its
++          # cache stays intact and useful across releases.
++          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.model.slug }}-${{ matrix.platform.arch }}
++          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.model.slug }}-${{ matrix.platform.arch }},mode=max
++          provenance: mode=max
+           sbom: true
++
++      - name: Export digest for the merge job
++        run: |
++          mkdir -p "${{ runner.temp }}/digests"
++          digest="${{ steps.build.outputs.digest }}"
++          touch "${{ runner.temp }}/digests/${digest#sha256:}"
++
++      - name: Upload digest artifact
++        uses: actions/upload-artifact@v4
++        with:
++          # Unique per (service, model, arch) so 16 legs never collide on
++          # an artifact name, and so `merge`'s download pattern below can
++          # select exactly one (service, model)'s pair of digests.
++          name: digests-${{ matrix.service }}-${{ matrix.model.slug }}-${{ matrix.platform.arch }}
++          path: ${{ runner.temp }}/digests/*
++          if-no-files-found: error
++          retention-days: 1
++
++  # One job per (service, model) — collects that pair's amd64 + arm64
++  # digests from `build` and fuses them into a single tagged, multi-arch
++  # manifest list.
++  merge:
++    needs: [bump-version, prepare, build]
++    runs-on: ubuntu-latest
++    permissions:
++      packages: write
++    strategy:
++      fail-fast: false
++      matrix:
++        service: [ingestion, mcp-server]
++        model: ${{ fromJSON(needs.prepare.outputs.models) }}
++    steps:
++      - name: Normalize repository owner to lowercase
++        run: |
++          REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
++          echo "REPO_LOWER=${REPO_LOWER}" >> "$GITHUB_ENV"
++          echo "IMAGE=ghcr.io/${REPO_LOWER}/self-docs-${{ matrix.service }}" >> "$GITHUB_ENV"
++
++      - name: Download this (service, model)'s per-arch digests
++        uses: actions/download-artifact@v4
++        with:
++          path: ${{ runner.temp }}/digests
++          # Anchored on BOTH matrix.service and matrix.model.slug (not just
++          # one), so this can only ever pull in the two digests (amd64,
++          # arm64) belonging to this exact (service, model) pair — never
++          # another service's or another model's digests, even though
++          # every leg's artifact lands in the same workflow run's
++          # artifact namespace.
++          pattern: digests-${{ matrix.service }}-${{ matrix.model.slug }}-*
++          merge-multiple: true
++
++      - name: Set up Docker Buildx
++        uses: docker/setup-buildx-action@v3
++
++      - name: Log in to GitHub Container Registry
++        uses: docker/login-action@v3
++        with:
++          registry: ghcr.io
++          username: ${{ github.actor }}
++          password: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Compute the tag set for this (service, model)
++        id: meta
++        uses: docker/metadata-action@v5
++        with:
++          images: ${{ env.IMAGE }}
++          tags: |
++            type=raw,value=${{ matrix.model.slug }}
++            type=raw,value=${{ needs.bump-version.outputs.new_tag }}-${{ matrix.model.slug }}
++            type=raw,value=${{ needs.bump-version.outputs.new_version }}-${{ matrix.model.slug }}
++            type=raw,value=sha-${{ github.sha }}-${{ matrix.model.slug }}
++            type=raw,value=latest,enable=${{ matrix.model.is_default }}
++            type=raw,value=${{ needs.bump-version.outputs.new_tag }},enable=${{ matrix.model.is_default }}
++            type=raw,value=${{ needs.bump-version.outputs.new_version }},enable=${{ matrix.model.is_default }}
++            type=raw,value=sha-${{ github.sha }},enable=${{ matrix.model.is_default }}
++          # Every model publishes under its own slug-suffixed tags (so all
++          # N models coexist in the registry side by side). Only the
++          # registry-default model (config/models.yaml `default:`, i.e.
++          # `matrix.model.is_default`) ALSO claims the unsuffixed
++          # `latest`/version/sha tags — those are the "if you don't know or
++          # care which embedding model you want, here's the one the
++          # project recommends" pointer, and exactly one model may own it
++          # at a time or `latest` would be ambiguous.
++
++      - name: Create multi-arch manifest list from the per-arch digests
++        working-directory: ${{ runner.temp }}/digests
++        run: |
++          # `docker buildx imagetools create`, not `docker manifest
++          # create`: imagetools understands (and re-attaches) each
++          # per-arch image's buildkit provenance/SBOM attestation
++          # manifests when it assembles the merged index, whereas the
++          # older `docker manifest` CLI only merges plain image manifests
++          # and would silently drop that attestation data.
++          docker buildx imagetools create \
++            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
++            $(printf "${IMAGE}@sha256:%s " *)
++
++      - name: Verify the merged manifest list is well-formed
++        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ matrix.model.slug }}
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index c8a1874..0ff4002 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -54,13 +54,16 @@ jobs:
+ 
+       - name: Configure embedding model (small/fast for CI)
+         run: |
+-          # Use the small 384-dim model in CI so the suite doesn't download the
+-          # 1.2GB production default (mxbai-large) on every run. This also
+-          # exercises `make configure`: it writes EMBEDDING_* into .env (which
+-          # the Makefile exports to the test venvs) and re-renders 01_schema.sql
+-          # to vector(384) so the seeded test vectors match the column width.
+-          # Must run before `make test` — db-test reads 01_schema.sql at
+-          # first boot via docker-entrypoint-initdb.d.
++          # BAAI/bge-small-en-v1.5 (384-dim) is already config/models.yaml's
++          # `default:` row, but CI configures it explicitly here rather than
++          # relying on an unset .env, which keeps the model small and fast
++          # and keeps the rendered schema in lockstep with the seeded test
++          # vectors. This exercises `make configure`: it writes EMBEDDING_*
++          # into .env (which the Makefile exports to the test venvs) and
++          # re-renders 01_schema.sql to vector(384) so the seeded test
++          # vectors match the column width. Must run before `make test` —
++          # db-test reads 01_schema.sql at first boot via
++          # docker-entrypoint-initdb.d.
+           python -m pip install --quiet pyyaml
+           make configure MODEL=BAAI/bge-small-en-v1.5
+ 
+diff --git a/DOCS_UPDATE_PLAN.md b/DOCS_UPDATE_PLAN.md
+new file mode 100644
+index 0000000..1e76e20
+--- /dev/null
++++ b/DOCS_UPDATE_PLAN.md
+@@ -0,0 +1,638 @@
++# Documentation Update Plan — self-docs
++
++> **For the agent executing this plan.** This document is self-contained: it
++> assumes no prior conversation. It is a **documentation-only** work order for
++> the `self-docs` repository at `/Users/adam/code/self-docs` (branch `main`,
++> baseline commit `e43ef54`). Every fact in the "Frozen fact sheet" below was
++> verified against the code at that commit, with file references given so you
++> can re-verify rather than trust.
++>
++> **Scope discipline:** you are updating documentation. You are **not** fixing
++> code, tests, CI, or defaults. Three real code-level defects were found while
++> preparing this plan; they are listed in §7 explicitly so you do **not** fix
++> them.
++
++---
++
++## 1. Objective
++
++Bring the repository's documentation up to date with the feature surface that
++exists in the code today, and correct statements the code has since outrun.
++
++Documents in scope:
++
++| File | Role | Owning work item |
++|---|---|---|
++| `docs/adr/005-document-uploads-as-a-source-type.md` | new ADR | W1 |
++| `docs/runbook.md` | operator source of truth (83 KB) | W2 (additive), W3 (corrections) |
++| `README.md` | project front page | W4 |
++| `docs/client-setup.md` | per-client MCP wiring | W5 |
++| `skills/doc-cli/SKILL.md` | agent-facing CLI protocol | W5 |
++| `AGENTS.md` | binding agent rules (`CLAUDE.md` is a **symlink** to it) | W6 |
++| `design.md` | admin-UI style guide | W6 |
++| `.env.example` | documented configuration surface | W7 |
++
++Explicitly **out of scope**: `IMPLEMENTATION_PLAN.md`. It is a dated,
++point-in-time design record (`Rev 2`, 2026-07-18) with its own review-resolution
++history. Retrofitting current features into it destroys its value as a record.
++This is a deliberate decision, not an oversight — do not "helpfully" update it.
++
++---
++
++## 2. Non-negotiable writing rules
++
++1. **Present tense, current state.** Documentation describes how the system
++   works *now*. It is not a changelog and not a release announcement.
++2. **Banned phrasings** anywhere outside the ADR: "new in", "newly added",
++   "recently", "we added", "we improved", "improvement", "now supports",
++   "this release", and internal task ids in prose (`T7`, `T19_FIX`, `T11`).
++   Write "An upload-type source is populated by…", never "We now support
++   uploading…".
++   - Grep the diff before you finish: `git diff | grep -inE "new in|recently|we (added|improved)|improvement|now supports|T[0-9]+_?[A-Z]*"`
++3. **Two legitimate exceptions**, because they are operational instructions
++   rather than product framing:
++   - Migration sections ("apply `04_upload_sources.sql` to an existing
++     database") — an operator genuinely needs to know a step is required.
++   - `docs/adr/005-*.md` — an ADR's whole job is Context / Decision /
++     Consequences / Alternatives. History belongs there and nowhere else.
++4. **Corrections are made silently in place.** Do not annotate them ("changed
++   from…", "previously this said…"). One exception, following the runbook's own
++   existing convention: where an operator may have built automation against the
++   old behavior, use the runbook's established superseded-guidance callout
++   style. That applies to exactly one change in this plan — the admin form's
++   `name` field becoming required (§3, "Corrections").
++5. **One canonical location per fact.** Limits and constants are documented in
++   depth in the runbook and the ADR. README, `client-setup.md`, and `AGENTS.md`
++   **link** to those; they do not restate the numbers. This is what keeps the
++   docs from drifting apart later.
++6. **Never invent.** No endpoints, flags, env vars, or make targets that are not
++   in the code. If something in this plan disagrees with the code, the **code
++   wins** — note the discrepancy in your final report.
++7. **Follow existing house style** in each file: heading depth, callout syntax
++   (`> [!WARNING]`, `> [!IMPORTANT]`), table shapes, and voice. Read the
++   surrounding sections before writing.
++
++---
++
++## 3. Frozen fact sheet (binding)
++
++Every work item must use these facts and these names, exactly. Verified against
++the code at `e43ef54`.
++
++### 3.1 Schema and data model
++
++- `doc_sources.source_type TEXT NOT NULL DEFAULT 'crawl'` with
++  `CHECK (source_type IN ('crawl','upload'))`.
++  - Defined for fresh installs in `db/init/01_schema.sql.template`.
++  - Added to existing databases by `db/init/04_upload_sources.sql`, which is
++    idempotent (`ADD COLUMN IF NOT EXISTS`, then
++    `DROP CONSTRAINT IF EXISTS` → `ADD CONSTRAINT`).
++  - Applied to a live database with:
++    ```bash
++    set -a; source .env; set +a
++    ./scripts/migrate_uploads.sh          # CONTAINER=<name> to override self-docs-db
++    ```
++  - `db/init/*.sql` only runs against an **empty** Postgres data directory, so
++    on an existing deployment the script above is required; on a fresh volume it
++    runs automatically and re-running it by hand is a harmless no-op.
++- An upload-type source's `base_url` is exactly the sentinel `upload://{name}`,
++  enforced by `SourceConfig._base_url_matches_source_type`
++  (`ingestion/app/config.py`). It is not a network address and is never fetched.
++- Individual uploaded pages are stored under `upload://{name}/{rel_path}`
++  (`store.ingest_uploaded_docs`).
++- **Only a human, through the admin UI, can create an upload-type source.**
++  `propose_doc_source` can never set `source_type='upload'`
++  (`mcp-server/app/retrieval.py`, `ProposedSourceConfig`).
++
++### 3.2 Accepted input and every limit
++
++Sources: `ingestion/app/uploads.py`, `upload_pdf.py`, `upload_zip.py`,
++`main.py`.
++
++| Constraint | Value | Where enforced |
++|---|---|---|
++| Parser-registry formats | `.md`, `.markdown`, `.txt`, `.html`, `.htm`, `.pdf` | `uploads.ALLOWED_SUFFIXES` / `uploads.PARSERS` |
++| Zip bundles | accepted, expanded **ahead of** the registry | `upload_zip.expand_zip`, called from `admin.py` |
++| Request body cap | 50 MiB | `uploads.MAX_UPLOAD_BYTES` via `MaxBodySizeMiddleware` (`main.py`) |
++| Aggregate in-flight cap | env `MAX_BODY_INFLIGHT_BYTES`, default `4 × MAX_UPLOAD_BYTES` (200 MiB) | `main.py` |
++| Zip members | ≤ 500 | `uploads.MAX_ARCHIVE_MEMBERS` |
++| Zip uncompressed total | ≤ 200 MiB | `uploads.MAX_UNCOMPRESSED_BYTES` |
++| Zip per-member expansion ratio | ≤ 100 | `uploads.MAX_EXPANSION_RATIO` |
++| Zip symlink members | rejected | `upload_zip._is_symlink` |
++| Zip-slip / absolute / backslash / `..` paths | rejected | `uploads.normalize_rel_path` |
++| PDF pages | ≤ 2000 | `upload_pdf.MAX_PDF_PAGES` |
++| MCP upload content | ≤ 1 MB | `retrieval.upload_text` |
++| MCP upload title | ≤ 200 chars | `retrieval.upload_text` |
++
++Additional behavior worth documenting:
++
++- Zip limits are checked from archive **metadata**, before any member is
++  decompressed. Nested `.zip` members are skipped, never recursed. A single bad
++  member fails **that member**, not the batch.
++- `.zip` is deliberately **absent** from `uploads.ALLOWED_SUFFIXES` even though
++  zip uploads work — that constant only covers suffixes dispatched through the
++  `PARSERS` registry, and zips are expanded before dispatch. Any format list you
++  write for users must include zip; make sure the two statements do not read as
++  a contradiction.
++- Encrypted and corrupt PDFs are rejected. Image-only/scanned PDFs produce no
++  text and are rejected under `extract.MIN_EXTRACTED_LENGTH`.
++- PDF-derived chunks have an **empty `heading_path`** (a PDF carries no markdown
++  headings) — cosmetically the same case as the existing `pgvector-readme`
++  source. `AGENTS.md` already documents that empty-`heading_path` caveat for
++  README-derived sources; extend it rather than duplicating it.
++- `upload_doc_text` slugifies `title` into the page URL, so **re-uploading the
++  same title replaces that page** instead of duplicating it. Exceeding either
++  cap rejects the whole call with nothing partially processed.
++
++### 3.3 The three write paths
++
++1. **Admin UI.**
++   - Create form (`GET/POST /admin/sources/new`) has a source-type radio:
++     `Crawled URL` (default) / `Uploaded files`. Choosing `Uploaded files`
++     hides `base_url` (it is synthesized as the sentinel) and reveals an
++     **optional** file input. Attaching nothing is supported and expected —
++     "create the source now, upload later".
++   - Edit page of an upload-type source carries a standing upload form →
++     `POST /admin/sources/{id}/upload` (multipart, one or more `files` parts).
++2. **CLI.**
++   ```bash
++   make upload SOURCE=my-docs PATH=./some/docs/dir
++   make upload SOURCE=my-docs PATH=./manual.pdf
++   ```
++   Wraps `scripts/upload_docs.py`, which walks directories recursively, batches
++   at ≤ 20 files / 40 MB per request to stay under the server cap, logs in with
++   `SYNC_TOKEN` via `/admin/login` (session cookie + CSRF, same flow as
++   `scripts/push_sources.py`), resolves `--source NAME` to a numeric id by
++   parsing the rendered `/admin` HTML, and posts each batch. Flags: `--url`,
++   `--token`, `--continue-on-error`.
++3. **MCP tool.** `upload_doc_text(source, title, content)` — writes a page of
++   Markdown/plain text into an **existing** upload-type source, addressed by
++   name. It can never create a source and never writes into a crawl-type
++   source; both are rejected with a clear reason, as is an unknown name.
++
++### 3.4 Ingestion semantics (`store.ingest_uploaded_docs`)
++
++- Parsed markdown goes through the **same** path a crawl uses:
++  `chunker.chunk_markdown` → `embedder.embed_chunks` → `replace_page`, with the
++  same `content_hash` comparison, so unchanged content is skipped without
++  re-embedding.
++- **Raw uploaded bytes are never persisted** — not to disk, not to the database.
++  Only parsed markdown and its chunks are stored. (The ASGI multipart parser may
++  transiently spool a large part to an OS temp file, cleaned up at request end;
++  no application code writes uploaded bytes anywhere.)
++- **Never** deletes pages absent from a batch. A batch is not a complete
++  enumeration of the source's pages, so absence is not evidence of removal.
++  Pages from earlier batches survive untouched.
++- Status via `classify_sync`: nothing indexed → `failed`; some indexed with at
++  least one failure → `partial`; otherwise `ok`.
++- It **does** call `metrics.record_sync_outcome(...)` and update
++  `doc_sources.last_status` / `last_synced` — upload sources therefore appear in
++  `/metrics` exactly like crawl sources. See §3.6 for the alerting consequence.
++- It takes the **same single sync lock** as a crawl. A running sync blocks an
++  upload and vice versa; the operator sees "another sync/upload is already in
++  progress; try again shortly." In production, ingestion runs in a background
++  thread and the operator is redirected with an `upload_started` banner;
++  progress streams into the same `/status` widget crawl syncs use.
++
++### 3.5 Guards
++
++Every crawl entrypoint refuses or skips upload-type sources with an explicit
++message:
++
++| Entrypoint | Behavior for an upload source |
++|---|---|
++| `POST /sync` (targeted) | refused with an explanatory message |
++| `POST /sync` (unscoped sweep) | filtered out before crawling |
++| `store.sync_all` | skipped, logs `sync_all_skipped_upload_source` |
++| Admin per-source **Sync** button | refused: no URL to crawl, use the upload form |
++| Admin **Refresh** (purge + recrawl) | refused: there is no crawl to re-populate it — purge, then re-upload |
++| Scheduler (`due_sources`) | upload rows excluded by the query; never scheduled |
++| Admin **Purge** | **applies** — clears the source's pages/chunks |
++
++### 3.6 Retrieval and observability surface
++
++- `list_doc_sources` (MCP) returns a `source_type` column alongside `source`,
++  `last_synced`, `last_status`, `chunks`.
++- `search_docs` renders an uploaded page's `upload://…` URL as **plain text**,
++  not a link, because the scheme is not `http(s)`.
++- Alerting (`ops/alerts/ingestion.yml`), given §3.4's metrics behavior:
++  - `SourceSyncStale` (48 h without a successful sync) **will fire** for an
++    upload source nobody has uploaded to. That is expected and means "no one has
++    uploaded recently", not "a crawl is broken".
++  - `SourceIndexedNothing` for an upload source means a batch finished having
++    indexed nothing — every document failed to parse or index.
++  - `SoftFailRatioHigh` and `ShellSuspectedRatioHigh` cannot apply: uploads
++    produce no soft failures and no JS-shell detection.
++
++### 3.7 Admin banner convention
++
++`ingestion/app/admin.py` (`_message_level`, `_ALLOWED_MESSAGE_LEVELS`,
++`_level_suffix`, `_SUCCESS_SYNC_STATUSES`):
++
++- Severity is carried **explicitly** by the redirecting route as `?level=`,
++  never inferred from the message text.
++- `?level=` is whitelisted to `warning`. Anything else — absent, mis-cased,
++  attacker-supplied — collapses to the default success styling.
++- Green success styling is reserved for `status='ok'`. `partial` and `failed`
++  both render amber, and an unrecognized future status deliberately falls on the
++  amber side.
++
++### 3.8 Corrections to text that is currently wrong
++
++1. **The admin create form now requires `name`** (`Form(...)` in
++   `create_source_submit`; `required pattern="^[a-z0-9-]+$"` in
++   `templates/admin/form.html`). The runbook currently says you may leave it
++   blank and the server will derive it. Derivation **still applies** to
++   `include_prefixes` and `max_pages` on that form
++   (`source_defaults.apply_creation_defaults`), and `propose_doc_source`
++   remains fully URL-only with `name` derived. This is the one change that gets
++   a superseded-guidance callout (rule 4 in §2) — an operator may have
++   automation posting a blank name.
++2. **Embedding default.** The registry default in `config/models.yaml` is
++   `BAAI/bge-small-en-v1.5` (384-dim), which is also what `.env.example` ships
++   and what `db/init/01_schema.sql` creates (`vector(384)`).
++   `ingestion/app/embedder.py`, `mcp-server/app/retrieval.py`, and
++   `docker-compose.yml` still fall back to `mixedbread-ai/mxbai-embed-large-v1`
++   (1024-dim). **That mismatch is exactly what README's "Known issue" block
++   describes.** Documentation must tell this story **one way**: the default is
++   bge-small/384, and the code-level fallbacks are the known defect. Do not
++   leave a second, contradictory "the default is mxbai (1024-dim)" statement
++   anywhere. The README Known-issue block itself is still accurate — leave it
++   verbatim.
++3. **CI migration coverage.** `.github/workflows/test.yml` and `release.yml`
++   apply `db/init/01_schema.sql` and `02_sources_config.sql` only — not `03` or
++   `04`. The runbook's claim that CI exercises the live-migration path must be
++   narrowed to those two files.
++4. **`doc-cli` default API URL.** The binary defaults to
++   `http://localhost:8000` (`cli/cmd/root.go`, `cli/internal/api/client.go`)
++   while the compose stack publishes ingestion on `127.0.0.1:8080`.
++   `docs/client-setup.md` already tells users to export
++   `SELF_DOCS_API_URL=http://localhost:8080`; `skills/doc-cli/SKILL.md` states
++   the `8000` default with no such note. Make the two agree and state plainly
++   that the variable must be set for the standard stack.
++5. **Admin data ops.** `POST /purge`, `POST /refresh`, `POST /stop` and their
++   `make purge` / `make refresh` / `make stop` targets exist and are only
++   mentioned in the runbook's exposure table — they have no operational
++   documentation. The admin UI's documented "Full CRUD + workflow surface" list
++   also omits them, the upload form, and the upload-source refusals.
++6. **Uploaded content is not re-crawlable.** The runbook's backup, restore, and
++   nuke-and-rebuild sections all rest on "the corpus is fully re-crawlable from
++   upstream". That is **false** for upload-type sources: `docker compose down -v
++   db`, a purge, or restoring an older dump loses uploaded content permanently
++   unless the operator still holds the original files. A `pg_dump` is the only
++   backup of an upload source's content.
++7. **MCP tool count.** Four tools are exposed — `search_docs`,
++   `list_doc_sources`, `propose_doc_source`, `upload_doc_text`
++   (`mcp-server/app/server.py`). `docs/client-setup.md` says two, in the
++   overview and in all three per-client Verify steps.
++8. **Undocumented make targets.** README's Development section omits `upload`,
++   `purge`, `refresh`, `stop`, `reindex`, `test-db-up`, `test-db-down`,
++   `test-db-reset`.
++9. **Missing from README's Architecture.** The optional headless `renderer`
++   compose service and the upload path are absent from the diagram, the prose,
++   and the layer table.
++
++---
++
++## 4. Work items
++
++Ordered for sequential execution. If you parallelize across subagents, respect
++the dependency column — W2 and W3 touch the same file and must not run
++concurrently.
++
++### W1 — New ADR: uploads as a source type
++**File:** `docs/adr/005-document-uploads-as-a-source-type.md` (new; use exactly
++this path — other work items link it)
++**Depends on:** nothing
++
++Read `docs/adr/003-llms-txt-etag-multilang-fts.md` and
++`docs/adr/004-selectable-embedding-models.md` first and match their section
++order, depth, and voice.
++
++Record:
++- **Decision:** uploads modeled as a `source_type` column on `doc_sources`
++  rather than a separate table, so one row, one status, one metrics series, and
++  one retrieval path serve both kinds of source.
++- The `upload://{name}` sentinel `base_url`, and why a non-`http(s)` sentinel
++  was preferred over making `base_url` nullable (every existing NOT NULL
++  constraint, join, and display path keeps working; validation splits cleanly
++  per `source_type`).
++- Parsed-markdown-only persistence: raw bytes never reach disk or the database.
++- Reuse of the crawl chunker/embedder/hash-diff path instead of a parallel
++  pipeline.
++- No stale-page deletion for upload batches, and why (a batch is not an
++  enumeration).
++- Human-only creation; `propose_doc_source` can never mint an upload source.
++- **Consequences** must state explicitly that uploaded content is
++  unrecoverable after a purge or nuke-and-rebuild unless the operator still
++  holds the original files, and that a `pg_dump` is its only backup.
++- **Alternatives rejected:** a separate `uploaded_docs` table; an on-disk or
++  object blob store for raw bytes; a dedicated upload service.
++
++**Acceptance:**
++- File exists at exactly that path, numbered `005`, `Status: Accepted`.
++- Every factual claim traces to `ingestion/app/uploads.py`,
++  `upload_pdf.py`, `upload_zip.py`, `store.ingest_uploaded_docs`,
++  `ingestion/app/config.py`, or `db/init/04_upload_sources.sql`.
++- The unrecoverability consequence is stated explicitly.
++- No other file touched.
++
++---
++
++### W2 — Runbook: add upload coverage (additive only)
++**File:** `docs/runbook.md`
++**Depends on:** nothing
++**Constraint:** **add** sections; do not modify or reflow any existing line.
++W3 owns all in-place edits to this file.
++
++(a) **New top-level `## Upload sources`**, placed after `## Add a new doc
++source` and before `## Admin UI`. Cover, in this order:
++- what an upload-type source is, and how it differs from a crawl source
++  (sentinel `base_url`, no crawl, human-only creation);
++- creating one in the admin UI (source-type radio, `name` required, `base_url`
++  synthesized, files optional at create);
++- all three write paths (§3.3) with copy-pasteable commands;
++- accepted formats (§3.2), including zip, with the registry-vs-zip nuance
++  stated so it does not read as a contradiction;
++- every limit and every rejection reason, as a table;
++- ingestion semantics (§3.4): shared chunker/embedder, hash-diff skip, no
++  stale-page deletion, the shared sync lock, background ingestion and the
++  `/status` widget;
++- the guard matrix (§3.5), including what **Purge** means for an upload source.
++
++(b) **New `### Apply the upload-sources migration`** inside the existing
++`## REQUIRED — apply the doc_sources config migration (read this first)`
++section, covering `db/init/04_upload_sources.sql` and
++`scripts/migrate_uploads.sh`. Match that section's established framing:
++idempotency, fresh-volume vs. live-database behavior, and the
++"is this already applied here?" guidance.
++
++(c) **New troubleshooting entries** under `## Troubleshooting`:
++- upload rejected — a per-limit table mapping the operator-visible error string
++  to the limit that produced it;
++- "another sync/upload is already in progress";
++- an upload source reporting `last_status='failed'` (what to check, given no
++  crawl is involved);
++- uploaded content missing after a purge or nuke-and-rebuild → it is gone;
++  re-upload from the original files.
++
++**Acceptance:**
++- Every new heading is anchor-stable and linkable (`#upload-sources`, etc.) —
++  W3 and W4 link to them.
++- Every command runs as written against the local stack.
++- No existing line modified (`git diff` shows additions only, plus whatever
++  whitespace a clean insertion requires).
++- Constants match §3.2 exactly.
++- No changelog voice; no `T7` / `T19_FIX` in prose.
++
++---
++
++### W3 — Runbook: correct existing sections
++**File:** `docs/runbook.md`
++**Depends on:** **W2** (same file — run after it)
++
++1. `## Add a new doc source`, section **A**: `name` is now required (§3.8.1).
++   Keep the `include_prefixes` / `max_pages` derivation text, and keep section
++   **B**'s URL-only `propose_doc_source` path intact. Use the runbook's existing
++   superseded-guidance callout convention here. Add the source-type selector to
++   the creation steps, linking W2's `## Upload sources`.
++2. `## Admin UI` → **Full CRUD + workflow surface**: add Purge, Refresh
++   (purge + recrawl), Stop (`POST /purge`, `/refresh`, `/stop` and their make
++   targets), the upload form on an upload-type source's edit page, and the
++   explicit refusals for upload sources on Sync/Refresh. Add the banner
++   convention (§3.7).
++3. `## Re-index from scratch (nuke-and-rebuild)`, `## Backup`, `## Restore`:
++   correct the "fully re-crawlable" premise per §3.8.6. State plainly that
++   `down -v`, a purge, or restoring an older dump permanently loses uploaded
++   content, and that a dump is the only backup of an upload source's content.
++4. `## Switch the embedding model`: registry default is
++   `BAAI/bge-small-en-v1.5` (384-dim) — §3.8.2. And in the migration section,
++   narrow the CI claim to `01_schema.sql` + `02_sources_config.sql` (§3.8.3).
++5. `## The scheduler`: upload sources are excluded from `due_sources` and are
++   never scheduled.
++6. `## Alerting — Prometheus rules`: per §3.6, note on each affected alert that
++   upload sources do emit sync metrics — `SourceSyncStale` firing for an upload
++   source means nobody has uploaded recently (expected, not a crawl fault);
++   `SourceIndexedNothing` means a batch indexed nothing; `SoftFailRatioHigh`
++   and `ShellSuspectedRatioHigh` cannot apply.
++
++**Acceptance:**
++- No statement in the file contradicts §3 or W2's new section.
++- Every internal anchor still resolves after edits.
++- The embedding-model text agrees with README's Known issue instead of
++  asserting a second "default".
++- No changelog voice introduced.
++
++---
++
++### W4 — README
++**File:** `README.md`
++**Depends on:** nothing
++
++(a) Lede and `## Why self-docs`: the pipeline indexes crawled sites **and**
++uploaded documents (Markdown/text, HTML, PDF, zip bundles). Fix the embedding
++bullet per §3.8.2 and point at the existing Known issue for the code-level
++fallbacks — do not leave two conflicting "defaults" in one file. Mention the
++optional headless renderer alongside llms.txt / conditional GET.
++
++(b) `## Architecture`: add the `renderer` service and the upload path to the
++ASCII diagram; add source types / uploads to the prose beneath it and to the
++layer table.
++
++(c) `## MCP Tools & REST Endpoints`: add
++`upload_doc_text(source, title, content)` with its caps and its
++existing-upload-source-only constraint. Note that `list_doc_sources` reports
++`source_type` and that `upload://` URLs render as plain text.
++
++(d) `## Managing Sources`: add rows for creating an upload source (admin UI) and
++populating it (edit-page form, `make upload SOURCE=<name> PATH=<file_or_dir>`,
++`upload_doc_text`).
++
++(e) `## Development`: document `make upload`, `purge`, `refresh`, `stop`,
++`reindex`, `test-db-up`, `test-db-down`, `test-db-reset` alongside the existing
++targets.
++
++(f) `## Contents`: add any new heading; link W2's runbook `#upload-sources`
++section and `docs/adr/005-document-uploads-as-a-source-type.md`. Add ADR-005 to
++the Documentation table row if ADRs are itemized there.
++
++Leave the `## Known issue — a fresh install with default .env values is broken`
++block **verbatim** — it is still accurate.
++
++**Acceptance:**
++- Every anchor in `## Contents` resolves.
++- The ASCII diagram stays aligned in a monospace render.
++- No claim contradicts `docs/runbook.md` or §3.
++- README no longer states mxbai as *the default* anywhere outside the Known
++  issue block.
++
++---
++
++### W5 — Client setup and the doc-cli skill
++**Files:** `docs/client-setup.md`, `skills/doc-cli/SKILL.md`
++**Depends on:** nothing
++
++`docs/client-setup.md`:
++- Fix "Two tools are exposed" and **all three** per-client Verify steps (Cursor,
++  Claude Code, Antigravity) to list `search_docs`, `list_doc_sources`,
++  `propose_doc_source`, `upload_doc_text`.
++- Add a short **Uploading documents from an agent** subsection covering
++  `upload_doc_text`'s contract — existing upload-type source only, 1 MB content
++  / 200-char title caps, same-title replaces the page, never creates a source —
++  linking the runbook's `#upload-sources` section rather than restating limits.
++- Add a troubleshooting bullet for a rejection because the target source is not
++  upload-type.
++
++`skills/doc-cli/SKILL.md`:
++- Note that hits from upload-type sources carry `upload://{source}/{path}`
++  URLs, which are identifiers, not fetchable links.
++- Resolve the API-URL discrepancy (§3.8.4): state the built-in default and that
++  `SELF_DOCS_API_URL=http://localhost:8080` is required for the standard compose
++  stack, agreeing with `client-setup.md`.
++- Do **not** change `doc-cli`'s flags or invent subcommands. The real surface is
++  `search`, `get`, `tree`, `skill install`, `skill status`, with global flags
++  `--url`, `--token`, `--json`, `--compact`, `--limit`, `--verbose`.
++
++**Acceptance:**
++- Tool lists match `mcp-server/app/server.py` exactly.
++- API-URL guidance agrees across both files.
++- No fabricated CLI flags or subcommands.
++- No changelog voice.
++
++---
++
++### W6 — Agent rules and the style guide
++**Files:** `AGENTS.md` (**edit this one** — `CLAUDE.md` is a symlink to it),
++`design.md`
++**Depends on:** nothing
++
++`AGENTS.md` — the memory-boundary rules predate uploads and must now cover a
++write path agents actually have. Keep the existing numbered structure and voice;
++do not rewrite unrelated rules; touch the `doc-cli` protocol section only as far
++as accuracy requires. Add/extend so that:
++1. `list_doc_sources`'s `source_type` column is named as how an agent
++   distinguishes a crawl source from an upload source.
++2. `upload_doc_text` is documented as the **only** agent-facing write into the
++   corpus: usable solely against an existing, human-created upload-type source,
++   never able to create one — and **still bound by the Mem0 boundary**.
++   Uploaded content must be static framework/library reference. Decisions, task
++   notes, PR context, and project state stay in Mem0 and must never be
++   uploaded. This tightens rule 2 ("never store project state in the docs
++   index") rather than loosening it.
++3. The citation rule notes that upload-derived hits carry `upload://`
++   identifiers rather than URLs, and that PDF-derived chunks may have an empty
++   `heading_path` (extend the existing `pgvector-readme` caveat) — so cite
++   source name + `heading_path`.
++
++`design.md` — add message/banner states to `## Components`, per §3.7: severity
++is explicit and whitelisted, green success styling is reserved for
++`status='ok'`, and an unrecognized outcome renders amber rather than green.
++
++**Acceptance:**
++- `AGENTS.md` keeps its numbered structure and stays internally consistent — no
++  rule contradicting another.
++- The Mem0-vs-docs boundary is strengthened, not loosened.
++- The `design.md` addition matches actual behavior in `ingestion/app/admin.py`
++  and `templates/admin/base.html`.
++- No changelog voice.
++
++---
++
++### W7 — Document the upload knob in `.env.example`
++**File:** `.env.example`
++**Depends on:** nothing
++
++`.env.example` currently has no upload entries at all. Add a commented block, in
++the file's existing comment style and grouping, for `MAX_BODY_INFLIGHT_BYTES`:
++the aggregate in-flight request-body cap, default `4 × MAX_UPLOAD_BYTES`
++(200 MiB), read in `ingestion/app/main.py`. Explain what raising or lowering it
++does, and that the per-request 50 MiB cap is a code constant, not an env var.
++
++Do **not** add any variable the code does not read, change any existing default,
++or uncomment anything.
++
++**Acceptance:**
++- `grep MAX_BODY_INFLIGHT_BYTES ingestion/app/main.py` confirms the name and
++  default.
++- Copying `.env.example` to `.env` and running `make up` behaves identically to
++  before.
++- Only `.env.example` is touched.
++
++---
++
++## 5. Final verification pass
++
++Run this before reporting done. Report `file:line` for anything that fails.
++
++1. **Fact accuracy.** Every constant, limit, route, env var, make target, tool
++   name, and CLI flag you documented exists as documented. Spot-check against
++   `ingestion/app/uploads.py`, `upload_pdf.py`, `upload_zip.py`, `admin.py`,
++   `main.py`, `store.py`, `mcp-server/app/server.py`, `Makefile`,
++   `db/init/04_upload_sources.sql`, `ops/alerts/ingestion.yml`,
++   `cli/cmd/*.go`.
++2. **No changelog voice.**
++   ```bash
++   git diff | grep -inE "new in|newly|recently|we (added|improved)|improvement|now supports|this release|T[0-9]+_[A-Z]+"
++   ```
++   Hits inside `docs/adr/005-*.md` are acceptable; anywhere else, fix.
++3. **Consistency.** The embedding-default story is told one way across README
++   and runbook. `doc-cli` API-URL guidance agrees between `client-setup.md` and
++   `SKILL.md`. Upload limits agree across runbook, README, `client-setup.md`,
++   and ADR-005. `AGENTS.md` contains no rule contradicting another.
++4. **Links and anchors.** Every relative link and every `#anchor` in the changed
++   files resolves — including README's `## Contents` list and all cross-document
++   links into the new runbook section and ADR-005.
++5. **Omissions.** Walk §3 end to end: is any fact undocumented in the place an
++   operator or an agent would actually look for it?
++
++---
++
++## 6. Ground truth — files to read before writing
++
++| Topic | Read |
++|---|---|
++| Upload parsing, limits, path safety | `ingestion/app/uploads.py` |
++| PDF parsing | `ingestion/app/upload_pdf.py` |
++| Zip expansion and its security checks | `ingestion/app/upload_zip.py` |
++| Admin routes, upload routes, banners, data ops | `ingestion/app/admin.py` |
++| Body-size middleware, `/sync` `/purge` `/refresh` `/stop` `/status`, `/api/v1/*` | `ingestion/app/main.py` |
++| `ingest_uploaded_docs`, `sync_all` guards, `classify_sync` | `ingestion/app/store.py` |
++| `SourceConfig`, `source_type` validation | `ingestion/app/config.py` |
++| Derived creation defaults | `ingestion/app/source_defaults.py` |
++| Sync metrics | `ingestion/app/metrics.py` |
++| MCP tools and their docstrings | `mcp-server/app/server.py` |
++| `list_sources`, `upload_text`, proposal validation | `mcp-server/app/retrieval.py` |
++| Admin form / upload form markup | `ingestion/app/templates/admin/form.html` |
++| Migration SQL and script | `db/init/04_upload_sources.sql`, `scripts/migrate_uploads.sh` |
++| Upload CLI | `scripts/upload_docs.py` |
++| Make targets | `Makefile` |
++| Alert rules | `ops/alerts/ingestion.yml` |
++| Compose services and profiles (`renderer`) | `docker-compose.yml`, `docker-compose.prod.yml` |
++| CLI defaults and subcommands | `cli/cmd/root.go`, `cli/internal/api/client.go` |
++
++---
++
++## 7. Known code-level defects — DO NOT FIX
++
++Found while preparing this plan. They are real, and they are **out of scope**.
++Documentation should describe reality accurately (including warning about these
++where the runbook and README already do), but do not change code, tests, CI, or
++defaults to "resolve" them.
++
++1. **CI never exercises the `03`/`04` migrations.**
++   `.github/workflows/test.yml` and `release.yml` apply `01_schema.sql` and
++   `02_sources_config.sql` only, so `04_upload_sources.sql` and
++   `scripts/migrate_uploads.sh` have no CI coverage on the live-migration path.
++   W3 narrows the runbook's claim; the gap itself stays.
++2. **Embedding-default drift is still open.**
++   `embedder.DEFAULT_MODEL_NAME` / `DEFAULT_EMBEDDING_DIM`,
++   `retrieval.DEFAULT_MODEL_NAME`, and `docker-compose.yml` still name
++   mxbai/1024 against a 384-dim registry default and a `vector(384)` schema. Two
++   registry-drift tests are expected-red because of it
++   (`mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`,
++   `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`).
++   Documentation keeps warning; nothing gets fixed here.
++3. **`doc-cli`'s default `--url` is `http://localhost:8000`** while ingestion
++   publishes `8080`, so the binary's zero-config default cannot work against the
++   standard stack. W5 documents the required `SELF_DOCS_API_URL`; changing the
++   default is a code decision, not a docs one.
+diff --git a/README.md b/README.md
+index b0acec8..2867690 100644
+--- a/README.md
++++ b/README.md
+@@ -23,55 +23,8 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
+ 
+ ---
+ 
+-## Known issue — a fresh install with default `.env` values is broken
+-
+-> [!WARNING]
+-> **If you are doing a first install, read this before `make up`.** This does
+-> **not** affect the existing production deployment (its `doc_chunks.embedding`
+-> column and `.env` are already on `BAAI/bge-small-en-v1.5` / 384-dim), and it
+-> does **not** affect a normal `cp .env.example .env && make up` — it only
+-> affects `docker compose up` run with **no `.env` at all** (or a hand-trimmed
+-> one missing `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`).
+->
+-> `config/models.yaml`'s registry default is `BAAI/bge-small-en-v1.5`
+-> (384-dim), matched by `db/init/01_schema.sql` (`doc_chunks.embedding
+-> vector(384)`) and by `ingestion/app/embedder.py`, `mcp-server/app/retrieval.py`,
+-> and `ingestion/app/chunker.py`'s fallback constants — every code-level
+-> default is aligned. The one place still **not** aligned is
+-> `docker-compose.yml`'s own shell-level env-var fallbacks:
+-> - `EMBEDDING_MODEL_NAME` — `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
+-> - `EMBEDDING_DIM` — `${EMBEDDING_DIM:-1024}`
+->
+-> These only kick in when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in
+-> `.env`. The result, only if you skip `.env.example`: an **empty volume**
+-> creates a `vector(384)` column, then the services embed at 1024-dim —
+-> every `doc_chunks` insert fails at sync time.
+->
+-> **Workaround — always start from `.env.example`:** it already ships with
+-> both lines uncommented at the correct values, so copying it verbatim (the
+-> Quickstart below) avoids this entirely. If you hand-edit `.env`, keep these:
+-> ```bash
+-> EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+-> EMBEDDING_DIM=384
+-> ```
+-> This must happen **before** the first `docker compose up`, because
+-> `db/init/*.sql` only runs against an empty Postgres data directory. If you
+-> already ran `make up` with the broken defaults, tear down the volume and
+-> start over: `docker compose down -v db && make up`.
+->
+-> **Separately:** if you are instead upgrading an **existing** 1024-dim
+-> database, there is no migration provided for the dimension change on this
+-> branch — the `DO` block that used to handle exactly this in
+-> `db/init/03_fix_embedding_dim.sql` was removed (that file now only contains
+-> unrelated `doc_sources` URL/sitemap fixups). Do not attempt to reconfigure an
+-> existing 1024-dim deployment to 384-dim without a manual re-embed plan; see
+-> [Runbook → switch the embedding model](docs/runbook.md#switch-the-embedding-model).
+-
+----
+-
+ ## Contents
+ 
+-- [Known issue — a fresh install with default `.env` values is broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+ - [Why self-docs](#why-self-docs)
+ - [Architecture](#architecture)
+ - [Quickstart — Local Development](#quickstart--local-development)
+@@ -93,9 +46,10 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
+   GPU/torch); documentation never leaves your network. The model is selectable
+   from a registry (`config/models.yaml`) — `make configure` derives the vector
+   dimension and container memory limits from your choice. Default:
+-  `BAAI/bge-small-en-v1.5` (384-dim). *(Note: See the Known issue above —
+-  `docker-compose.yml`'s own env-var fallback can still drift from this if
+-  `.env` is missing).*
++  `BAAI/bge-small-en-v1.5` (384-dim) — compose defaults, both Dockerfiles'
++  build `ARG`s, both services' code-level fallbacks, and the committed
++  `db/init/01_schema.sql` schema all agree on this out of the box, with no
++  `.env` required.
+ - **Hybrid retrieval.** Vector similarity + per-source-language Postgres
+   full-text search over `pgvector`, so exact terms and semantic matches both
+   surface.
+@@ -153,14 +107,6 @@ make up                     # db + ingestion (:8080) + mcp-server (:8081)
+ make sync                   # trigger the initial documentation sync
+ ```
+ 
+-> [!WARNING]
+-> See the [Known issue](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+-> above before running `make up` for the first time — an unmodified
+-> `.env.example` copy currently ships with the correct `EMBEDDING_MODEL_NAME`/
+-> `EMBEDDING_DIM` values already uncommented, but if you hand-edit those lines
+-> or skip copying `.env.example` verbatim, double-check they say
+-> `BAAI/bge-small-en-v1.5` / `384` before your first `make up`.
+-
+ `make configure` is optional: with no `.env` overrides both services already use
+ the registry default. Run it to choose a different model —
+ `make configure MODEL=BAAI/bge-base-en-v1.5` — and it resolves that model's
+diff --git a/config/models.yaml b/config/models.yaml
+index c0217cf..b0a9709 100644
+--- a/config/models.yaml
++++ b/config/models.yaml
+@@ -16,6 +16,14 @@
+ # plain embed(). Leave a prompt empty ("") when the model wants no prefix on
+ # that side. bge/mxbai want an instruction on the QUERY only; e5 wants a prefix
+ # on BOTH sides.
++#
++# image_slug (optional): the GHCR image tag suffix for this model, e.g. the
++# release workflow tags ghcr.io/.../self-docs-ingestion-<image_slug>. Must be
++# unique across rows and a valid Docker tag fragment. Consumed by
++# scripts/models_matrix.py, which generates the CI build matrix from this
++# file so a new row automatically gets its own images. When omitted, the
++# slug is derived from the model name: the basename after the last '/',
++# lowercased, with any character outside [a-z0-9._-] replaced by '-'.
+ 
+ default: BAAI/bge-small-en-v1.5
+ 
+@@ -26,6 +34,7 @@ models:
+     mem_mcp: "2g"
+     query_prompt: "Represent this sentence for searching relevant passages: "
+     passage_prompt: ""
++    image_slug: mxbai-embed-large-v1
+ 
+   intfloat/multilingual-e5-large:
+     dim: 1024
+@@ -33,6 +42,7 @@ models:
+     mem_mcp: "2g"
+     query_prompt: "query: "
+     passage_prompt: "passage: "
++    image_slug: multilingual-e5-large
+ 
+   BAAI/bge-base-en-v1.5:
+     dim: 768
+@@ -40,6 +50,7 @@ models:
+     mem_mcp: "1g"
+     query_prompt: "Represent this sentence for searching relevant passages: "
+     passage_prompt: ""
++    image_slug: bge-base-en-v1.5
+ 
+   BAAI/bge-small-en-v1.5:
+     dim: 384
+@@ -47,3 +58,4 @@ models:
+     mem_mcp: "1g"
+     query_prompt: "Represent this sentence for searching relevant passages: "
+     passage_prompt: ""
++    image_slug: bge-small-en-v1.5
+diff --git a/css-layout-guide.md b/css-layout-guide.md
+new file mode 100644
+index 0000000..a87fbd7
+--- /dev/null
++++ b/css-layout-guide.md
+@@ -0,0 +1,308 @@
++
++--- Guide for css-layout ---
++# CSS Layouts and Responsive Design
++
++1. [1 Fundamentals](#1-fundamentals)
++   1. [Which layout mode to use?](#11-which-layout-mode-to-use)
++   2. [Working principles](#12-working-principles)
++2. [2 Flexbox](#2-flexbox)
++3. [3 Grid and subgrid](#3-grid-and-subgrid)
++   1. [Code example: grid and subgrid](#31-code-example-grid-and-subgrid)
++4. [4 Container queries](#4-container-queries)
++   1. [Code example: fluid typography using container query units](#41-code-example-fluid-typography-using-container-query-units)
++5. [5 Native overlays, anchor positioning, and stacking contexts](#5-native-overlays-anchor-positioning-and-stacking-contexts)
++6. [6 Overflow tracking and layout stability](#6-overflow-tracking-and-layout-stability)
++7. [7 Viewport mechanics and track distribution](#7-viewport-mechanics-and-track-distribution)
++8. [8 Grid lanes (aka masonry)](#8-grid-lanes-aka-masonry)
++
++## 1 Fundamentals
++
++Lean on the browser's layout engine when possible for better performance. Reach for intrinsic sizing, logical properties, and `aspect-ratio` before resorting to hardcoded dimensions or complicated media-queries.
++
++### 1.1 Which layout mode to use?
++
++Walk the decision tree top-to-bottom and stop at the first match. Note that layouts can be nested within each-other and each decision is based on the use-case for that container.
++
++1. **Is it a simple row OR column of items?** Use **flexbox** — 1D, content-first, content distributes along a single axis.
++2. **Does a nested element need to line up with its grandparent grid's tracks?** Use **subgrid** — 2D, relationship-first, inherits parent tracks so grandchildren can align across siblings.
++3. **Is it a complex page or component structure with rows AND columns?** Use **grid** — 2D, layout-first, you define the skeleton and content fills it.
++4. **Is the content a long flow of prose that should split into balanced columns?** Use **multi-column** — 1D flow, newspaper-style.
++5. **Are items of varied heights that need to be packed tightly?** Use **grid** with `grid-auto-flow: dense` today; reach for native masonry (aka "grid lanes") only when it ships in your Baseline target (see [§8](#8-grid-lanes-aka-masonry)).
++6. **Does an element need to float above the page and stay spatially tethered to a trigger, even across DOM boundaries or stacking contexts?** Use **anchor positioning** — `anchor-name` on the trigger, `position-anchor` on the overlay (see [§5](#5-native-overlays-anchor-positioning-and-stacking-contexts)).
++
++### 1.2 Working principles
++
++**Do:**
++
++- Use logical properties (`inline-size`, `block-size`, `margin-inline`, `padding-block`, `inset-inline-start`) for layout dimensions and spacing — see `css` (via `npx -y modern-web-guidance@latest retrieve "css"`) for full coverage.
++- Apply the content-first vs layout-first mental model: flexbox when items dictate flow, grid when you define the skeleton first.
++- Use the `place-*` shorthands (`place-content`, `place-items`, `place-self`) to align across both axes in one declaration.
++- Reach for intrinsic sizing (`min-content`, `max-content`, `fit-content()`) and flexible tracks (`fr`, `minmax()`) before fixed `width`/`height` — fewer media queries, more resilient layouts.
++- Use `aspect-ratio` to reserve space for media and prevent layout shift before assets load.
++
++```css
++.sidebar       { inline-size: max-content; }    /* Size to longest unbreakable token. */
++.main-content  { inline-size: fit-content; }    /* Grow to available space, no further. */
++.media         { aspect-ratio: 16 / 9; inline-size: 100%; block-size: auto; }
++body.centered  { display: grid; place-content: center; min-block-size: 100dvb; }
++```
++
++> For `calc-size()` and constraint-aware intrinsic sizing, see `calculate-with-intrinsic-sizes` (via `npx -y modern-web-guidance@latest retrieve "calculate-with-intrinsic-sizes"`).
++
++## 2 Flexbox
++
++One-dimensional layout — items flow along a single **main** axis with alignment on the **cross** axis. Reach for it for navbars, toolbars, item rows, and any single-row-or-column distribution.
++
++**Do:**
++
++- Establish a context with `display: flex` and set the main axis with `flex-direction` (`row` default).
++- Use `flex-wrap: wrap` whenever overflow is a possibility — `nowrap` without `overflow: auto/hidden` will spill on narrow viewports.
++- Use the `flex` shorthand `<grow> <shrink> <basis>` (e.g., `flex: 1 1 250px`) on items rather than setting `flex-grow`/`flex-shrink`/`flex-basis` individually.
++- Use `gap` (or the `row-gap`/`column-gap` longhand) for spacing between items instead of child margins.
++- Prefix positional alignment with `safe` (e.g., `align-items: safe center`) so focusable content isn't clipped when the container is narrower than its content.
++- Push a single item to the far end of the main axis with `margin-inline-start: auto` (or `margin-block-start: auto`) — that's the standard escape hatch.
++- Override cross-axis alignment per item with `align-self`.
++- Use `align-items` to center all items on the cross axis; use `margin: auto` on a single item to center it on both axes independently; use `align-content` only when the container wraps and has extra space across rows.
++- Set `min-inline-size: 0` (or `min-width: 0`) on flex items that contain long unbreakable content (URLs, code, long strings) — flex items won't shrink below their content size by default, causing overflow.
++
++**Do not:**
++
++- Don't reach for `justify-self` on flex items — it only works on grid, block, and absolutely-positioned layouts. Use auto margins instead.
++- Don't use `order` or `flex-direction: *-reverse` to reorder interactive content. They change visual order only; the DOM order still drives sequential focus, so keyboard tab flow won't match what the user sees.
++- Don't confuse `space-around` (half-gap at the ends) with `space-evenly` (equal gaps before, between, and after).
++- Don't forget the axis flip: when `flex-direction: column`, `justify-content` aligns on the block axis and `align-items` aligns on the inline axis — the opposite of the default.
++- Don't size both the container and its children to fill each other — that's a common source of overflow and surprising results. Give one side a definite size.
++- Don't set both `flex-basis` and `width`/`inline-size` on the same item — `flex-basis` takes precedence in a flex context and `width` is ignored. Use `flex-basis` (or the `flex` shorthand) as the single source of truth for sizing flex items.
++
++```css
++.card-grid        { display: flex; flex-flow: row wrap; gap: 1rem; }
++.card-item        { flex: 1 1 250px; }                  /* grow, shrink, basis */
++.card-item-action { margin-inline-start: auto; }        /* Push to main-axis end. */
++.toolbar          { display: flex; align-items: safe center; }
++```
++
++## 3 Grid and subgrid
++
++Baseline status for Subgrid: Widely available. It's been Baseline since 2023-09-15.
++Supported by: Chrome 117 (Sep 2023), Edge 117 (Sep 2023), Firefox 71 (Dec 2019), and Safari 16 (Sep 2022).
++
++Two-dimensional layout — define rows AND columns explicitly, or let the engine derive them. Subgrid lets a nested grid inherit its parent's tracks so grandchildren align across siblings.
++
++**Choosing grid features:**
++
++- Do you know exactly how many columns you need?
++  - **Yes** — use explicit tracks (`grid-template-columns: 200px 1fr`, `repeat(3, 1fr)`, etc.)
++    - Do different columns need different sizes (sidebar + main, header spanning all)? → use `grid-template-areas` for named, readable regions
++    - Are all columns uniform or positioned purely by line number? → use `repeat(N, ...)` or named lines
++  - **No** (responsive, unknown item count) — use `repeat(auto-fit, minmax(min, 1fr))`
++    - Should items on the last row stretch to fill remaining space? → `auto-fit`
++    - Should empty last-row tracks hold their min size (preserving column ghost slots)? → `auto-fill`
++- Do you need to place an item at a specific location?
++  - **Yes** — use `grid-column: <start> / <end>` or `grid-area: <name>`
++  - **No** (just spanning multiple tracks, flow position doesn't matter) — use `grid-column: span <n>`
++- Do child elements need to inherit the parent grid's track sizes (ragged-edge alignment across siblings)?
++  - **Yes** — use subgrid on the affected axis
++    - Is the number of children per cell variable? → subgrid **one axis only**; use `grid-auto-rows`/`grid-auto-columns` for the other
++    - Is the child count fixed? → subgrid on both axes is fine
++  - **No** — standard grid, no subgrid needed
++
++**Do:**
++
++- Establish a context with `display: grid`.
++- Use `grid-template-areas` for complex page-level layouts — area names are self-documenting and the declaration can be aligned in rows and columns for at-a-glance readability.
++- Use `repeat(auto-fit, minmax(200px, 1fr))` for responsive card grids that stretch filled tracks to fill the row, or `auto-fill` to preserve empty repeated tracks at their min size.
++- Use `fr` for proportional track distribution and `minmax(min, max)` for flexible-but-bounded tracks.
++- Position items with `grid-column: span <n>` to size across tracks, `grid-column: <start> / <end>` to place at specific lines, or `grid-area: <name>` for named regions.
++- Use subgrid (`grid-template-columns: subgrid` or `grid-template-rows: subgrid`) to solve the "ragged edge" problem in card lists — internal elements like titles, metadata, and CTAs line up across siblings.
++- Pair a subgrid declaration with a preceding explicit `grid-template-rows`/`-columns` declaration as a same-cascade fallback for older browsers.
++
++**Do not:**
++
++- Don't expect `auto-fit`/`auto-fill` track size to come from item content — it comes from the `repeat()` size argument.
++- Don't use `grid-auto-flow: dense` on interactive content. It packs items efficiently but reorders them visually, breaking DOM-order keyboard tab flow.
++- Don't apply subgrid to both axes when the child count is variable. Extras land in the last track; use `grid-auto-rows`/`grid-auto-columns` for the implicit axis instead.
++- Don't confuse `justify-items`/`align-items` (aligns item content *within its track*) with `justify-content`/`align-content` (aligns the grid tracks *within the container*). Using the wrong one silently has no effect.
++- Don't use `repeat(auto-fit/auto-fill, ...)` without a definite `inline-size` on the container — inside `display: inline-grid` or an unsized flex item, the container has no width to divide, making track counts unpredictable.
++
++### 3.1 Code example: grid and subgrid
++
++Page shell: `<main class="page-layout">` contains `<header>`, `<aside>`, a `<section class="card-grid">` with `<div class="card">` children, and `<footer>`.
++
++```css
++/* Align grid-template-areas in rows and columns for readability. */
++.page-layout {
++  display: grid;
++  grid-template-columns: repeat(3, 1fr);
++  grid-template-areas:
++    "header  header  header"
++    "sidebar main    main"
++    "footer  footer  footer";
++  gap: 1.5rem;
++}
++
++header  { grid-area: header; }
++aside   { grid-area: sidebar; }
++footer  { grid-area: footer; }
++
++.card-grid {
++  grid-area: main;
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
++  grid-template-rows: auto 1fr; /* title block, body block */
++  gap: 1rem;
++}
++
++.card {
++  grid-row: span 2;
++  display: grid;
++  /* Same-cascade fallback: ignored when subgrid is supported. */
++  grid-template-rows: auto 1fr;
++  grid-template-rows: subgrid;
++}
++```
++
++## 4 Container queries
++
++Baseline status for Container queries: Widely available. It's been Baseline since 2023-02-14.
++Supported by: Chrome 105 (Sep 2022), Edge 105 (Sep 2022), Firefox 110 (Feb 2023), and Safari 16 (Sep 2022).
++
++Query the size (or computed style) of an ancestor container rather than the viewport. Mental model: container queries = component context; media queries = global page layout and user preferences (`prefers-color-scheme`, `prefers-reduced-motion`).
++
++**Do:**
++
++- Establish a containment context with `container-type: inline-size` (width-only queries) or `container-type: size` (both axes) on a wrapper before its descendants can be queried.
++- Name containers with `container-name` (or the `container` shorthand: `container: inline-size card`) when nested contexts could collide.
++- Include container query units in calculating fluid type and spacing: `cqi`/`cqb` (logical inline/block), `cqw`/`cqh` (physical), `cqmin`/`cqmax`.
++- Give the container a definite `block-size` whenever `container-type: size` is used — without one, descendants collapse because size containment forces the container to ignore its content.
++
++**Do not:**
++
++- Don't use `block-size` as a `container-type` value — it isn't valid. Use `size` for both axes.
++- Don't expect children's intrinsic size to influence the container after declaring `container-type`. The container is computed as if it has no children once containment is active.
++- Don't rely on container query units inside descendants of a non-qualifying ancestor; they fall back to the small viewport (`svw`/`svh`).
++
++### 4.1 Code example: fluid typography using container query units
++
++```css
++.card-wrapper {
++  container: inline-size / card; /* shorthand for container-type + container-name */
++}
++
++@container card (inline-size > 400px) {
++  .content {
++    display: flex;
++    gap: 2rem;
++  }
++}
++
++.title {
++  /* Fluid type bound to the container width, not the viewport. */
++  font-size: clamp(1rem, 4cqi, 2rem);
++}
++```
++
++> For component-driven responsive styling patterns, see `size-aware-styling` (via `npx -y modern-web-guidance@latest retrieve "size-aware-styling"`) and `fluid-scaling` (via `npx -y modern-web-guidance@latest retrieve "fluid-scaling"`).
++
++## 5 Native overlays, anchor positioning, and stacking contexts
++
++Baseline status for <dialog>: Widely available. It's been Baseline since 2022-03-14.
++Supported by: Chrome 37 (Aug 2014), Edge 79 (Jan 2020), Firefox 98 (Mar 2022), and Safari 15.4 (Mar 2022).
++Baseline status for Popover: Newly available. It's been Baseline since 2025-01-27.
++Supported by: Chrome 116 (Aug 2023), Edge 116 (Aug 2023), Firefox 125 (Apr 2024), Safari 17 (Sep 2023), and Safari iOS 18.3 (Jan 2025).
++Anchor positioning is not natively supported by any major browser yet.
++
++**When to use each overlay primitive:**
++
++- Use `popover` for transient, non-modal UI (flyouts, toasts, tooltips) — lives in the top layer, no `z-index` management needed.
++- Use `<dialog>` with `.showModal()` for modal interactions that require focus trapping and an inert backdrop.
++- Don't combine `popover` and `.showModal()` on the same element — they're mutually exclusive runtime states.
++
++**Anchor positioning (spatial layout of overlays):**
++
++- Use `position-area` (or `anchor()` on insets) and `anchor-size()` to position and size an overlay relative to its trigger.
++- Use `position-try-fallbacks: flip-block` (or `flip-inline`) to let the browser reposition when the overlay overflows the viewport.
++- Don't mix physical and logical keywords in a single `position-area` value — pick one coordinate system.
++- Feature-detect with `@supports (anchor-name: --x)` and provide an absolute-position fallback.
++
++> For full implementation detail, polyfill strategies, and `popover` value reference, see `declarative-dialog-popover-control` (via `npx -y modern-web-guidance@latest retrieve "declarative-dialog-popover-control"`) and `position-aware-tooltips` (via `npx -y modern-web-guidance@latest retrieve "position-aware-tooltips"`). For anchor positioning applied to menus and tab indicators, see `resilient-context-menus-and-nested-dropdowns` (via `npx -y modern-web-guidance@latest retrieve "resilient-context-menus-and-nested-dropdowns"`) and `anchor-positioning-tab-underline` (via `npx -y modern-web-guidance@latest retrieve "anchor-positioning-tab-underline"`).
++
++## 6 Overflow tracking and layout stability
++
++Baseline status for scrollbar-gutter: Newly available. It's been Baseline since 2024-12-11.
++Supported by: Chrome 94 (Sep 2021), Edge 94 (Sep 2021), Firefox 97 (Feb 2022), and Safari 18.2 (Dec 2024).
++line-clamp is not natively supported by any major browser yet.
++
++Manage layout shifts, scrollbars, and clipping predictably.
++
++**Do:**
++
++- Use `overflow: auto` so scrollbars appear only when content actually overflows.
++- Use `overflow: clip` to clip content **without** establishing a scroll container; opt into spillover with `overflow-clip-margin`.
++- Use `scrollbar-gutter: stable` to reserve space for scrollbars and prevent layout shifts when content grows.
++- Use `overscroll-behavior: contain` (or `none`) on scrollable containers to stop scroll chains from bubbling into the parent or document.
++- Use the `-webkit-line-clamp` + `display: -webkit-box` + `-webkit-box-orient: vertical` triad for multi-line truncation — despite the prefix, this pattern is fully specified and not deprecated. Declare the unprefixed `line-clamp` shorthand alongside it; browsers that don't yet support it ignore the property harmlessly.
++**Do not:**
++
++- Don't use `overflow: scroll` when `auto` will do — `scroll` forces scrollbars even when there's nothing to scroll.
++- Don't reach for `overflow: hidden` when you only want to clip — `hidden` establishes a scroll container that can be programmatically scrolled.
++
++```css
++.scrollable-list {
++  max-block-size: 400px;
++  overflow-y: auto;
++  scrollbar-gutter: stable;       /* Reserve scrollbar space. */
++  overscroll-behavior: contain;   /* No scroll chaining into the page. */
++}
++
++.snippet {
++  display: -webkit-box;
++  -webkit-line-clamp: 3;
++  -webkit-box-orient: vertical;
++  line-clamp: 3;                  /* Ignored where unsupported. */
++  overflow: clip;
++}
++```
++
++> For `overflow: clip` and `overflow-clip-margin` in depth, see `overflow-clipping-control` (via `npx -y modern-web-guidance@latest retrieve "overflow-clipping-control"`). For scrollbar color, sizing, and theming, see `customize-scrollbar-color-and-thickness` (via `npx -y modern-web-guidance@latest retrieve "customize-scrollbar-color-and-thickness"`), `dark-mode` (via `npx -y modern-web-guidance@latest retrieve "dark-mode"`), and `adapt-scrollbar-to-contrast-preferences` (via `npx -y modern-web-guidance@latest retrieve "adapt-scrollbar-to-contrast-preferences"`).
++
++## 7 Viewport mechanics and track distribution
++
++Baseline status for Small, large, and dynamic viewport units: Widely available. It's been Baseline since 2022-12-05.
++Supported by: Chrome 108 (Nov 2022), Edge 108 (Dec 2022), Firefox 101 (May 2022), and Safari 15.4 (Mar 2022).
++
++- Use `dvh`/`dvw` for mobile layout containers that must account for browser UI shifting (URL bar collapse/expand).
++- Don't use `100vw` for full-width layout — it ignores scrollbar width and causes horizontal overflow. Use `100%`, `100dvw`, or `100svw` instead.
++
++> For the full viewport unit reference (`svh`, `lvh`, `dvi`, `dvb`, etc.), see `css` (via `npx -y modern-web-guidance@latest retrieve "css"`).
++
++## 8 Grid lanes (aka masonry)
++
++Masonry is not natively supported by any major browser yet.
++
++The spec is in development. The currently agreed-upon name is "grid lanes" (e.g., `display: grid-lanes`). Firefox ships `grid-template-rows: masonry` behind a flag; no other engines ship it in stable as of this writing.
++
++**Do:**
++
++- Use grid with `grid-auto-flow: dense` for tight packing today, accepting that DOM order may not match visual order.
++- Use multi-column (`columns: 3; column-gap: 1rem`) for content-heavy masonry-like flow when items are document fragments rather than equal-weight cards.
++- Treat `grid-template-rows: masonry` as a progressive enhancement only — feature-detect with `@supports`.
++
++**Do not:**
++
++- Don't ship `grid-template-rows: masonry` as a hard requirement until your Baseline target catches up.
++
++```css
++.gallery       { columns: 3 200px; column-gap: 1rem; }
++.gallery > *   { break-inside: avoid; margin-block-end: 1rem; }
++
++@supports (grid-template-rows: masonry) {
++  .gallery {
++    display: grid;
++    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
++    grid-template-rows: masonry;
++    gap: 1rem;
++    columns: unset;
++  }
++}
++```
++
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 009fd7a..490cfce 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -36,7 +36,11 @@ services:
+     build:
+       context: ./ingestion
+       args:
+-        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
++        # This default tracks config/models.yaml's `default:` row — change it
++        # THERE, not here, and re-run `make configure`. Build-arg and runtime
++        # env (below) must agree, or the baked-in embedding dimension will
++        # mismatch the `vector(N)` column in db/init/01_schema.sql.
++        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
+     container_name: self-docs-ingestion
+     restart: unless-stopped
+     profiles:
+@@ -65,16 +69,19 @@ services:
+       OMP_NUM_THREADS: 1
+       ORT_NUM_THREADS: 4
+       # Embedding model config — resolved by `make configure` into .env from
+-      # config/models.yaml. The `:-mixedbread-ai/mxbai-embed-large-v1`
+-      # fallback below is a hardcoded compose-level default so `make up`
+-      # works even if .env was never written by `make configure` — it does
+-      # NOT track config/models.yaml's `default:` row and can drift from it
+-      # (e.g. config/models.yaml currently marks `BAAI/bge-small-en-v1.5` as
+-      # `default: true`, not mxbai). Always run `make configure` (or set
+-      # EMBEDDING_MODEL_NAME/EMBEDDING_DIM in .env yourself) rather than
+-      # relying on this fallback to reflect the registry's current default.
+-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+-      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
++      # config/models.yaml. The `:-BAAI/bge-small-en-v1.5` / `:-384` fallbacks
++      # below are hardcoded compose-level defaults so `make up` works even if
++      # .env was never written by `make configure`. EMBEDDING_DIM MUST track
++      # the SAME config/models.yaml row as EMBEDDING_MODEL_NAME (currently
++      # the `default:` row, BAAI/bge-small-en-v1.5 → dim: 384) — change both
++      # THERE, not here, and re-run `make configure` (or set
++      # EMBEDDING_MODEL_NAME/EMBEDDING_DIM in .env yourself). These values
++      # must also agree with the build.args default above and with the
++      # runtime EMBEDDING_MODEL_NAME on mcp-server, or the embedding
++      # dimension will mismatch the `vector(N)` column in
++      # db/init/01_schema.sql.
++      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
++      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+       EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT:-}"
+       # T7 (headless-render retry): only ever used for a source that has
+       # explicitly set `js_render: true` AND whose crawl this run flagged a
+@@ -101,8 +108,16 @@ services:
+     deploy:
+       resources:
+         limits:
+-          # Sized per embedding model by `make configure` (config/models.yaml);
+-          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
++          # `make configure` writes the selected model's `mem_ingestion` row
++          # from config/models.yaml into .env as INGESTION_MEM_LIMIT — that
++          # resolved value is what normally applies. This ${INGESTION_MEM_LIMIT:-2g}
++          # is only the fallback used when .env hasn't set it. It deliberately
++          # over-provisions the default bge-small-en-v1.5 row
++          # (mem_ingestion: "1500m") for headroom, but is NOT enough for the
++          # heaviest rows — mixedbread-ai/mxbai-embed-large-v1 and
++          # intfloat/multilingual-e5-large both ask for mem_ingestion: "3g" —
++          # so running `make configure` is required, not optional, when
++          # switching to one of those.
+           memory: ${INGESTION_MEM_LIMIT:-2g}
+     healthcheck:
+       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+@@ -183,7 +198,11 @@ services:
+     build:
+       context: ./mcp-server
+       args:
+-        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
++        # This default tracks config/models.yaml's `default:` row — change it
++        # THERE, not here, and re-run `make configure`. Build-arg and runtime
++        # env (below) must agree, or the baked-in embedding dimension will
++        # mismatch the `vector(N)` column in db/init/01_schema.sql.
++        EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
+     container_name: self-docs-mcp-server
+     restart: unless-stopped
+     profiles:
+@@ -203,12 +222,15 @@ services:
+       ORT_NUM_THREADS: 4
+       # Must match the ingestion service's model for vectors to be comparable;
+       # `make configure` keeps both in sync via .env. The
+-      # `:-mixedbread-ai/mxbai-embed-large-v1` fallback below is a hardcoded
+-      # compose-level default, not a live read of config/models.yaml's
+-      # `default:` row, so it can drift from the registry's current default
+-      # (see the same note on the ingestion service above) — run `make
+-      # configure` rather than relying on it.
+-      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}
++      # `:-BAAI/bge-small-en-v1.5` fallback below is a hardcoded compose-level
++      # default, not a live read of config/models.yaml — it tracks that
++      # file's `default:` row as of this writing (see the same note on the
++      # ingestion service above); change the default THERE, not here, and
++      # re-run `make configure` rather than relying on this fallback. It must
++      # also agree with the build.args default above, or the baked-in
++      # embedding dimension will mismatch the `vector(N)` column in
++      # db/init/01_schema.sql.
++      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}
+       EMBEDDING_QUERY_PROMPT: "${EMBEDDING_QUERY_PROMPT:-Represent this sentence for searching relevant passages: }"
+     ports:
+       - "127.0.0.1:${DOCS_MCP_HOST_PORT:-8081}:8000"
+@@ -217,8 +239,16 @@ services:
+     deploy:
+       resources:
+         limits:
+-          # Sized per embedding model by `make configure` (config/models.yaml);
+-          # default fits the 1024-dim mxbai-large ONNX weights + headroom.
++          # `make configure` writes the selected model's `mem_mcp` row from
++          # config/models.yaml into .env as MCP_MEM_LIMIT — that resolved
++          # value is what normally applies. This ${MCP_MEM_LIMIT:-2g} is only
++          # the fallback used when .env hasn't set it. It deliberately
++          # over-provisions the default bge-small-en-v1.5 row (mem_mcp: "1g")
++          # for headroom, but only just matches the heaviest rows —
++          # mixedbread-ai/mxbai-embed-large-v1 and
++          # intfloat/multilingual-e5-large both ask for mem_mcp: "2g", with no
++          # spare headroom left — so running `make configure` is required,
++          # not optional, when switching to one of those.
+           memory: ${MCP_MEM_LIMIT:-2g}
+     healthcheck:
+       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=3)"]
+diff --git a/docs/adr/006-per-model-multi-arch-image-matrix.md b/docs/adr/006-per-model-multi-arch-image-matrix.md
+new file mode 100644
+index 0000000..1809035
+--- /dev/null
++++ b/docs/adr/006-per-model-multi-arch-image-matrix.md
+@@ -0,0 +1,158 @@
++# ADR-006: Per-Model, Multi-Arch Image Matrix
++
++**Status:** Accepted
++**Date:** 2026-07-28
++**Decision makers:** Project owner + architect
++
++## Context
++
++[ADR-004](004-selectable-embedding-models.md) made the embedding model
++registry-selectable (`config/models.yaml`), but the model is still **baked
++into each container image at build time** (`ARG EMBEDDING_MODEL_NAME`, both
++Dockerfiles) — FastEmbed downloads and caches the ONNX weights during
++`docker build`, not at container start. One image therefore cannot serve more
++than one model; the release pipeline needed to decide how to publish four
++(and growing) model variants per service without turning that into a
++hand-maintained list.
++
++Three problems converged on this decision:
++
++1. **`:latest` was previously baked with a 1024-dim model**
++   (`mixedbread-ai/mxbai-embed-large-v1`, per ADR-004's original default)
++   while the *committed* schema (`db/init/01_schema.sql`, `vector(384)`) and
++   both services' code-level fallbacks had already reverted to
++   `BAAI/bge-small-en-v1.5`/384-dim (see ADR-004's status update). Anyone
++   pulling `:latest` onto a fresh volume got a dimension mismatch on the
++   first insert — the exact bug documented and fixed in
++   `docs/runbook.md`/`README.md` alongside this change. A tagging scheme
++   that ties `:latest` to *whichever* model is the registry default, computed
++   from the same source of truth the schema/services read, closes this
++   permanently rather than requiring a human to remember to keep them in
++   sync.
++2. **The `arm64` leg ran under QEMU emulation and was the slowest, flakiest
++   part of a release.** `pip install` (no manylinux aarch64 wheel for some
++   dependencies, falling back to a source compile under emulation) and the
++   FastEmbed ONNX model pre-download/first-run session init both got
++   dramatically slower under emulation, occasionally timing out outright.
++3. **A single shared `:buildcache` tag cannot serve multiple model
++   variants.** Two legs building different models for the same service and
++   racing to push to one shared cache tag would clobber each other's layers,
++   since a registry cache ref is a single mutable tag, not an additive
++   content-addressed store.
++
++## Decision
++
++- **Encode the model in the image *tag*, not the image name.** Two GHCR
++  packages continue to exist (`self-docs-ingestion`, `self-docs-mcp-server`);
++  every model gets its own slug-suffixed row of tags
++  (`<slug>`, `vX.Y.Z-<slug>`, `X.Y.Z-<slug>`, `sha-<sha>-<slug>`) inside the
++  same package, and only the registry-default model additionally claims the
++  unsuffixed `latest`/`vX.Y.Z`/`X.Y.Z`/`sha-<sha>` tags.
++- **Generate the build/merge matrix from `config/models.yaml`**
++  (`scripts/models_matrix.py`, consumed by the `prepare` job in
++  `.github/workflows/release.yml`), so the workflow itself never hardcodes a
++  model name or slug. `tests/test_models_matrix.py` locks this down,
++  including a guard that `release.yml` contains no hardcoded model literal.
++  Adding a row to the registry (with a unique `image_slug:`) is enough to get
++  that model its own images on the next release — no workflow edit required.
++- **Native `ubuntu-24.04-arm` runners instead of QEMU** for the arm64 leg of
++  every `(service, model)` pair, alongside `ubuntu-24.04` for amd64 — two
++  single-arch, native-architecture build legs per `(service, model)` instead
++  of one emulated multi-platform build.
++- **Push-by-digest, then `docker buildx imagetools create` to merge.** Each
++  `build` leg pushes its single-arch image untagged, addressed only by
++  digest; a separate `merge` job downloads the two digests for a given
++  `(service, model)` and fuses them into one tagged multi-arch manifest list.
++  `imagetools create` is used instead of the older `docker manifest create`
++  because it understands and re-attaches each per-arch image's
++  provenance/SBOM attestation manifests when assembling the merged index;
++  `docker manifest` only merges plain image manifests and would silently drop
++  that attestation data.
++- **One registry cache ref per service+model+arch**
++  (`buildcache-<slug>-<arch>`), not one shared `:buildcache` tag, so
++  concurrent legs building different models never clobber each other's
++  cached layers.
++
++## Consequences
++
++- **16 build legs + 8 merge legs per release** (2 services × 4 models × 2
++  platforms, then 2 services × 4 models). This scales linearly with the
++  registry: a fifth model adds 4 build legs and 2 merge legs automatically,
++  with no workflow change.
++- **16 `buildcache-*` package versions** appear in GHCR (one per
++  service+model+arch) alongside the release tags — these are build cache,
++  not release artifacts, and are called out as such in `docs/runbook.md` so
++  nobody mistakes them for something to `docker pull` and run.
++- **`multilingual-e5-large` variants are the heaviest** — its ONNX weights
++  are ~2 GB, the largest of the four registry rows, so those four build legs
++  (2 services × 2 platforms) take the longest and produce the largest pushed
++  layers.
++- **Layers dedupe across variants.** The base image, Python/OS dependencies,
++  and application code layers are identical regardless of which model is
++  baked in — only the final ONNX-weights layer differs — so GHCR storage
++  growth across 8 image variants (2 services × 4 models) is far less than a
++  naive 8× multiple of a single variant's size.
++- **Native arm64 runners are free on public GitHub repos and hard-fail the
++  job with no automatic fallback on private ones.** This repo is public (per
++  `CLAUDE.md`/the global project context) specifically so this holds. If the
++  repo is ever made private, the arm64 build leg must be repointed at a paid
++  larger arm64 runner, or the whole platform axis reverted to a single
++  amd64+QEMU leg — this is a real constraint on any future decision to go
++  private, not a hypothetical.
++- **Adding a model to the registry now automatically produces images.** A new
++  `config/models.yaml` row (with `dim`, `mem_ingestion`, `mem_mcp`, prompts,
++  and a unique `image_slug:`) is picked up by `scripts/models_matrix.py` on
++  the very next release run; nothing in `.github/workflows/release.yml`
++  needs to change.
++
++## Alternatives considered
++
++1. **Add the model axis to the existing single QEMU job.** Simplest possible
++   change — extend the one existing build job's matrix with a `model`
++   dimension and keep amd64+QEMU for arm64. Rejected: this multiplies the
++   already-slowest, flakiest step in the pipeline by the number of models
++   instead of fixing it, turning an occasional timeout into a per-release
++   near-certainty across four models.
++2. **Docker's `docker/github-builder` reusable workflow with
++   `distribute: true`.** This first-party reusable workflow already
++   implements the per-platform build / push-by-digest / finalize-into-a-
++   manifest-list pattern this ADR hand-rolls. Rejected for now to keep
++   control over per-`(service, model, arch)` cache refs and the conditional
++   `latest` tag (only the registry-default model gets it) — both of which
++   would need to be threaded through or worked around if delegated to an
++   external reusable workflow. Noted as the fallback if the hand-rolled
++   `build`/`merge` split in `release.yml` proves too fragile to maintain.
++3. **One GHCR package per model**
++   (`self-docs-ingestion-bge-small-en-v1.5`, `self-docs-ingestion-mxbai-embed-large-v1`,
++   …). Rejected: 8 packages (2 services × 4 models) to browse, secure, and
++   retain instead of 2, and `latest` loses its meaning entirely — there would
++   be no single package where "the recommended default" and "every supported
++   variant" coexist.
++
++## Open risk
++
++`provenance: mode=max` + `sbom: true` (set on every `build` leg) surviving
++the push-by-digest → `docker buildx imagetools create` merge is **documented
++upstream behavior, but has not yet been observed on a real run of this
++repo's `release.yml`.** The first real release under this workflow must be
++verified with:
++
++```bash
++docker buildx imagetools inspect --raw ghcr.io/<owner>/self-docs-ingestion:<slug> \
++  | jq '.manifests[] | {mediaType, platform}'
++```
++
++confirming the merged index lists **two platform image manifests** (amd64,
++arm64) **plus their attestation manifests** (provenance + SBOM), not just the
++two platform manifests alone. If attestations do not survive the merge, the
++fallback is either dropping to plain `provenance: true` (no SBOM, less
++metadata but simpler to reason about across the merge) or a separate
++post-merge attestation-attach step.
++
++## Related
++
++- [ADR-004](004-selectable-embedding-models.md) — introduced the model
++  registry this ADR's build matrix is generated from
++- [Runbook → Pre-built Container Images (GHCR)](../runbook.md#pre-built-container-images-ghcr)
++- `.github/workflows/release.yml`, `scripts/models_matrix.py`,
++  `tests/test_models_matrix.py`
+diff --git a/docs/runbook.md b/docs/runbook.md
+index 15ebe88..35f82ef 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -5,72 +5,43 @@ in the repo root with a populated `.env` (see `.env.example`).
+ 
+ ---
+ 
+-## KNOWN ISSUE — a fresh install with default `.env` values is broken (read this first)
+-
+-**Affects new deployments only, and only when `.env` is missing or
+-incomplete.** If you are standing up a **fresh** instance (empty Postgres
+-volume) via `docker compose up`/`make up` without a populated `.env`, sync
+-will fail on every insert. **The existing production deployment is
+-unaffected** — its `doc_chunks.embedding` column is already `vector(384)` and
+-its `.env` already sets `EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` /
+-`EMBEDDING_DIM=384`; verified live.
+-
+-`config/models.yaml` (the model registry, single source of truth) defaults to
+-`BAAI/bge-small-en-v1.5` (384-dim), `db/init/01_schema.sql` creates
+-`doc_chunks.embedding vector(384)` to match, and `ingestion/app/embedder.py`,
++## Embedding model defaults on a fresh install (fixed; historical bug below)
++
++**Every layer that decides the embedding model/dimension for a brand-new
++deployment now agrees, even with no `.env` file at all.** `config/models.yaml`
++(the model registry, single source of truth) defaults to
++`BAAI/bge-small-en-v1.5` (384-dim); `db/init/01_schema.sql` creates
++`doc_chunks.embedding vector(384)` to match; `ingestion/app/embedder.py`,
+ `mcp-server/app/retrieval.py`, and `ingestion/app/chunker.py`'s `DEFAULT_*`/
+ `TOKENIZER_MODEL_ID` fallback constants all default to the same
+-`BAAI/bge-small-en-v1.5` / 384-dim — every code-level fallback is aligned
+-with the registry.
+-
+-**One place was intentionally left unaligned: `docker-compose.yml`'s own
+-shell-level env-var defaults**, which still fall back to the old
+-`mixedbread-ai/mxbai-embed-large-v1` (1024-dim):
+-
+-- `EMBEDDING_MODEL_NAME` build arg/env default —
+-  `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
+-- `EMBEDDING_DIM` env default — `${EMBEDDING_DIM:-1024}`
+-
+-These only take effect when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset —
+-i.e. there is no `.env` file at all, or it exists but doesn't set them. A
+-normal `cp .env.example .env && make up` is **not** affected: `.env.example`
+-ships with both lines already uncommented at the correct values (see below),
+-so copying it verbatim means Compose never falls back to the stale
+-`docker-compose.yml` defaults. Net effect: only `docker compose up` run with
+-**no `.env` at all** (or a hand-trimmed one missing these two vars) against an
+-**empty volume** creates a `vector(384)` column via `db/init/01_schema.sql`
+-and then embeds at 1024-dim — every `doc_chunks` insert fails at sync time.
+-
+-**Workaround — always start from `.env.example`, and set this in `.env`
+-before your first `make up` if you skip it:**
+-
+-```bash
+-EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+-EMBEDDING_DIM=384
+-```
+-
+-**This must be done before the first `docker compose up`**: `db/init/*.sql`
+-scripts run only against an empty Postgres data directory (see "REQUIRED"
+-section immediately below for the general rule). If you already brought the
+-stack up with the broken defaults, you must tear down the data volume and
+-re-init:
+-
+-```bash
+-docker compose down -v db && docker compose up -d db   # re-runs db/init/*.sql
+-make up
+-make sync
+-```
+-
+-**Separately — existing 1024-dim databases have no migration path on this
+-branch.** The `DO` block that used to handle exactly this embedding-dimension
+-change was **deleted** from `db/init/03_fix_embedding_dim.sql` (that file now
+-contains only unrelated `doc_sources` base_url/sitemap/include_prefixes
+-fixups for specific sources, e.g. `anthropic-api`, `openai-api`). If you are
+-reconfiguring an **existing** 1024-dim deployment down to 384-dim, do **not**
+-assume `03_fix_embedding_dim.sql` will handle the column width — it will not.
+-Follow the general [Switch the embedding model](#switch-the-embedding-model)
+-procedure below (which does cover a dimension change, via nuke-and-rebuild or
+-`make reindex`).
++`BAAI/bge-small-en-v1.5` / 384-dim; and `docker-compose.yml`'s own build-arg/
++env-var fallbacks (`${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}`,
++`${EMBEDDING_DIM:-384}`, on both services and both build stages) resolve to
++the same model/dimension too. A `docker compose up`/`make up` against a fresh
++Postgres volume with no `.env` at all no longer breaks on the first
++`doc_chunks` insert.
++
++**Historical bug, now fixed:** `docker-compose.yml`'s fallbacks used to
++resolve to the *old* default, `mixedbread-ai/mxbai-embed-large-v1` (1024-dim),
++while the committed schema and both services' code-level fallbacks had
++already moved to 384-dim. A fresh install with no `.env` at all (or a
++hand-trimmed one missing `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`) created a
++`vector(384)` column and then embedded at 1024-dim — every `doc_chunks`
++insert failed at sync time. Fixed by aligning the compose-level fallbacks to
++the registry default alongside every other layer. A normal
++`cp .env.example .env && make up` was never affected — `.env.example` has
++always shipped with both lines uncommented at the correct values.
++
++**Still true, independent of the fix above: there is no automated migration
++for a vector-dimension change.** The `DO` block that used to handle a
++384-dim/1024-dim column-width change was **deleted** from
++`db/init/03_fix_embedding_dim.sql` (that file now contains only unrelated
++`doc_sources` `base_url`/`sitemap`/`include_prefixes` fixups for specific
++sources, e.g. `anthropic-api`, `openai-api`). Reconfiguring an **existing**
++deployment to a model with a different `dim` (either direction) requires the
++[Switch the embedding model](#switch-the-embedding-model) procedure below
++(nuke-and-rebuild or `make reindex`, depending on whether the column width
++actually changed) — do not assume `03_fix_embedding_dim.sql` handles it.
+ 
+ ---
+ 
+@@ -176,26 +147,104 @@ when:
+ 
+ ## Pre-built Container Images (GHCR)
+ 
+-Pre-built, multi-architecture container images (`linux/amd64` and `linux/arm64`) for both services are automatically published to GitHub Container Registry (GHCR) via CI (`.github/workflows/release.yml`) on every release tag (`v*.*.*`) and update to `main`.
++Every push to `main` runs `.github/workflows/release.yml`, which builds and
++publishes one multi-architecture (`linux/amd64` + `linux/arm64`) image **per
++embedding model** for both services (`self-docs-ingestion`,
++`self-docs-mcp-server`) — 2 services × N registry models = 2N release images
++per run. The embedding model is baked into the image at build time (`ARG
++EMBEDDING_MODEL_NAME`), so a single image cannot serve more than one model;
++the model is instead encoded in the **image tag**. Each `(service, model)`
++pair is built as two native single-arch legs (`ubuntu-24.04` for amd64,
++`ubuntu-24.04-arm` for arm64 — no QEMU), pushed by digest, then stitched into
++one tagged multi-arch manifest list with `docker buildx imagetools create`.
++See [ADR-006](adr/006-per-model-multi-arch-image-matrix.md) for why.
++
++**Tag scheme** (`X.Y.Z` = the release version bumped by `bump-version`,
++`<sha>` = the full commit SHA, `<slug>` = the model's `image_slug`):
++
++| Tag | Who gets it |
++| --- | --- |
++| `<slug>` | every model |
++| `vX.Y.Z-<slug>` | every model |
++| `X.Y.Z-<slug>` | every model |
++| `sha-<sha>-<slug>` | every model |
++| `latest` | **only** the registry-default model |
++| `vX.Y.Z` | **only** the registry-default model |
++| `X.Y.Z` | **only** the registry-default model |
++| `sha-<sha>` | **only** the registry-default model |
++
++Exactly one model owns the unsuffixed `latest`/`vX.Y.Z`/`X.Y.Z`/`sha-<sha>`
++tags at a time: `config/models.yaml`'s `default:` row. Every other model
++publishes only its slug-suffixed rows, side by side in the same GHCR package.
++
++**Current slugs** (from each row's `image_slug:` in `config/models.yaml` —
++this list is generated by `scripts/models_matrix.py` on every release run,
++**not maintained by hand in this doc**; re-check `config/models.yaml` before
++trusting this list):
++
++| `image_slug` | Model | `dim` | Registry default? |
++| --- | --- | --- | --- |
++| `bge-small-en-v1.5` | `BAAI/bge-small-en-v1.5` | 384 | yes — owns `latest` |
++| `mxbai-embed-large-v1` | `mixedbread-ai/mxbai-embed-large-v1` | 1024 | no |
++| `multilingual-e5-large` | `intfloat/multilingual-e5-large` | 1024 | no |
++| `bge-base-en-v1.5` | `BAAI/bge-base-en-v1.5` | 768 | no |
+ 
+-**Package URLs (`<owner>` must be lowercase):**
+-- `ghcr.io/<owner>/self-docs-ingestion:latest` (or specific tag like `:v1.0.0` / `:main`)
+-- `ghcr.io/<owner>/self-docs-mcp-server:latest`
++> [!WARNING]
++> **The image variant you pull MUST match your `.env`'s
++> `EMBEDDING_MODEL_NAME` AND `db/init/01_schema.sql`'s `vector(N)`.** These
++> three things — the pulled image's baked-in model, `.env`, and the rendered
++> schema — must all agree, exactly like a from-source build. Pulling
++> `:latest` (`bge-small-en-v1.5`, 384-dim) onto a database initialized for a
++> 1024-dim model (or vice versa) breaks **every** insert and **every** query
++> with a pgvector dimension mismatch — there is no partial-compatibility
++> mode. This is the same failure mode as the fresh-install bug described
++> above, just triggered by a mismatched pulled tag instead of an unset `.env`.
++
++**Recipe — pin a non-default model's pre-built image:**
+ 
+-**Consuming via Docker Compose:**
+-If you prefer pulling pre-built images instead of building locally (`docker compose build`), override `build:` in your compose configuration or add `image:` references:
++```bash
++make configure MODEL=intfloat/multilingual-e5-large   # writes .env + renders the schema
++```
++
++Then, in a compose override (e.g. `docker-compose.override.yml`), pin the
++matching slug-suffixed tag instead of building locally:
+ 
+ ```yaml
+ services:
+   ingestion:
+-    image: ghcr.io/<owner>/self-docs-ingestion:latest
++    image: ghcr.io/<owner>/self-docs-ingestion:multilingual-e5-large
+   mcp-server:
+-    image: ghcr.io/<owner>/self-docs-mcp-server:latest
++    image: ghcr.io/<owner>/self-docs-mcp-server:multilingual-e5-large
++```
++
++(`<owner>` must be lowercase.) If this is a **fresh** volume, `make up` picks
++up the rendered schema on first boot. If you are changing the model on an
++**existing** volume/deployment, the vector width will not match until you
++follow [Re-index from scratch (nuke-and-rebuild)](#re-index-from-scratch-nuke-and-rebuild)
++— do not just swap the `image:` line on a live database.
++
++**Verify what a pulled image actually contains** before trusting it, using
++the `io.self-docs.embedding-model`/`io.self-docs.embedding-dim` labels every
++build leg attaches:
++
++```bash
++docker buildx imagetools inspect ghcr.io/<owner>/self-docs-ingestion:multilingual-e5-large \
++  --format '{{json (index .Image "linux/amd64").Config.Labels}}'
+ ```
+ 
+-*Note: The pre-built GHCR images come pre-baked with the default embedding model (`mixedbread-ai/mxbai-embed-large-v1`). If you switch to a custom model via `make configure MODEL=...`, you must build from source so the new ONNX model weights are downloaded during container build.*
++(swap `linux/amd64` for `linux/arm64` to check the other platform's manifest — both carry the same labels, since they come from the same build matrix row.)
+ 
+-**Authentication (if pulling from private registry):**
++Confirm the printed `io.self-docs.embedding-model`/`io.self-docs.embedding-dim`
++match what `make configure` wrote into `.env` and rendered into
++`db/init/01_schema.sql`'s `vector(N)`.
++
++**`buildcache-*` tags are not release artifacts.** Alongside the tags above,
++GHCR also lists `buildcache-<slug>-amd64` and `buildcache-<slug>-arm64`
++package versions per service — these are `docker buildx`'s registry-cache
++refs (one per service+model+arch, so concurrent legs never clobber each
++other's cache), not something meant to be pulled and run.
++
++**Authentication (if pulling from a private registry):**
+ ```bash
+ echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
+ ```
+@@ -840,16 +889,18 @@ the two services' Docker memory limits. The registry default is
+ fallback constants (`embedder.DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`,
+ `retrieval.DEFAULT_MODEL_NAME`).
+ 
+-> [!WARNING]
+-> `docker-compose.yml`'s own env-var fallbacks are the one place that was
+-> **not** aligned to the registry default — they still fall back to
+-> `mixedbread-ai/mxbai-embed-large-v1` (1024-dim) when
+-> `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in `.env`. See [Known
+-> issue — a fresh install with default `.env` values is
+-> broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+-> at the top of this runbook. Always set `EMBEDDING_MODEL_NAME`/
+-> `EMBEDDING_DIM` explicitly in `.env` (which `.env.example` already does)
+-> rather than relying on unset-env fallbacks.
++> [!NOTE]
++> `docker-compose.yml`'s own build-arg/env-var fallbacks
++> (`${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}`,
++> `${EMBEDDING_DIM:-384}`) now track the registry default too — see
++> [Embedding model defaults on a fresh install](#embedding-model-defaults-on-a-fresh-install-fixed-historical-bug-below)
++> above. They are a **static compose-level default, not a live read of
++> `config/models.yaml`**, so if you ever change the registry's `default:`
++> row, update those compose fallbacks to match (`.env.example`'s "Embedding
++> model" block documents the pairing) or they will silently drift again.
++> Always set `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` explicitly in `.env`
++> (which `.env.example` already does) rather than relying on unset-env
++> fallbacks.
+ 
+ To see the options:
+ 
+@@ -997,11 +1048,17 @@ test invocation — matching the deployed default in `config/models.yaml`, the
+ `DEFAULT_*` fallback constants in `ingestion/app/embedder.py` and
+ `mcp-server/app/retrieval.py`, which now also default to
+ `BAAI/bge-small-en-v1.5`/384-dim. The pinning is now redundant with those
+-fallbacks rather than a workaround for them — kept as explicit belt-and-
+-suspenders insurance against `.env`/`docker-compose.yml` drift (see the
+-[Known issue](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+-above) rather than a mask for a code-level mismatch. Both parity tests now
+-pass by default on an unconfigured checkout:
++fallbacks rather than a workaround for them: `docker-compose.yml`'s own
++build-arg/env-var fallbacks used to be the one place still resolving to the
++old `mixedbread-ai/mxbai-embed-large-v1`/1024-dim default while everything
++else above had already moved to `BAAI/bge-small-en-v1.5`/384-dim, but that
++drift is now closed at the compose/Dockerfile level too (both Dockerfiles'
++`ARG EMBEDDING_MODEL_NAME` default and every `docker-compose.yml`
++`EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` fallback resolve to
++`BAAI/bge-small-en-v1.5`/384-dim). The pin here is kept as explicit
++belt-and-suspenders insurance against future drift, not a mask for a
++code-level mismatch. Both parity tests now pass by default on an
++unconfigured checkout:
+ `mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
+ and `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`.
+ 
+@@ -1052,6 +1109,51 @@ therefore on the order of 20–40 minutes.
+ 
+ ---
+ 
++## URL canonicalization (locale / tracking query parameters)
++
++`include_prefixes`/`exclude_prefixes` only ever match a URL's **path**, so
++no source config can express "don't crawl the translated copies of every
++page." Sites that serve each document in ~20 languages behind a query
++parameter (`?hl=` on every `*.google.com` / `ai.google.dev` docs property)
++therefore enumerated ~20 near-identical URLs per document, and — because
++`max_pages` was applied to that inflated list — the whole budget went to
++translations of the first handful of documents.
++
++`urlscope.canonicalize_url` strips the fragment plus every parameter in
++`urlscope.NOISE_QUERY_PARAMS` (locale selectors `hl`, `lang`, `locale`,
++`setlang`, …; analytics `utm_*`, `gclid`, `fbclid`, `ref`, `referrer`, …).
++It runs at the crawler's single normalization chokepoint (`_strip_fragment`)
++and, critically, **before dedupe and before the `max_pages` cap** in both
++sitemap and llms.txt-index discovery — canonicalizing at fetch time would be
++too late, the budget is already spent by then.
++
++Observed effect on `gemini-api` (`max_pages: 500`):
++
++| | before | after |
++|---|---:|---:|
++| URLs discovered | 500 | 185 |
++| distinct documents | 28 | 185 |
++| `?hl=` variants indexed | 472 | 0 |
++| truncated at cap | yes | no |
++| stale-page purge | skipped | runs |
++
++This is a **deny-list, not an allow-list**, and must stay that way: doc
++sites routinely put real content-selecting state in the query string
++(`?tech=python`, `?apix_params=…`, `?client_type=…` are all live in the
++current corpus). An unknown parameter is therefore preserved — the worst
++case is a duplicate, not a silently missing document. To cover a new
++locale/tracking parameter, add it to `NOISE_QUERY_PARAMS` and re-sync the
++affected sources.
++
++Note the interaction with stale-page purging: a source truncated at its cap
++has `_delete_missing_pages` **skipped** (an incomplete enumeration must not
++be read as "these pages were removed upstream"), so a permanently-truncated
++source accumulates dead rows indefinitely. Collapsing the variants removes
++the truncation, which is what lets the purge resume and clear the rows the
++old crawls left behind.
++
++---
++
+ ## HTTP conditional skip (ETag / If-Modified-Since)
+ 
+ `doc_pages` stores `etag`/`last_modified` from each page's most recent
+diff --git a/ingestion/Dockerfile b/ingestion/Dockerfile
+index 7e2a5ab..443cd4a 100644
+--- a/ingestion/Dockerfile
++++ b/ingestion/Dockerfile
+@@ -26,9 +26,14 @@ RUN pip install --no-cache-dir uv \
+ # Pre-download the FastEmbed embedding model and its tokenizer at build time so
+ # the first real sync doesn't pay a cold-start download. Cached under
+ # /home/ingest/.cache, owned by the runtime user below. The model is a build
+-# arg so `make configure` / compose can bake the selected model (default =
+-# config/models.yaml registry default); the runtime env var must match it.
+-ARG EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
++# arg so `make configure` / compose can bake the selected model. The default
++# below tracks config/models.yaml's `default:` row — change it THERE, not
++# here, and re-run `make configure` (this ARG default is only a fallback for
++# a plain `docker compose build` with no EMBEDDING_MODEL_NAME set). The
++# runtime EMBEDDING_MODEL_NAME env var must match whatever was baked in here,
++# or the embedding dimension will mismatch the `vector(N)` column in
++# db/init/01_schema.sql.
++ARG EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+ ENV EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
+ RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['EMBEDDING_MODEL_NAME'])" \
+     && python -c "import os; from tokenizers import Tokenizer; Tokenizer.from_pretrained(os.environ['EMBEDDING_MODEL_NAME'])"
+diff --git a/ingestion/app/crawler.py b/ingestion/app/crawler.py
+index 45bbe2c..ec2cea7 100644
+--- a/ingestion/app/crawler.py
++++ b/ingestion/app/crawler.py
+@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+ from . import llms_txt
+ from .config import SourceConfig
+ from .logging_config import get_logger
+-from .urlscope import parse_sitemap, url_host_is_private
++from .urlscope import canonicalize_url, parse_sitemap, url_host_is_private
+ from .urlscope import path_allowed as _path_allowed
+ 
+ USER_AGENT = "self-docs-crawler/0.1"
+@@ -120,8 +120,16 @@ def _validate_final_url(
+ 
+ 
+ def _strip_fragment(url: str) -> str:
+-    parsed = urlparse(url)
+-    return parsed._replace(fragment="").geturl()
++    """Canonicalize `url` for indexing: drop the fragment AND every
++    locale/tracking query parameter (`urlscope.canonicalize_url`).
++
++    Kept under its original name because it is the crawler's single
++    normalization chokepoint — every URL-admission path already routes
++    through it — but it now does strictly more than strip the fragment.
++    Dropping `?hl=`-style parameters HERE rather than at each call site is
++    what makes `visited` deduplicate a page against its own translations
++    instead of fetching, embedding and storing each one separately."""
++    return canonicalize_url(url)
+ 
+ 
+ def load_robots(client: httpx.Client, base_url: str) -> urllib.robotparser.RobotFileParser:
+@@ -267,12 +275,24 @@ def _discover_sitemap_urls_recursive(
+     urls, child_sitemaps = parse_sitemap(resp.content)
+ 
+     filtered: list[str] = []
++    seen_in_level: set[str] = set()
+     for u in urls:
++        # Canonicalize BEFORE dedupe and BEFORE the cap. Order is
++        # load-bearing, not stylistic: a sitemap that lists every page once
++        # per supported language (`?hl=ar`, `?hl=de`, ... — Google's docs
++        # sites list ~17) yields ~17 distinct strings per document, all of
++        # which survive a raw `not in filtered` check and each of which
++        # consumes one unit of `max_pages`. Canonicalizing first collapses
++        # them to one entry, so the budget buys distinct DOCUMENTS rather
++        # than translations. Doing it downstream (at fetch time) would be
++        # far too late: the cap has already been spent by then.
++        u = canonicalize_url(u)
+         if not _same_host(u, base_url):
+             continue
+         if not _allowed(urlparse(u).path, include_prefixes, exclude_prefixes):
+             continue
+-        if u not in filtered:
++        if u not in seen_in_level:
++            seen_in_level.add(u)
+             filtered.append(u)
+ 
+     # Sort deterministically BEFORE the cap is applied: sitemap enumeration
+@@ -667,12 +687,18 @@ def crawl(
+             # mirroring sitemap discovery — instead of a sitemap/BFS crawl. Each
+             # URL is still re-validated (host/scope/private/robots) in `_visit`.
+             filtered: list[str] = []
++            seen_in_index: set[str] = set()
+             for u in llms_index_urls:
++                # Canonicalized before dedupe and before the cap, exactly as
++                # in sitemap discovery — an llms.txt index is just as free to
++                # list per-language URL variants.
++                u = canonicalize_url(u)
+                 if not _same_host(u, base_url):
+                     continue
+                 if not _allowed(urlparse(u).path, source.include_prefixes, source.exclude_prefixes):
+                     continue
+-                if u not in filtered:
++                if u not in seen_in_index:
++                    seen_in_index.add(u)
+                     filtered.append(u)
+             candidate_urls = filtered[:page_cap]
+             log.info("llms_index_candidates", count=len(candidate_urls))
+diff --git a/ingestion/app/urlscope.py b/ingestion/app/urlscope.py
+index de5f021..b932066 100644
+--- a/ingestion/app/urlscope.py
++++ b/ingestion/app/urlscope.py
+@@ -1,7 +1,7 @@
+-"""Pure helpers for URL scoping and sitemap parsing.
++"""Pure helpers for URL scoping, canonicalization, and sitemap parsing.
+ 
+ No network, no filesystem, no DB access — these functions operate purely on
+-their inputs. They exist to fix two production defects:
++their inputs. They exist to fix three production defects:
+ 
+ 1. Scope leak: prefix matching via plain `str.startswith` lets an
+    `include_prefixes` entry like `/traefik` also match `/traefik-hub/...`,
+@@ -15,6 +15,17 @@ their inputs. They exist to fix two production defects:
+    distinguishes the two and returns both possible lists so a caller can
+    recurse into child sitemaps.
+ 
++3. Locale/tracking query-parameter explosion: include/exclude prefixes only
++   ever match `urlparse(url).path`, so NO source config could express "don't
++   crawl the translated copies." Sites that serve every page in ~20
++   languages behind a `?hl=` parameter therefore enumerated ~20 near-
++   identical URLs per document, and the `max_pages` cap — applied to that
++   inflated list — spent the entire budget on translations of the first
++   handful of documents. `canonicalize_url` strips those parameters so the
++   variants collapse onto one URL and the cap is spent on distinct
++   documents. See `NOISE_QUERY_PARAMS` for the deny-list and why it is a
++   deny-list rather than an allow-list.
++
+ INCLUDE vs EXCLUDE matching is deliberately ASYMMETRIC — read this before
+ adding a new source's include_prefixes/exclude_prefixes:
+ 
+@@ -52,7 +63,7 @@ from __future__ import annotations
+ import ipaddress
+ import os
+ import socket
+-from urllib.parse import urlparse
++from urllib.parse import parse_qsl, quote, urlencode, urlparse
+ from xml.etree import ElementTree  # kept for ElementTree.ParseError below
+ 
+ from defusedxml import ElementTree as DefusedET
+@@ -258,6 +269,113 @@ def path_allowed(path: str, include_prefixes: list[str], exclude_prefixes: list[
+     return True
+ 
+ 
++# ---------------------------------------------------------------------------
++# URL canonicalization
++# ---------------------------------------------------------------------------
++
++# Query parameters that select a TRANSLATION or carry ANALYTICS, never
++# content. Stripping them collapses the variants onto the canonical URL.
++#
++# This is deliberately a DENY-list, not an allow-list. Plenty of doc sites
++# put genuinely content-bearing state in the query string — `?tech=python`
++# picks a language-specific code sample, `?apix_params=...` drives an
++# embedded API explorer, `?client_type=...` switches an SDK's reference —
++# and those are all live in the current corpus. An allow-list would have to
++# enumerate every such parameter across every upstream site and would
++# silently drop real documents the moment a site invented a new one. A
++# deny-list fails the safe way instead: an unknown parameter is preserved,
++# so the worst case is a duplicate we already tolerate today rather than a
++# missing page.
++#
++# Note `hl=` is Google's locale parameter and is the specific one that broke
++# the gemini-api and google-search-console-api crawls. `referrer` is on the
++# list because developers.google.com stamps it onto in-page links
++# (`?referrer=rootllms` in the live corpus).
++#
++# Entries are held to the same fail-safe standard the deny-list exists for,
++# which rules out several "obvious" candidates. `ref` is attribution on most
++# sites but selects a git branch/tag on others (`?ref=main`); `source` is
++# attribution on Google properties but arbitrary state elsewhere; a bare `l`
++# is too generic to attribute to anything. Each of those could collapse two
++# genuinely different documents into one — the failure mode this list is
++# supposed to avoid — so they are deliberately EXCLUDED. Only add a
++# parameter here when its value cannot change the rendered content.
++NOISE_QUERY_PARAMS = frozenset(
++    {
++        # Locale / translation selectors
++        "hl",
++        "lang",
++        "language",
++        "locale",
++        "setlang",
++        # Analytics / attribution
++        "utm_source",
++        "utm_medium",
++        "utm_campaign",
++        "utm_term",
++        "utm_content",
++        "utm_id",
++        "gclid",
++        "fbclid",
++        "msclkid",
++        "mc_cid",
++        "mc_eid",
++        "igshid",
++        "referrer",
++        "referer",
++        "_ga",
++        "_gl",
++    }
++)
++
++
++def canonicalize_url(url: str) -> str:
++    """Strip the fragment and every `NOISE_QUERY_PARAMS` entry from `url`.
++
++    Returns a URL that is equivalent for indexing purposes, so that
++    `.../docs/models`, `.../docs/models#pricing`, `.../docs/models?hl=fr`
++    and `.../docs/models?hl=ja&utm_source=x` all collapse to the single
++    canonical `.../docs/models`.
++
++    Parameter names are matched CASE-INSENSITIVELY (`?HL=fr` is the same
++    selector as `?hl=fr`). Content-bearing parameters are preserved, in
++    their original order, along with their original encoding of spaces and
++    reserved characters — `parse_qsl(keep_blank_values=True)` +
++    `urlencode(quote_via=quote)` round-trips a parameter that is kept
++    without mangling it, and blank values (`?tech=`) survive as blanks
++    rather than being silently dropped.
++
++    A URL with no query and no fragment is returned UNCHANGED (byte-for-
++    byte, not re-serialized), so canonicalization can never perturb the
++    overwhelming majority of URLs that have nothing to strip. This matters:
++    every URL flows through here, and a re-serialization round-trip is a
++    chance to alter a path's percent-encoding for no benefit.
++
++    Malformed input that `urlparse` rejects is returned unchanged — this is
++    a normalizer, not a validator; the host/scope/private-address gates run
++    separately and still refuse it.
++    """
++    try:
++        parsed = urlparse(url)
++    except ValueError:
++        return url
++
++    if not parsed.query and not parsed.fragment:
++        return url
++
++    if parsed.query:
++        kept = [
++            (name, value)
++            for name, value in parse_qsl(parsed.query, keep_blank_values=True)
++            if name.lower() not in NOISE_QUERY_PARAMS
++        ]
++        query = urlencode(kept, quote_via=quote)
++    else:
++        query = ""
++
++    return parsed._replace(query=query, fragment="").geturl()
++
++
+ def _strip_ns(tag: str) -> str:
+     """Strip an XML namespace URI wrapper (e.g. '{ns}tag' -> 'tag')."""
+     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+diff --git a/ingestion/tests/test_crawler.py b/ingestion/tests/test_crawler.py
+index 8dc0190..c721ae7 100644
+--- a/ingestion/tests/test_crawler.py
++++ b/ingestion/tests/test_crawler.py
+@@ -1855,3 +1855,101 @@ def test_discover_sitemap_urls_sitemapindex_children_order_is_deterministic():
+         children["https://docs-fixture.dev/sitemaps/b.xml"]
+     )[:7]
+ 
++
++
++def test_sitemap_locale_variants_collapse_before_the_cap():
++    """Regression test for the real ai.google.dev/sitemap.xml case that left
++    gemini-api stuck at `partial`.
++
++    Upstream lists every document once per supported language behind `?hl=`.
++    Before canonicalization those variants were 17 distinct strings per
++    document, each consuming one unit of `max_pages`, so a 100-page budget
++    bought ~6 real documents and reported truncation. Canonicalizing BEFORE
++    the dedupe and BEFORE the cap must collapse them, so the same budget
++    covers all 40 distinct documents and discovery is no longer truncated.
++    """
++    langs = ["ar", "de", "es-419", "fr", "he", "hi", "id", "it", "ja", "ko", "pl", "pt-BR", "th", "tr", "vi", "zh-CN"]
++    locs = []
++    for i in range(40):
++        page = f"https://ai.google.dev/gemini-api/docs/p{i:02d}"
++        locs.append(f"<url><loc>{page}</loc></url>")
++        locs.extend(f"<url><loc>{page}?hl={lang}</loc></url>" for lang in langs)
++    sitemap_xml = (
++        '<?xml version="1.0" encoding="UTF-8"?>'
++        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
++        f"{''.join(locs)}"
++        "</urlset>"
++    )
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url) == "https://ai.google.dev/sitemap.xml":
++            return httpx.Response(200, text=sitemap_xml)
++        return httpx.Response(404)
++
++    truncation: dict = {}
++    urls = discover_sitemap_urls(
++        make_client(handler),
++        "https://ai.google.dev/sitemap.xml",
++        max_pages=100,
++        limiter=_new_limiter(),
++        log=_test_log(),
++        base_url="https://ai.google.dev/gemini-api/docs",
++        include_prefixes=["/gemini-api/docs"],
++        exclude_prefixes=[],
++        truncation_info_out=truncation,
++    )
++
++    # 680 raw <loc> entries collapse to the 40 distinct documents...
++    assert len(urls) == 40
++    assert len(set(urls)) == 40
++    # ...none of which carries a locale parameter...
++    assert not any("hl=" in u for u in urls)
++    # ...and the crawl is no longer truncated, so `store.sync_source` can
++    # trust the enumeration and resume purging stale pages.
++    assert truncation["truncated_at_cap"] is False
++
++
++def test_sitemap_canonicalization_does_not_drop_content_bearing_query_pages():
++    """The collapse must be limited to locale/tracking parameters: two pages
++    differing only by a content-bearing parameter remain two pages."""
++    sitemap_xml = (
++        '<?xml version="1.0" encoding="UTF-8"?>'
++        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
++        "<url><loc>https://cloudinary.com/documentation/image?tech=python</loc></url>"
++        "<url><loc>https://cloudinary.com/documentation/image?tech=ruby</loc></url>"
++        "<url><loc>https://cloudinary.com/documentation/image?tech=ruby&amp;hl=fr</loc></url>"
++        "</urlset>"
++    )
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url) == "https://cloudinary.com/sitemap.xml":
++            return httpx.Response(200, text=sitemap_xml)
++        return httpx.Response(404)
++
++    urls = discover_sitemap_urls(
++        make_client(handler),
++        "https://cloudinary.com/sitemap.xml",
++        max_pages=100,
++        limiter=_new_limiter(),
++        log=_test_log(),
++        base_url="https://cloudinary.com/documentation",
++        include_prefixes=["/documentation"],
++        exclude_prefixes=[],
++    )
++
++    # ?tech=ruby and ?tech=ruby&hl=fr collapse together; ?tech=python stays
++    # separate.
++    assert sorted(urls) == [
++        "https://cloudinary.com/documentation/image?tech=python",
++        "https://cloudinary.com/documentation/image?tech=ruby",
++    ]
++
++
++def test_bfs_crawl_does_not_refetch_locale_variants_of_a_visited_page():
++    """The BFS path shares the same chokepoint: a page linking to its own
++    translations must not enqueue them as separate documents."""
++    from app.crawler import _strip_fragment
++
++    assert _strip_fragment("https://x.dev/a?hl=fr") == "https://x.dev/a"
++    assert _strip_fragment("https://x.dev/a#frag") == "https://x.dev/a"
++    assert _strip_fragment("https://x.dev/a?tech=python") == "https://x.dev/a?tech=python"
+diff --git a/ingestion/tests/test_urlscope.py b/ingestion/tests/test_urlscope.py
+index bca12ab..eecf9dd 100644
+--- a/ingestion/tests/test_urlscope.py
++++ b/ingestion/tests/test_urlscope.py
+@@ -2,8 +2,10 @@ import socket
+ 
+ import pytest
+ from app.urlscope import (
++    NOISE_QUERY_PARAMS,
+     _resolve_host_addrs,
+     _resolve_is_private,
++    canonicalize_url,
+     parse_sitemap,
+     path_allowed,
+     url_host_is_private,
+@@ -284,3 +286,96 @@ def test_unresolvable_is_not_private_at_validation_time(monkeypatch):
+ def test_url_with_no_host_fails_closed():
+     assert url_host_is_private("file:///etc/passwd") is True
+     assert url_host_is_private("not a url") is True
++
++
++# --- canonicalize_url -----------------------------------------------------
++
++
++def test_canonicalize_strips_locale_parameter():
++    """The gemini-api defect: ai.google.dev lists every doc page once per
++    supported language behind `?hl=`, so 28 real documents enumerated as
++    500 URLs and consumed the entire max_pages budget."""
++    canonical = "https://ai.google.dev/gemini-api/docs/models"
++    for variant in ("?hl=ar", "?hl=de", "?hl=ja", "?hl=pt-BR", "?hl=en"):
++        assert canonicalize_url(canonical + variant) == canonical
++
++
++def test_canonicalize_strips_fragment():
++    assert canonicalize_url("https://x.dev/a#install") == "https://x.dev/a"
++
++
++def test_canonicalize_strips_fragment_and_query_together():
++    assert canonicalize_url("https://x.dev/a?hl=fr#install") == "https://x.dev/a"
++
++
++def test_canonicalize_strips_tracking_parameters():
++    assert canonicalize_url("https://x.dev/a?utm_source=n&gclid=1&referrer=rootllms") == "https://x.dev/a"
++
++
++def test_canonicalize_keeps_ambiguous_attribution_lookalikes():
++    """`ref`/`source`/`l` are attribution on many sites but content-bearing
++    on others (`?ref=main` selects a git branch), so they are deliberately
++    NOT on the deny-list — collapsing two different documents is the exact
++    failure mode the deny-list exists to avoid. This test is the guard
++    against someone 'completing' the list later."""
++    for param in ("ref", "ref_src", "source", "l"):
++        assert param not in NOISE_QUERY_PARAMS
++        url = f"https://x.dev/a?{param}=main"
++        assert canonicalize_url(url) == url
++
++
++def test_canonicalize_is_case_insensitive_on_parameter_names():
++    assert canonicalize_url("https://x.dev/a?HL=fr") == "https://x.dev/a"
++    assert canonicalize_url("https://x.dev/a?Utm_Source=n") == "https://x.dev/a"
++
++
++def test_canonicalize_preserves_content_bearing_parameters():
++    """Deny-list, not allow-list: these four are live in the real corpus and
++    select genuinely different content, so they must survive untouched."""
++    for url in (
++        "https://cloudinary.com/documentation/image?tech=python",
++        "https://developers.google.com/x?apix=true",
++        "https://developers.google.com/x?apix_params=%7B%22a%22%3A1%7D",
++        "https://developers.google.com/x?client_type=rest",
++    ):
++        assert canonicalize_url(url) == url
++
++
++def test_canonicalize_keeps_content_parameters_while_dropping_noise():
++    assert (
++        canonicalize_url("https://x.dev/a?tech=python&hl=fr&utm_source=n&client_type=rest")
++        == "https://x.dev/a?tech=python&client_type=rest"
++    )
++
++
++def test_canonicalize_preserves_order_of_kept_parameters():
++    assert canonicalize_url("https://x.dev/a?b=2&hl=fr&a=1") == "https://x.dev/a?b=2&a=1"
++
++
++def test_canonicalize_preserves_blank_values():
++    """`keep_blank_values=True`: `?tech=` must not be silently dropped, since
++    a blank value can select different content than an absent parameter."""
++    assert canonicalize_url("https://x.dev/a?tech=") == "https://x.dev/a?tech="
++
++
++def test_canonicalize_does_not_mangle_encoded_values():
++    url = "https://x.dev/a?q=a%2Bb%20c&hl=fr"
++    assert canonicalize_url(url) == "https://x.dev/a?q=a%2Bb%20c"
++
++
++def test_canonicalize_returns_url_without_query_or_fragment_unchanged():
++    """Byte-for-byte identity — no re-serialization round-trip for the
++    overwhelming majority of URLs, which have nothing to strip."""
++    url = "https://x.dev/a/b%2Fc/"
++    assert canonicalize_url(url) is url
++
++
++def test_canonicalize_drops_query_string_that_was_entirely_noise():
++    assert canonicalize_url("https://x.dev/a?hl=fr") == "https://x.dev/a"
++    assert "?" not in canonicalize_url("https://x.dev/a?hl=fr")
++
++
++def test_canonicalize_leaves_malformed_input_alone():
++    """A normalizer, not a validator — the host/scope/private gates still
++    refuse it separately."""
++    assert canonicalize_url("not a url") == "not a url"
+diff --git a/mcp-server/Dockerfile b/mcp-server/Dockerfile
+index a503c9f..3a00191 100644
+--- a/mcp-server/Dockerfile
++++ b/mcp-server/Dockerfile
+@@ -32,9 +32,13 @@ USER app
+ # cold-load / download penalty (see IMPLEMENTATION_PLAN.md: "FastEmbed model
+ # cache — pre-baked into both images at build; runtime works offline"). The
+ # model is a build arg so `make configure` / compose can bake the selected
+-# model (default = config/models.yaml registry default); the runtime env var
+-# must match the ingestion service's model.
+-ARG EMBEDDING_MODEL_NAME=mixedbread-ai/mxbai-embed-large-v1
++# model. The default below tracks config/models.yaml's `default:` row —
++# change it THERE, not here, and re-run `make configure` (this ARG default is
++# only a fallback for a plain `docker compose build` with no
++# EMBEDDING_MODEL_NAME set). The runtime EMBEDDING_MODEL_NAME env var must
++# match the ingestion service's model, or the embedding dimension will
++# mismatch the `vector(N)` column in db/init/01_schema.sql.
++ARG EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+ ENV EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME}
+ RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['EMBEDDING_MODEL_NAME'])"
+ 
+diff --git a/scripts/models_matrix.py b/scripts/models_matrix.py
+new file mode 100644
+index 0000000..af50e98
+--- /dev/null
++++ b/scripts/models_matrix.py
+@@ -0,0 +1,210 @@
++#!/usr/bin/env python3
++"""Generate the per-model container-image build matrix from the registry.
++
++`config/models.yaml` is the single source of truth for embedding models (see
++its header comment). `.github/workflows/release.yml` needs one build job per
++model — each image bakes in a different `EMBEDDING_MODEL_NAME` build arg and
++gets its own GHCR tag suffix — but the workflow itself must not hardcode that
++list, or adding a model row would silently NOT get an image until someone
++remembered to edit the YAML by hand.
++
++This script closes that gap: the workflow shells out to it (its stdout is
++captured straight into `$GITHUB_OUTPUT`, so nothing else may print to stdout)
++and gets back one JSON array with one row per model, ordered registry-default
++first, then `config/models.yaml` declaration order. Each row carries:
++
++    model       the full FastEmbed model name (used as the build arg)
++    slug        a GHCR-tag-safe suffix (each model's row of image tags is
++                suffixed `-<slug>`, e.g. self-docs-ingestion-bge-base-en-v1.5)
++    dim         the model's vector dimension (informational for the workflow)
++    is_default  true for exactly the row matching `default:` in the registry
++
++`--only <csv>` restricts the matrix to a subset of full model names (or the
++literal `all`/an empty string, meaning "every model") — used by the release
++workflow to build the default model on every push while gating the rest
++behind a manual dispatch input, without duplicating this generator's logic.
++
++Usage:
++    python scripts/models_matrix.py [--only <csv>]
++
++Exit codes: 0 with the JSON array on stdout; 2 with a message on stderr (and
++NOTHING on stdout) if --only names an unknown model, two rows resolve to the
++same slug, two rows' slugs collide via the artifact-download glob (one slug
++is the other plus a '-' prefix, e.g. `foo` and `foo-bar`), or a slug is not a
++valid Docker tag fragment.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import re
++import sys
++from pathlib import Path
++from typing import Any
++
++try:
++    import yaml
++except ModuleNotFoundError as exc:  # pragma: no cover - environment hint
++    raise SystemExit(
++        "models_matrix.py needs PyYAML. Install it with `pip install pyyaml`, "
++        "or run this via the ingestion venv (which already has it): "
++        "ingestion/.venv/bin/python scripts/models_matrix.py"
++    ) from exc
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++REGISTRY_PATH = REPO_ROOT / "config" / "models.yaml"
++
++# A valid Docker image tag fragment: this is appended to a fixed prefix
++# (`self-docs-<service>-`), so it need not satisfy the FULL tag grammar on its
++# own, but it still must never contain characters Docker tags reject.
++SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
++_SLUG_INVALID_CHARS = re.compile(r"[^a-z0-9._-]")
++
++
++class MatrixError(Exception):
++    """A registry/`--only` problem that should exit 2 with a stderr message,
++    as opposed to letting an unrelated exception produce a stray traceback."""
++
++
++def load_registry() -> dict[str, Any]:
++    with REGISTRY_PATH.open(encoding="utf-8") as fh:
++        return yaml.safe_load(fh)  # type: ignore[no-any-return]
++
++
++def derive_slug(model_name: str) -> str:
++    """Fallback slug for a row with no explicit `image_slug:`: the basename
++    after the last '/', lowercased, with every character outside
++    [a-z0-9._-] replaced by '-'."""
++    basename = model_name.rsplit("/", 1)[-1].lower()
++    return _SLUG_INVALID_CHARS.sub("-", basename)
++
++
++def parse_only(raw: str | None) -> list[str] | None:
++    """Normalize --only's raw string into a list of model names, or None
++    meaning "every model" (its `all`/empty-string/omitted spellings)."""
++    if raw is None:
++        return None
++    stripped = raw.strip()
++    if not stripped or stripped.lower() == "all":
++        return None
++    return [name.strip() for name in stripped.split(",") if name.strip()]
++
++
++def build_matrix(registry: dict[str, Any], only: list[str] | None = None) -> list[dict[str, Any]]:
++    """Pure function: registry dict (as loaded from config/models.yaml) + an
++    optional --only selection -> the ordered matrix rows. Raises MatrixError
++    (never exits/prints) so tests and callers can handle failures themselves.
++    """
++    models: dict[str, Any] = registry["models"]
++    default_name: str = registry["default"]
++
++    if only is not None:
++        unknown = [name for name in only if name not in models]
++        if unknown:
++            available = "\n  ".join(sorted(models))
++            raise MatrixError(
++                f"--only names unknown model(s): {', '.join(unknown)}. "
++                f"Valid models (config/models.yaml):\n  {available}"
++            )
++        wanted = set(only)
++        selected_names = [name for name in models if name in wanted]
++    else:
++        selected_names = list(models)
++
++    # Registry-default first (if selected), then config/models.yaml
++    # declaration order for the rest — independent of --only's own order.
++    ordered_names = [name for name in selected_names if name == default_name] + [
++        name for name in selected_names if name != default_name
++    ]
++
++    rows: list[dict[str, Any]] = []
++    slug_owners: dict[str, str] = {}
++    for name in ordered_names:
++        row = models[name]
++        slug = row.get("image_slug") or derive_slug(name)
++        if not SLUG_RE.match(slug):
++            raise MatrixError(
++                f"model {name!r} resolves to slug {slug!r}, which is not a valid "
++                f"image tag fragment (must match {SLUG_RE.pattern!r})"
++            )
++        if slug in slug_owners:
++            raise MatrixError(
++                f"slug collision: {slug_owners[slug]!r} and {name!r} both resolve "
++                f"to slug {slug!r} — set an explicit, unique `image_slug:` on one"
++            )
++        # Beyond exact duplicates, also reject a slug that is another
++        # selected slug plus a literal '-' prefix (e.g. `foo` / `foo-bar`):
++        # `.github/workflows/release.yml`'s merge job downloads a
++        # (service, model)'s digests with
++        # `pattern: digests-<service>-<slug>-*`, so `foo-*` would ALSO match
++        # `digests-<service>-foo-bar-amd64`/`-arm64` and fuse the wrong
++        # model's platform digests into one manifest list. A slug that is
++        # merely a prefix without the trailing '-' (e.g. `bge-small-en-v1`
++        # vs `bge-small-en-v1.5`) is safe: the glob's literal '-' cannot
++        # match the following '.'.
++        #
++        # Scoping this to `ordered_names`/`slug_owners` (the already-
++        # selected set), same as the exact-duplicate check just above, is
++        # deliberate, not an oversight: the glob only ever collects
++        # artifacts uploaded by build legs that ran IN THIS SAME workflow
++        # run, and `build`/`merge` only ever iterate
++        # `fromJSON(needs.prepare.outputs.models)` — i.e. exactly this
++        # function's --only-selected rows. A model excluded by --only never
++        # uploads a `digests-...` artifact at all in that run, so it can
++        # never collide with anything, and rejecting it anyway (by
++        # scanning the full registry regardless of --only) would block a
++        # legitimate `--only=foo` dispatch just because some unrelated,
++        # unselected `foo-bar` row exists in the registry. For the same
++        # reason, the exact-duplicate check above is already correctly
++        # scoped and does not need widening for this defect.
++        for other_slug, other_name in slug_owners.items():
++            if slug.startswith(other_slug + "-") or other_slug.startswith(slug + "-"):
++                raise MatrixError(
++                    f"slug glob collision: {other_name!r} (slug {other_slug!r}) and "
++                    f"{name!r} (slug {slug!r}) — one slug is the other plus a "
++                    f"'-' prefix, so the merge job's artifact download glob "
++                    f"'digests-<service>-<slug>-*' would match both models' "
++                    f"digests and publish a manifest with the wrong platforms; "
++                    f"set a distinct, explicit `image_slug:` on one to fix it"
++                )
++        slug_owners[slug] = name
++        rows.append(
++            {
++                "model": name,
++                "slug": slug,
++                "dim": int(row["dim"]),
++                "is_default": name == default_name,
++            }
++        )
++    return rows
++
++
++def _parse_args(argv: list[str]) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        prog="models_matrix.py",
++        description="Print the per-model container-image build matrix as one line of JSON.",
++    )
++    parser.add_argument(
++        "--only",
++        default=None,
++        help="Comma-separated full model names to include, or 'all'/empty for every model.",
++    )
++    return parser.parse_args(argv)
++
++
++def main(argv: list[str]) -> int:
++    args = _parse_args(argv[1:])
++    registry = load_registry()
++    only = parse_only(args.only)
++    try:
++        matrix = build_matrix(registry, only)
++    except MatrixError as exc:
++        print(str(exc), file=sys.stderr)
++        return 2
++    print(json.dumps(matrix))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv))
+diff --git a/tests/test_models_matrix.py b/tests/test_models_matrix.py
+new file mode 100644
+index 0000000..0b5b1ae
+--- /dev/null
++++ b/tests/test_models_matrix.py
+@@ -0,0 +1,392 @@
++"""Guards that keep `scripts/models_matrix.py` (the per-model container-image
++build matrix generator) faithful to its contract with `.github/workflows/
++release.yml`: every registry model appears exactly once, slugs are valid and
++unique, the registry default sorts first, the JSON row shape/types match what
++the workflow's `enable=`/build-arg expressions expect, `--only` filtering and
++its error paths behave, and the CLI emits exactly one JSON line on stdout (the
++only thing safe to pipe into `$GITHUB_OUTPUT`). Also guards against the
++workflow silently reverting to a hardcoded model name instead of consuming
++this generator.
++
++Runs under the ingestion venv (see Makefile's `test` target), so PyYAML is
++available.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import re
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any
++
++import pytest
++import yaml
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++REGISTRY_PATH = REPO_ROOT / "config" / "models.yaml"
++MATRIX_SCRIPT = REPO_ROOT / "scripts" / "models_matrix.py"
++RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
++
++SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
++
++
++def _load_models_matrix():
++    spec = importlib.util.spec_from_file_location("models_matrix", MATRIX_SCRIPT)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _load_registry() -> dict:
++    with REGISTRY_PATH.open(encoding="utf-8") as fh:
++        return yaml.safe_load(fh)
++
++
++mm = _load_models_matrix()
++REGISTRY = _load_registry()
++
++
++# Sanity check (development-time only, see task notes): confirms this suite
++# is exercising THIS worktree's copy of the code, not some other checkout's.
++print(f"[test_models_matrix] REPO_ROOT resolved to: {REPO_ROOT}")
++assert REPO_ROOT == Path(__file__).resolve().parent.parent
++assert mm.REPO_ROOT == REPO_ROOT
++
++
++# ---------------------------------------------------------------------------
++# 1. Registry coverage
++# ---------------------------------------------------------------------------
++
++
++def test_full_matrix_covers_every_registry_model_exactly_once():
++    matrix = mm.build_matrix(REGISTRY, only=None)
++    names = [row["model"] for row in matrix]
++    assert len(names) == len(REGISTRY["models"])
++    assert sorted(names) == sorted(REGISTRY["models"])
++    assert len(set(names)) == len(names)  # no duplicates
++
++
++# ---------------------------------------------------------------------------
++# 2. Slug validity and uniqueness
++# ---------------------------------------------------------------------------
++
++
++def test_every_slug_in_the_real_registry_is_valid_and_unique():
++    matrix = mm.build_matrix(REGISTRY, only=None)
++    slugs = [row["slug"] for row in matrix]
++    for slug in slugs:
++        assert SLUG_RE.match(slug), f"slug {slug!r} fails {SLUG_RE.pattern!r}"
++    assert len(set(slugs)) == len(slugs)
++
++
++# ---------------------------------------------------------------------------
++# 3. Default handling
++# ---------------------------------------------------------------------------
++
++
++def test_exactly_one_default_row_matching_registry_and_it_is_first():
++    matrix = mm.build_matrix(REGISTRY, only=None)
++    default_rows = [row for row in matrix if row["is_default"]]
++    assert len(default_rows) == 1
++    assert default_rows[0]["model"] == REGISTRY["default"]
++    assert matrix[0]["model"] == REGISTRY["default"]
++    assert matrix[0]["is_default"] is True
++
++
++# ---------------------------------------------------------------------------
++# 4. Key/type contract
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("model_name", list(REGISTRY["models"]))
++def test_row_has_exact_keys_and_correct_types(model_name):
++    matrix = mm.build_matrix(REGISTRY, only=None)
++    row = next(r for r in matrix if r["model"] == model_name)
++    assert set(row.keys()) == {"model", "slug", "dim", "is_default"}
++    assert isinstance(row["dim"], int)
++    # bool is a subclass of int in Python, so check bool BEFORE/AS WELL as the
++    # dim check to guard against a stringified bool ("true"/"false") which
++    # would silently break `enable=` in the workflow while still looking
++    # "truthy" in casual inspection.
++    assert isinstance(row["is_default"], bool)
++    assert not isinstance(row["dim"], bool)
++    assert row["dim"] == REGISTRY["models"][model_name]["dim"]
++
++
++# ---------------------------------------------------------------------------
++# 5. Slug derivation
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "model_name, expected_slug",
++    [
++        ("vendor/Some-Weird_Model.NAME", "some-weird_model.name"),
++        ("Vendor/UPPER-CASE", "upper-case"),
++        ("no-vendor-prefix", "no-vendor-prefix"),
++        ("vendor/name+with*bad!chars", "name-with-bad-chars"),
++        ("vendor/deep/nested/path", "path"),
++        ("vendor/name with spaces", "name-with-spaces"),
++    ],
++)
++def test_derive_slug_basename_lowercase_and_charset_replacement(model_name, expected_slug):
++    assert mm.derive_slug(model_name) == expected_slug
++
++
++def test_explicit_image_slug_wins_over_derived_slug():
++    synthetic_registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "custom-slug"},
++            "vendor/model-b": {"dim": 200},
++        },
++    }
++    matrix = mm.build_matrix(synthetic_registry, only=None)
++    row_a = next(r for r in matrix if r["model"] == "vendor/model-a")
++    row_b = next(r for r in matrix if r["model"] == "vendor/model-b")
++    assert row_a["slug"] == "custom-slug"  # explicit wins, not derive_slug("vendor/model-a")
++    assert row_a["slug"] != mm.derive_slug("vendor/model-a")
++    assert row_b["slug"] == mm.derive_slug("vendor/model-b")
++
++
++# ---------------------------------------------------------------------------
++# 6. --only filtering
++# ---------------------------------------------------------------------------
++
++
++def _synthetic_registry() -> dict[str, Any]:
++    return {
++        "default": "vendor/model-b",
++        "models": {
++            "vendor/model-a": {"dim": 100},
++            "vendor/model-b": {"dim": 200},
++            "vendor/model-c": {"dim": 300},
++        },
++    }
++
++
++def test_only_single_name_yields_one_row():
++    registry = _synthetic_registry()
++    matrix = mm.build_matrix(registry, only=mm.parse_only("vendor/model-a"))
++    assert [row["model"] for row in matrix] == ["vendor/model-a"]
++
++
++def test_only_two_names_yields_two_rows():
++    registry = _synthetic_registry()
++    matrix = mm.build_matrix(registry, only=mm.parse_only("vendor/model-a,vendor/model-c"))
++    assert {row["model"] for row in matrix} == {"vendor/model-a", "vendor/model-c"}
++    assert len(matrix) == 2
++
++
++@pytest.mark.parametrize("raw", ["all", "", "ALL", "  ", None])
++def test_only_all_empty_or_omitted_yields_full_matrix(raw):
++    registry = _synthetic_registry()
++    matrix = mm.build_matrix(registry, only=mm.parse_only(raw))
++    assert {row["model"] for row in matrix} == set(registry["models"])
++    assert len(matrix) == len(registry["models"])
++
++
++def test_only_ordering_does_not_change_output_ordering():
++    registry = _synthetic_registry()
++    # default is vendor/model-b; request it last in --only, it must still sort
++    # first in the output because ordering follows registry declaration order,
++    # default-first, not --only's own order.
++    matrix = mm.build_matrix(registry, only=mm.parse_only("vendor/model-c,vendor/model-a,vendor/model-b"))
++    assert [row["model"] for row in matrix] == ["vendor/model-b", "vendor/model-a", "vendor/model-c"]
++
++
++# ---------------------------------------------------------------------------
++# 7. Error paths
++# ---------------------------------------------------------------------------
++
++
++def test_unknown_only_name_raises_matrix_error():
++    registry = _synthetic_registry()
++    with pytest.raises(mm.MatrixError):
++        mm.build_matrix(registry, only=["vendor/does-not-exist"])
++
++
++def test_duplicate_slug_raises_matrix_error():
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "same-slug"},
++            "vendor/model-b": {"dim": 200, "image_slug": "same-slug"},
++        },
++    }
++    with pytest.raises(mm.MatrixError):
++        mm.build_matrix(registry, only=None)
++
++
++def test_invalid_slug_raises_matrix_error():
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "-leading-dash-invalid"},
++        },
++    }
++    with pytest.raises(mm.MatrixError):
++        mm.build_matrix(registry, only=None)
++
++
++# ---------------------------------------------------------------------------
++# 7b. Slug prefix collision (release.yml `download-artifact` glob over-match)
++#
++# `.github/workflows/release.yml` collects each model's digests with a glob
++# `digests-<service>-<slug>-*`. If one row's slug is a literal prefix of
++# another row's slug followed by '-', that glob over-matches and the prefix
++# model's merge job silently sweeps up the longer-slug model's digests too —
++# e.g. `bge-small-en-v1.5` vs `bge-small-en-v1.5-q8` (see task dispatch notes).
++# A prefix relationship where the next character is anything other than '-'
++# is safe, because the glob's literal '-' cannot match it (e.g.
++# `bge-small-en-v1` vs `bge-small-en-v1.5`, where the boundary character is
++# '.').
++# ---------------------------------------------------------------------------
++
++
++def test_slug_prefix_followed_by_dash_raises_matrix_error_naming_both_slugs():
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "bge-small-en-v1.5"},
++            "vendor/model-b": {"dim": 200, "image_slug": "bge-small-en-v1.5-q8"},
++        },
++    }
++    with pytest.raises(mm.MatrixError) as exc_info:
++        mm.build_matrix(registry, only=None)
++    message = str(exc_info.value)
++    assert "bge-small-en-v1.5" in message
++    assert "bge-small-en-v1.5-q8" in message
++
++
++@pytest.mark.parametrize(
++    "first_slug, second_slug",
++    [
++        ("bge-small-en-v1.5", "bge-small-en-v1.5-q8"),
++        ("bge-small-en-v1.5-q8", "bge-small-en-v1.5"),
++    ],
++    ids=["shorter-declared-first", "longer-declared-first"],
++)
++def test_slug_prefix_collision_detected_regardless_of_declaration_order(first_slug, second_slug):
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": first_slug},
++            "vendor/model-b": {"dim": 200, "image_slug": second_slug},
++        },
++    }
++    with pytest.raises(mm.MatrixError):
++        mm.build_matrix(registry, only=None)
++
++
++def test_slug_prefix_with_non_dash_boundary_char_is_safe_and_does_not_raise():
++    # Regression guard: this is the case a naive "startswith" prefix check
++    # would wrongly reject. The glob `...-v1-*` cannot match "...-v1.5" (the
++    # boundary character is '.', not '-'), so these two slugs must coexist.
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "bge-small-en-v1"},
++            "vendor/model-b": {"dim": 200, "image_slug": "bge-small-en-v1.5"},
++        },
++    }
++    matrix = mm.build_matrix(registry, only=None)
++    assert {row["slug"] for row in matrix} == {"bge-small-en-v1", "bge-small-en-v1.5"}
++
++
++def test_identical_slugs_raise_the_duplicate_slug_error_not_the_prefix_error():
++    # Same string is not a "prefix followed by '-'" of itself (there is no
++    # boundary character at all), so an exact duplicate must still be caught
++    # by the pre-existing duplicate-slug check, not silently pass through
++    # the new prefix-collision check.
++    registry = {
++        "default": "vendor/model-a",
++        "models": {
++            "vendor/model-a": {"dim": 100, "image_slug": "same-slug"},
++            "vendor/model-b": {"dim": 200, "image_slug": "same-slug"},
++        },
++    }
++    with pytest.raises(mm.MatrixError, match="both resolve to slug"):
++        mm.build_matrix(registry, only=None)
++
++
++def test_real_registry_slugs_are_mutually_prefix_free():
++    # Guards config/models.yaml itself: a future row whose slug is a prefix
++    # of an existing slug followed by '-' (or vice versa) must fail here,
++    # not surface as a broken release.yml artifact download in CI.
++    matrix = mm.build_matrix(REGISTRY, only=None)
++    slugs = [row["slug"] for row in matrix]
++    for i, slug_a in enumerate(slugs):
++        for slug_b in slugs[i + 1 :]:
++            shorter, longer = sorted((slug_a, slug_b), key=len)
++            assert not longer.startswith(shorter + "-"), (
++                f"slug {shorter!r} is a prefix of {longer!r} followed by '-' — "
++                "release.yml's download-artifact glob would over-match"
++            )
++
++
++def test_main_returns_exit_code_2_and_writes_nothing_to_stdout_for_unknown_only_name(
++    capsys, monkeypatch
++):
++    # Point load_registry at a synthetic registry so this test doesn't depend
++    # on any particular real model name being "unknown".
++    registry = _synthetic_registry()
++    monkeypatch.setattr(mm, "load_registry", lambda: registry)
++    exit_code = mm.main(["models_matrix.py", "--only", "vendor/does-not-exist"])
++    captured = capsys.readouterr()
++    assert exit_code == 2
++    assert captured.out == ""
++    assert captured.err.strip() != ""
++
++
++# ---------------------------------------------------------------------------
++# 8. stdout shape
++# ---------------------------------------------------------------------------
++
++
++def test_cli_stdout_is_exactly_one_json_line_that_round_trips():
++    result = subprocess.run(
++        [sys.executable, str(MATRIX_SCRIPT)],
++        cwd=REPO_ROOT,
++        capture_output=True,
++        text=True,
++        timeout=30,
++    )
++    assert result.returncode == 0
++    lines = result.stdout.splitlines()
++    assert len(lines) == 1
++    parsed = json.loads(lines[0])
++    assert parsed == mm.build_matrix(REGISTRY, only=None)
++
++
++# ---------------------------------------------------------------------------
++# 9. Anti-hardcoding guard: release.yml must derive its build matrix from
++# this generator instead of hardcoding a registry model name/vendor prefix,
++# so adding/removing a model row can never silently drift out of sync with
++# the workflow.
++# ---------------------------------------------------------------------------
++
++
++def _forbidden_substrings_from_registry() -> list[str]:
++    """Every full model name and its vendor prefix (text before the last
++    '/'), built from the registry file itself so this guard keeps working
++    unmodified when a model row is added or removed."""
++    forbidden: set[str] = set()
++    for name in REGISTRY["models"]:
++        forbidden.add(name)
++        if "/" in name:
++            forbidden.add(name.split("/", 1)[0])
++    return sorted(forbidden)
++
++
++def test_release_workflow_does_not_hardcode_a_registry_model_name_or_vendor():
++    workflow_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
++    offenders = [s for s in _forbidden_substrings_from_registry() if s in workflow_text]
++    assert offenders == [], (
++        "release.yml hardcodes registry model name(s)/vendor prefix(es) "
++        f"{offenders!r} instead of deriving the build matrix from "
++        "scripts/models_matrix.py"
++    )

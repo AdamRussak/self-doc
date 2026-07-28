@@ -5,72 +5,43 @@ in the repo root with a populated `.env` (see `.env.example`).
 
 ---
 
-## KNOWN ISSUE — a fresh install with default `.env` values is broken (read this first)
+## Embedding model defaults on a fresh install (fixed; historical bug below)
 
-**Affects new deployments only, and only when `.env` is missing or
-incomplete.** If you are standing up a **fresh** instance (empty Postgres
-volume) via `docker compose up`/`make up` without a populated `.env`, sync
-will fail on every insert. **The existing production deployment is
-unaffected** — its `doc_chunks.embedding` column is already `vector(384)` and
-its `.env` already sets `EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` /
-`EMBEDDING_DIM=384`; verified live.
-
-`config/models.yaml` (the model registry, single source of truth) defaults to
-`BAAI/bge-small-en-v1.5` (384-dim), `db/init/01_schema.sql` creates
-`doc_chunks.embedding vector(384)` to match, and `ingestion/app/embedder.py`,
+**Every layer that decides the embedding model/dimension for a brand-new
+deployment now agrees, even with no `.env` file at all.** `config/models.yaml`
+(the model registry, single source of truth) defaults to
+`BAAI/bge-small-en-v1.5` (384-dim); `db/init/01_schema.sql` creates
+`doc_chunks.embedding vector(384)` to match; `ingestion/app/embedder.py`,
 `mcp-server/app/retrieval.py`, and `ingestion/app/chunker.py`'s `DEFAULT_*`/
 `TOKENIZER_MODEL_ID` fallback constants all default to the same
-`BAAI/bge-small-en-v1.5` / 384-dim — every code-level fallback is aligned
-with the registry.
+`BAAI/bge-small-en-v1.5` / 384-dim; and `docker-compose.yml`'s own build-arg/
+env-var fallbacks (`${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}`,
+`${EMBEDDING_DIM:-384}`, on both services and both build stages) resolve to
+the same model/dimension too. A `docker compose up`/`make up` against a fresh
+Postgres volume with no `.env` at all no longer breaks on the first
+`doc_chunks` insert.
 
-**One place was intentionally left unaligned: `docker-compose.yml`'s own
-shell-level env-var defaults**, which still fall back to the old
-`mixedbread-ai/mxbai-embed-large-v1` (1024-dim):
+**Historical bug, now fixed:** `docker-compose.yml`'s fallbacks used to
+resolve to the *old* default, `mixedbread-ai/mxbai-embed-large-v1` (1024-dim),
+while the committed schema and both services' code-level fallbacks had
+already moved to 384-dim. A fresh install with no `.env` at all (or a
+hand-trimmed one missing `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`) created a
+`vector(384)` column and then embedded at 1024-dim — every `doc_chunks`
+insert failed at sync time. Fixed by aligning the compose-level fallbacks to
+the registry default alongside every other layer. A normal
+`cp .env.example .env && make up` was never affected — `.env.example` has
+always shipped with both lines uncommented at the correct values.
 
-- `EMBEDDING_MODEL_NAME` build arg/env default —
-  `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
-- `EMBEDDING_DIM` env default — `${EMBEDDING_DIM:-1024}`
-
-These only take effect when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset —
-i.e. there is no `.env` file at all, or it exists but doesn't set them. A
-normal `cp .env.example .env && make up` is **not** affected: `.env.example`
-ships with both lines already uncommented at the correct values (see below),
-so copying it verbatim means Compose never falls back to the stale
-`docker-compose.yml` defaults. Net effect: only `docker compose up` run with
-**no `.env` at all** (or a hand-trimmed one missing these two vars) against an
-**empty volume** creates a `vector(384)` column via `db/init/01_schema.sql`
-and then embeds at 1024-dim — every `doc_chunks` insert fails at sync time.
-
-**Workaround — always start from `.env.example`, and set this in `.env`
-before your first `make up` if you skip it:**
-
-```bash
-EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
-EMBEDDING_DIM=384
-```
-
-**This must be done before the first `docker compose up`**: `db/init/*.sql`
-scripts run only against an empty Postgres data directory (see "REQUIRED"
-section immediately below for the general rule). If you already brought the
-stack up with the broken defaults, you must tear down the data volume and
-re-init:
-
-```bash
-docker compose down -v db && docker compose up -d db   # re-runs db/init/*.sql
-make up
-make sync
-```
-
-**Separately — existing 1024-dim databases have no migration path on this
-branch.** The `DO` block that used to handle exactly this embedding-dimension
-change was **deleted** from `db/init/03_fix_embedding_dim.sql` (that file now
-contains only unrelated `doc_sources` base_url/sitemap/include_prefixes
-fixups for specific sources, e.g. `anthropic-api`, `openai-api`). If you are
-reconfiguring an **existing** 1024-dim deployment down to 384-dim, do **not**
-assume `03_fix_embedding_dim.sql` will handle the column width — it will not.
-Follow the general [Switch the embedding model](#switch-the-embedding-model)
-procedure below (which does cover a dimension change, via nuke-and-rebuild or
-`make reindex`).
+**Still true, independent of the fix above: there is no automated migration
+for a vector-dimension change.** The `DO` block that used to handle a
+384-dim/1024-dim column-width change was **deleted** from
+`db/init/03_fix_embedding_dim.sql` (that file now contains only unrelated
+`doc_sources` `base_url`/`sitemap`/`include_prefixes` fixups for specific
+sources, e.g. `anthropic-api`, `openai-api`). Reconfiguring an **existing**
+deployment to a model with a different `dim` (either direction) requires the
+[Switch the embedding model](#switch-the-embedding-model) procedure below
+(nuke-and-rebuild or `make reindex`, depending on whether the column width
+actually changed) — do not assume `03_fix_embedding_dim.sql` handles it.
 
 ---
 
@@ -176,26 +147,104 @@ when:
 
 ## Pre-built Container Images (GHCR)
 
-Pre-built, multi-architecture container images (`linux/amd64` and `linux/arm64`) for both services are automatically published to GitHub Container Registry (GHCR) via CI (`.github/workflows/release.yml`) on every release tag (`v*.*.*`) and update to `main`.
+Every push to `main` runs `.github/workflows/release.yml`, which builds and
+publishes one multi-architecture (`linux/amd64` + `linux/arm64`) image **per
+embedding model** for both services (`self-docs-ingestion`,
+`self-docs-mcp-server`) — 2 services × N registry models = 2N release images
+per run. The embedding model is baked into the image at build time (`ARG
+EMBEDDING_MODEL_NAME`), so a single image cannot serve more than one model;
+the model is instead encoded in the **image tag**. Each `(service, model)`
+pair is built as two native single-arch legs (`ubuntu-24.04` for amd64,
+`ubuntu-24.04-arm` for arm64 — no QEMU), pushed by digest, then stitched into
+one tagged multi-arch manifest list with `docker buildx imagetools create`.
+See [ADR-006](adr/006-per-model-multi-arch-image-matrix.md) for why.
 
-**Package URLs (`<owner>` must be lowercase):**
-- `ghcr.io/<owner>/self-docs-ingestion:latest` (or specific tag like `:v1.0.0` / `:main`)
-- `ghcr.io/<owner>/self-docs-mcp-server:latest`
+**Tag scheme** (`X.Y.Z` = the release version bumped by `bump-version`,
+`<sha>` = the full commit SHA, `<slug>` = the model's `image_slug`):
 
-**Consuming via Docker Compose:**
-If you prefer pulling pre-built images instead of building locally (`docker compose build`), override `build:` in your compose configuration or add `image:` references:
+| Tag | Who gets it |
+| --- | --- |
+| `<slug>` | every model |
+| `vX.Y.Z-<slug>` | every model |
+| `X.Y.Z-<slug>` | every model |
+| `sha-<sha>-<slug>` | every model |
+| `latest` | **only** the registry-default model |
+| `vX.Y.Z` | **only** the registry-default model |
+| `X.Y.Z` | **only** the registry-default model |
+| `sha-<sha>` | **only** the registry-default model |
+
+Exactly one model owns the unsuffixed `latest`/`vX.Y.Z`/`X.Y.Z`/`sha-<sha>`
+tags at a time: `config/models.yaml`'s `default:` row. Every other model
+publishes only its slug-suffixed rows, side by side in the same GHCR package.
+
+**Current slugs** (from each row's `image_slug:` in `config/models.yaml` —
+this list is generated by `scripts/models_matrix.py` on every release run,
+**not maintained by hand in this doc**; re-check `config/models.yaml` before
+trusting this list):
+
+| `image_slug` | Model | `dim` | Registry default? |
+| --- | --- | --- | --- |
+| `bge-small-en-v1.5` | `BAAI/bge-small-en-v1.5` | 384 | yes — owns `latest` |
+| `mxbai-embed-large-v1` | `mixedbread-ai/mxbai-embed-large-v1` | 1024 | no |
+| `multilingual-e5-large` | `intfloat/multilingual-e5-large` | 1024 | no |
+| `bge-base-en-v1.5` | `BAAI/bge-base-en-v1.5` | 768 | no |
+
+> [!WARNING]
+> **The image variant you pull MUST match your `.env`'s
+> `EMBEDDING_MODEL_NAME` AND `db/init/01_schema.sql`'s `vector(N)`.** These
+> three things — the pulled image's baked-in model, `.env`, and the rendered
+> schema — must all agree, exactly like a from-source build. Pulling
+> `:latest` (`bge-small-en-v1.5`, 384-dim) onto a database initialized for a
+> 1024-dim model (or vice versa) breaks **every** insert and **every** query
+> with a pgvector dimension mismatch — there is no partial-compatibility
+> mode. This is the same failure mode as the fresh-install bug described
+> above, just triggered by a mismatched pulled tag instead of an unset `.env`.
+
+**Recipe — pin a non-default model's pre-built image:**
+
+```bash
+make configure MODEL=intfloat/multilingual-e5-large   # writes .env + renders the schema
+```
+
+Then, in a compose override (e.g. `docker-compose.override.yml`), pin the
+matching slug-suffixed tag instead of building locally:
 
 ```yaml
 services:
   ingestion:
-    image: ghcr.io/<owner>/self-docs-ingestion:latest
+    image: ghcr.io/<owner>/self-docs-ingestion:multilingual-e5-large
   mcp-server:
-    image: ghcr.io/<owner>/self-docs-mcp-server:latest
+    image: ghcr.io/<owner>/self-docs-mcp-server:multilingual-e5-large
 ```
 
-*Note: The pre-built GHCR images come pre-baked with the default embedding model (`mixedbread-ai/mxbai-embed-large-v1`). If you switch to a custom model via `make configure MODEL=...`, you must build from source so the new ONNX model weights are downloaded during container build.*
+(`<owner>` must be lowercase.) If this is a **fresh** volume, `make up` picks
+up the rendered schema on first boot. If you are changing the model on an
+**existing** volume/deployment, the vector width will not match until you
+follow [Re-index from scratch (nuke-and-rebuild)](#re-index-from-scratch-nuke-and-rebuild)
+— do not just swap the `image:` line on a live database.
 
-**Authentication (if pulling from private registry):**
+**Verify what a pulled image actually contains** before trusting it, using
+the `io.self-docs.embedding-model`/`io.self-docs.embedding-dim` labels every
+build leg attaches:
+
+```bash
+docker buildx imagetools inspect ghcr.io/<owner>/self-docs-ingestion:multilingual-e5-large \
+  --format '{{json (index .Image "linux/amd64").Config.Labels}}'
+```
+
+(swap `linux/amd64` for `linux/arm64` to check the other platform's manifest — both carry the same labels, since they come from the same build matrix row.)
+
+Confirm the printed `io.self-docs.embedding-model`/`io.self-docs.embedding-dim`
+match what `make configure` wrote into `.env` and rendered into
+`db/init/01_schema.sql`'s `vector(N)`.
+
+**`buildcache-*` tags are not release artifacts.** Alongside the tags above,
+GHCR also lists `buildcache-<slug>-amd64` and `buildcache-<slug>-arm64`
+package versions per service — these are `docker buildx`'s registry-cache
+refs (one per service+model+arch, so concurrent legs never clobber each
+other's cache), not something meant to be pulled and run.
+
+**Authentication (if pulling from a private registry):**
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
 ```
@@ -840,16 +889,18 @@ the two services' Docker memory limits. The registry default is
 fallback constants (`embedder.DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`,
 `retrieval.DEFAULT_MODEL_NAME`).
 
-> [!WARNING]
-> `docker-compose.yml`'s own env-var fallbacks are the one place that was
-> **not** aligned to the registry default — they still fall back to
-> `mixedbread-ai/mxbai-embed-large-v1` (1024-dim) when
-> `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in `.env`. See [Known
-> issue — a fresh install with default `.env` values is
-> broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
-> at the top of this runbook. Always set `EMBEDDING_MODEL_NAME`/
-> `EMBEDDING_DIM` explicitly in `.env` (which `.env.example` already does)
-> rather than relying on unset-env fallbacks.
+> [!NOTE]
+> `docker-compose.yml`'s own build-arg/env-var fallbacks
+> (`${EMBEDDING_MODEL_NAME:-BAAI/bge-small-en-v1.5}`,
+> `${EMBEDDING_DIM:-384}`) now track the registry default too — see
+> [Embedding model defaults on a fresh install](#embedding-model-defaults-on-a-fresh-install-fixed-historical-bug-below)
+> above. They are a **static compose-level default, not a live read of
+> `config/models.yaml`**, so if you ever change the registry's `default:`
+> row, update those compose fallbacks to match (`.env.example`'s "Embedding
+> model" block documents the pairing) or they will silently drift again.
+> Always set `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` explicitly in `.env`
+> (which `.env.example` already does) rather than relying on unset-env
+> fallbacks.
 
 To see the options:
 
@@ -997,11 +1048,17 @@ test invocation — matching the deployed default in `config/models.yaml`, the
 `DEFAULT_*` fallback constants in `ingestion/app/embedder.py` and
 `mcp-server/app/retrieval.py`, which now also default to
 `BAAI/bge-small-en-v1.5`/384-dim. The pinning is now redundant with those
-fallbacks rather than a workaround for them — kept as explicit belt-and-
-suspenders insurance against `.env`/`docker-compose.yml` drift (see the
-[Known issue](#known-issue--a-fresh-install-with-default-env-values-is-broken)
-above) rather than a mask for a code-level mismatch. Both parity tests now
-pass by default on an unconfigured checkout:
+fallbacks rather than a workaround for them: `docker-compose.yml`'s own
+build-arg/env-var fallbacks used to be the one place still resolving to the
+old `mixedbread-ai/mxbai-embed-large-v1`/1024-dim default while everything
+else above had already moved to `BAAI/bge-small-en-v1.5`/384-dim, but that
+drift is now closed at the compose/Dockerfile level too (both Dockerfiles'
+`ARG EMBEDDING_MODEL_NAME` default and every `docker-compose.yml`
+`EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` fallback resolve to
+`BAAI/bge-small-en-v1.5`/384-dim). The pin here is kept as explicit
+belt-and-suspenders insurance against future drift, not a mask for a
+code-level mismatch. Both parity tests now pass by default on an
+unconfigured checkout:
 `mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
 and `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`.
 
@@ -1049,6 +1106,51 @@ against the cap; unchanged pages on repeat syncs are skipped almost
 instantly via hash-diff, so weekly re-syncs are much faster than the first
 full crawl). A full first-time sync of all three seed sources together is
 therefore on the order of 20–40 minutes.
+
+---
+
+## URL canonicalization (locale / tracking query parameters)
+
+`include_prefixes`/`exclude_prefixes` only ever match a URL's **path**, so
+no source config can express "don't crawl the translated copies of every
+page." Sites that serve each document in ~20 languages behind a query
+parameter (`?hl=` on every `*.google.com` / `ai.google.dev` docs property)
+therefore enumerated ~20 near-identical URLs per document, and — because
+`max_pages` was applied to that inflated list — the whole budget went to
+translations of the first handful of documents.
+
+`urlscope.canonicalize_url` strips the fragment plus every parameter in
+`urlscope.NOISE_QUERY_PARAMS` (locale selectors `hl`, `lang`, `locale`,
+`setlang`, …; analytics `utm_*`, `gclid`, `fbclid`, `ref`, `referrer`, …).
+It runs at the crawler's single normalization chokepoint (`_strip_fragment`)
+and, critically, **before dedupe and before the `max_pages` cap** in both
+sitemap and llms.txt-index discovery — canonicalizing at fetch time would be
+too late, the budget is already spent by then.
+
+Observed effect on `gemini-api` (`max_pages: 500`):
+
+| | before | after |
+|---|---:|---:|
+| URLs discovered | 500 | 185 |
+| distinct documents | 28 | 185 |
+| `?hl=` variants indexed | 472 | 0 |
+| truncated at cap | yes | no |
+| stale-page purge | skipped | runs |
+
+This is a **deny-list, not an allow-list**, and must stay that way: doc
+sites routinely put real content-selecting state in the query string
+(`?tech=python`, `?apix_params=…`, `?client_type=…` are all live in the
+current corpus). An unknown parameter is therefore preserved — the worst
+case is a duplicate, not a silently missing document. To cover a new
+locale/tracking parameter, add it to `NOISE_QUERY_PARAMS` and re-sync the
+affected sources.
+
+Note the interaction with stale-page purging: a source truncated at its cap
+has `_delete_missing_pages` **skipped** (an incomplete enumeration must not
+be read as "these pages were removed upstream"), so a permanently-truncated
+source accumulates dead rows indefinitely. Collapsing the variants removes
+the truncation, which is what lets the purge resume and clear the rows the
+old crawls left behind.
 
 ---
 
