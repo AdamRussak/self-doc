@@ -15,6 +15,7 @@ database.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
@@ -25,7 +26,7 @@ from app import admin
 from app.config import SourceConfig
 from app.sources_repo import SourceRecord
 from app.store import ChunkRecord, PageRecord, SourceOutcome
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 SYNC_TOKEN = "test-admin-token-xyz"
@@ -1063,6 +1064,1043 @@ def test_upload_happy_path_calls_ingest_and_redirects(client, csrf_token, monkey
     assert not admin._manual_sync_lock.locked()
 
 
+# --- Create + upload in one submit (T23/T24) ------------------------------------------------
+#
+# The create form is now multipart and carries an optional file input, so a
+# source_type='upload' source can be created AND populated by a single POST
+# to /admin/sources/new. The redirect contract under test:
+#
+#   crawl (files ignored)      -> /admin?msg=created+{name}          (unchanged)
+#   upload, no files           -> /admin/sources/{id}?msg=created+{name}
+#   upload, inline ingest      -> /admin/sources/{id}?msg=created+{name}:+{status}  + HX-Trigger
+#   upload, background handoff -> /admin/sources/{id}?msg=upload_started+{name}     + HX-Trigger
+#   upload, nothing parsable   -> /admin/sources/{id}?msg=created+{name}+—+upload+failed:+...
+#   upload, lock busy          -> /admin/sources/{id}?msg=created+{name}+—+upload+skipped:+...
+#
+# In every failure case the source row SURVIVES (it is never deleted or
+# rolled back) and nothing 500s. Under pytest, `PYTEST_CURRENT_TEST` is set,
+# so the route takes the inline-ingest branch unless a test removes it.
+
+_BOUNDARY = "----selfdocstestboundary"
+
+
+def _raw_multipart(fields: list[tuple[str, str]], file_parts: list[tuple[str, str, bytes, str]]) -> tuple[bytes, dict[str, str]]:
+    """Hand-build a multipart/form-data body, returning (body, headers).
+
+    Needed because httpx's `files={"files": ("", b"", "text/plain")}`
+    shorthand OMITS the `filename` parameter entirely when the filename is
+    empty — Starlette then parses that part as a plain `str` form field and
+    FastAPI 422s the request BEFORE the route body ever runs. A real browser
+    submitting an untouched `<input type="file">` sends the parameter
+    present-but-empty (`filename=""`), which Starlette parses as an
+    `UploadFile` with `filename == ""` and `_parse_upload_files` skips. Only
+    a hand-built body can express that, so only a hand-built body actually
+    tests the case a browser produces.
+
+    `file_parts` entries are (field_name, filename, content, content_type);
+    `filename` is emitted verbatim, empty string included.
+    """
+    chunks: list[bytes] = []
+    for name, value in fields:
+        chunks.append(f"--{_BOUNDARY}\r\n".encode())
+        chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        chunks.append(value.encode() + b"\r\n")
+    for name, filename, content, content_type in file_parts:
+        chunks.append(f"--{_BOUNDARY}\r\n".encode())
+        chunks.append(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
+        chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        chunks.append(content + b"\r\n")
+    chunks.append(f"--{_BOUNDARY}--\r\n".encode())
+    return b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={_BOUNDARY}"}
+
+
+def test_raw_multipart_helper_produces_a_browser_style_empty_file_part():
+    """Guard on the test helper itself: if it ever stopped emitting a literal
+    `filename=""`, the empty-part tests below would silently start testing
+    httpx's (different, 422-producing) shorthand instead."""
+    body, headers = _raw_multipart([("name", "x")], [("files", "", b"", "application/octet-stream")])
+    assert b'name="files"; filename=""' in body
+    assert headers["Content-Type"].startswith("multipart/form-data; boundary=")
+
+
+# (a) upload + a parsable file: create, then ingest inline, in one submit.
+
+
+def test_create_upload_with_file_ingests_once_and_redirects_to_the_new_source(client, csrf_token, monkeypatch):
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    record = _upload_record(id=42, name="widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status="ok", pages_fetched=1, chunks_indexed=3)
+    ingest_mock = MagicMock(return_value=outcome)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    location = resp.headers["location"]
+    assert location.startswith("/admin/sources/42?")
+    assert "msg=created+widget-uploads" in location
+    assert "ok" in location  # the inline outcome.status is surfaced
+    assert resp.headers["hx-trigger"] == "syncStatusUpdated"
+
+    create_mock.assert_called_once()
+    _conn, cfg = create_mock.call_args.args
+    assert cfg.source_type == "upload"
+
+    ingest_mock.assert_called_once()
+    assert ingest_mock.call_args.args[1] is record
+    docs = ingest_mock.call_args.args[2]
+    assert len(docs) == 1
+    assert docs[0].markdown == "# hello world"
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_with_multiple_files_ingests_all_of_them_in_one_call(client, csrf_token, monkeypatch):
+    """The file input is `multiple` — every attached file must land in a
+    single ingest call, not one call per file (which would re-run the
+    whole ingest pipeline N times)."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    record = _upload_record(id=42, name="widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status="ok", pages_fetched=2, chunks_indexed=4)
+    ingest_mock = MagicMock(return_value=outcome)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files=[
+            ("files", ("a.md", b"# first", "text/markdown")),
+            ("files", ("b.md", b"# second", "text/markdown")),
+        ],
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    ingest_mock.assert_called_once()
+    docs = ingest_mock.call_args.args[2]
+    assert [doc.markdown for doc in docs] == ["# first", "# second"]
+    assert not admin._manual_sync_lock.locked()
+
+
+# (b) upload with no file part at all: create the source, ingest nothing.
+
+
+def test_create_upload_without_any_file_part_creates_source_and_skips_ingest(client, csrf_token, monkeypatch):
+    """The "create it now, upload into it later" path, and every API caller
+    that posts no file part at all."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin/sources/42?msg=created+widget-uploads"
+    assert "hx-trigger" not in resp.headers
+    create_mock.assert_called_once()
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+# (c) upload with the empty part a browser sends for an untouched file input.
+
+
+def test_create_upload_with_browser_empty_file_part_is_treated_as_no_files(client, csrf_token, monkeypatch):
+    """A browser always submits the file input, even untouched — as a part
+    with `filename=""`. That must be indistinguishable from "no files
+    attached": source created, nothing ingested, and emphatically NOT a
+    422 (which is what a `File(...)`-required parameter would produce)."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    body, headers = _raw_multipart(
+        [("csrf_token", csrf_token), ("name", "widget-uploads"), ("source_type", "upload")],
+        [("files", "", b"", "application/octet-stream")],
+    )
+    resp = client.post("/admin/sources/new", content=body, headers=headers, follow_redirects=False)
+
+    assert resp.status_code == 303, resp.text  # not 422: the route really ran
+    assert resp.headers["location"] == "/admin/sources/42?msg=created+widget-uploads"
+    create_mock.assert_called_once()
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_with_whitespace_only_filename_is_treated_as_no_files(client, csrf_token, monkeypatch):
+    """Boundary neighbour of the empty part: a filename of only whitespace is
+    skipped too (`filename.strip()`), so it can never reach a parser as a
+    bogus "unsupported file type: ' '" error."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    body, headers = _raw_multipart(
+        [("csrf_token", csrf_token), ("name", "widget-uploads"), ("source_type", "upload")],
+        [("files", "   ", b"", "application/octet-stream")],
+    )
+    resp = client.post("/admin/sources/new", content=body, headers=headers, follow_redirects=False)
+
+    assert resp.status_code == 303, resp.text
+    assert resp.headers["location"] == "/admin/sources/42?msg=created+widget-uploads"
+    ingest_mock.assert_not_called()
+
+
+# (d) crawl create submitted as multipart: byte-identical to the old behavior.
+
+
+def test_create_crawl_multipart_with_stray_empty_file_part_redirects_to_index(client, csrf_token, monkeypatch):
+    """Every crawl create from the (now multipart) form carries the untouched
+    file input's empty part. It must be ignored outright — same
+    `/admin?msg=created+{name}` redirect as before this feature existed, no
+    ingest, no 422."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    body, headers = _raw_multipart(
+        [
+            ("csrf_token", csrf_token),
+            ("name", "widget"),
+            ("source_type", "crawl"),
+            ("base_url", "https://widget.example.com/docs/"),
+        ],
+        [("files", "", b"", "application/octet-stream")],
+    )
+    resp = client.post("/admin/sources/new", content=body, headers=headers, follow_redirects=False)
+
+    assert resp.status_code == 303, resp.text
+    assert resp.headers["location"] == "/admin?msg=created+widget"
+    create_mock.assert_called_once()
+    _conn, cfg = create_mock.call_args.args
+    assert cfg.source_type == "crawl"
+    assert cfg.base_url == "https://widget.example.com/docs/"
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_crawl_multipart_ignores_an_actually_attached_file(client, csrf_token, monkeypatch):
+    """Defense in depth: even a real, parsable file riding along on a
+    crawl-type create is ignored — a crawl source gets its content by
+    crawling, and silently ingesting an upload into one would leave content
+    the next sync cannot reproduce."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={
+            "csrf_token": csrf_token,
+            "name": "widget",
+            "source_type": "crawl",
+            "base_url": "https://widget.example.com/docs/",
+        },
+        files={"files": ("a.md", b"# sneaky", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/admin?msg=created+widget"
+    ingest_mock.assert_not_called()
+
+
+def test_create_crawl_multipart_still_validates_base_url(client, csrf_token, monkeypatch):
+    """Switching the form to multipart must not weaken validation: a bad
+    base_url still re-renders the form with a 400 and writes nothing."""
+    _login(client)
+    create_mock = MagicMock()
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    body, headers = _raw_multipart(
+        [
+            ("csrf_token", csrf_token),
+            ("name", "widget"),
+            ("source_type", "crawl"),
+            ("base_url", "not-a-url"),
+        ],
+        [("files", "", b"", "application/octet-stream")],
+    )
+    resp = client.post("/admin/sources/new", content=body, headers=headers, follow_redirects=False)
+
+    assert resp.status_code == 400, resp.text
+    assert "error" in resp.text.lower()
+    create_mock.assert_not_called()
+
+
+# (e) upload where nothing parses: the source row still survives.
+
+
+def test_create_upload_with_unparsable_file_still_creates_the_source(client, csrf_token, monkeypatch):
+    """An unsupported file type yields no docs and no per-file error, so the
+    generic "nothing parsable" message is reported. The source row must
+    survive untouched — never deleted, never rolled back — and the response
+    must be a 303 to that source, not a 500."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    delete_mock = MagicMock()
+    monkeypatch.setattr(admin.sources_repo, "delete_source", delete_mock)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("payload.exe", b"\x00\x01\x02garbage", "application/octet-stream")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("/admin/sources/42?")
+    assert "msg=created+widget-uploads" in location
+    assert "upload+failed" in location
+    assert "No+parsable+content" in location
+    create_mock.assert_called_once()
+    delete_mock.assert_not_called()
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_with_corrupt_zip_reports_the_parser_error_and_keeps_the_source(client, csrf_token, monkeypatch):
+    """An `UploadError` from a parser is reported as the failure detail (not
+    the generic message) and is never raised: still a 303, still no 500, row
+    still created."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    delete_mock = MagicMock()
+    monkeypatch.setattr(admin.sources_repo, "delete_source", delete_mock)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("bundle.zip", b"this is definitely not a zip", "application/zip")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("/admin/sources/42?")
+    assert "upload+failed" in location
+    assert "not+a+valid+zip" in location
+    create_mock.assert_called_once()
+    delete_mock.assert_not_called()
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_unparsable_file_never_acquires_the_sync_lock(client, csrf_token, monkeypatch):
+    """Parsing runs BEFORE the lock is taken, so an unparsable batch never
+    contends for it at all — and, critically, the route must not release a
+    lock it never acquired (that would stomp on whoever does hold it)."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    acquire_spy = MagicMock(wraps=admin.try_acquire_sync_lock)
+    release_spy = MagicMock(wraps=admin.release_sync_lock)
+    monkeypatch.setattr(admin, "try_acquire_sync_lock", acquire_spy)
+    monkeypatch.setattr(admin, "release_sync_lock", release_spy)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("payload.exe", b"garbage", "application/octet-stream")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    acquire_spy.assert_not_called()
+    release_spy.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+# (f) lock hygiene — the T19_FIX bug class: never leak, never steal.
+
+
+def test_create_upload_when_lock_held_skips_upload_and_leaves_the_lock_with_its_owner(client, csrf_token, monkeypatch):
+    """A sync already in flight owns the lock. The create still succeeds, the
+    upload is skipped with a message, and the route must neither ingest nor
+    RELEASE the lock it failed to acquire — releasing another holder's lock
+    is the same class of bug as leaking one."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    assert admin._manual_sync_lock.acquire(blocking=False)
+    try:
+        resp = client.post(
+            "/admin/sources/new",
+            data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+            files={"files": ("a.md", b"# hello world", "text/markdown")},
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 303, resp.text
+        location = resp.headers["location"]
+        assert location.startswith("/admin/sources/42?")
+        assert "msg=created+widget-uploads" in location
+        assert "upload+skipped" in location
+        assert "sync+in+progress" in location
+        create_mock.assert_called_once()
+        ingest_mock.assert_not_called()
+        # Still held by THIS test's acquire — the route did not steal it.
+        assert admin._manual_sync_lock.locked()
+    finally:
+        admin._manual_sync_lock.release()
+
+
+def test_create_upload_lock_busy_does_not_release_a_lock_it_never_acquired(client, csrf_token, monkeypatch):
+    """Same contract as above, asserted at the seam rather than on the lock
+    object: with `try_acquire_sync_lock` returning False, `release_sync_lock`
+    must never be called."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+    monkeypatch.setattr(admin, "try_acquire_sync_lock", MagicMock(return_value=False))
+    release_spy = MagicMock()
+    monkeypatch.setattr(admin, "release_sync_lock", release_spy)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303
+    assert "upload+skipped" in resp.headers["location"]
+    ingest_mock.assert_not_called()
+    release_spy.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_ingest_exception_releases_the_lock_and_does_not_500(client, csrf_token, monkeypatch):
+    """THE lock-leak shape (T19_FIX): the lock is acquired, then ingestion
+    blows up. The row is already committed, so the route reports the failure
+    as a redirect instead of a 500 — and the `finally` must still release the
+    lock, or the whole admin UI deadlocks until restart."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    release_spy = MagicMock(side_effect=admin.release_sync_lock)
+    monkeypatch.setattr(admin, "release_sync_lock", release_spy)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", MagicMock(side_effect=RuntimeError("ingest exploded")))
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("/admin/sources/42?")
+    assert "upload+failed" in location
+    assert "ingest+exploded" in location
+    create_mock.assert_called_once()
+    release_spy.assert_called_once()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_parser_exception_releases_the_lock_and_does_not_500(client, csrf_token, monkeypatch):
+    """A non-`UploadError` parser bug propagates out of `_parse_upload_files`.
+    `upload_source_submit` lets it become a 500 (nothing was written there);
+    here the row exists, so it is caught and reported — and no lock is
+    leaked either way (none was acquired: parsing precedes the acquire)."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+    monkeypatch.setattr(admin.uploads, "parse_upload", MagicMock(side_effect=RuntimeError("parser exploded")))
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.text
+    assert "upload+failed" in resp.headers["location"]
+    assert "parser+exploded" in resp.headers["location"]
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_missing_record_after_create_reports_failure_without_500(client, csrf_token, monkeypatch):
+    """Can't-happen guard: `create_source` returned an id but re-reading it
+    yields None (concurrent delete). Must degrade to the upload-failed
+    redirect with the lock never acquired — not an AttributeError 500."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=None))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 303, resp.text
+    assert resp.headers["location"].startswith("/admin/sources/42?")
+    assert "upload+failed" in resp.headers["location"]
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_upload_background_handoff_transfers_lock_ownership(client, csrf_token, monkeypatch):
+    """Production path (no `PYTEST_CURRENT_TEST`): the route hands the parsed
+    docs to `run_sync_task` and returns immediately. Lock ownership transfers
+    to the worker — so the route must NOT release it in its `finally` (that
+    would let a second sync start on top of the in-flight ingest)."""
+    _login(client)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    record = _upload_record(id=42, name="widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+    # Capture the handoff instead of running it: this test is about what the
+    # REQUEST does with the lock, not what the worker later does with it.
+    run_sync_task_mock = MagicMock()
+    monkeypatch.setattr(admin, "run_sync_task", run_sync_task_mock)
+    release_spy = MagicMock(side_effect=admin.release_sync_lock)
+    monkeypatch.setattr(admin, "release_sync_lock", release_spy)
+
+    try:
+        resp = client.post(
+            "/admin/sources/new",
+            data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+            files={"files": ("a.md", b"# hello world", "text/markdown")},
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 303, resp.text
+        assert resp.headers["location"] == "/admin/sources/42?msg=upload_started+widget-uploads"
+        assert resp.headers["hx-trigger"] == "syncStatusUpdated"
+        run_sync_task_mock.assert_called_once()
+        args = run_sync_task_mock.call_args.args
+        assert args[0] is admin._bg_ingest_upload
+        assert args[1] is record
+        assert [doc.markdown for doc in args[2]] == ["# hello world"]
+        assert args[4] == 42
+        # No inline ingest on this path, and the lock stays held for the worker.
+        ingest_mock.assert_not_called()
+        release_spy.assert_not_called()
+        assert admin._manual_sync_lock.locked()
+    finally:
+        if admin._manual_sync_lock.locked():
+            admin._manual_sync_lock.release()
+
+
+# (g) template wiring: the file input exists on CREATE only.
+
+
+def _source_form_tag(html: str) -> str:
+    match = re.search(r'<form id="source-form"[^>]*>', html)
+    assert match is not None, "form#source-form not found in rendered page"
+    return match.group(0)
+
+
+def test_new_source_form_is_multipart_with_an_optional_file_input(client):
+    _login(client)
+    resp = client.get("/admin/sources/new")
+    assert resp.status_code == 200
+
+    assert 'enctype="multipart/form-data"' in _source_form_tag(resp.text)
+    assert 'name="files"' in resp.text
+    assert 'id="create-upload-files"' in resp.text
+    # Pure-CSS progressive disclosure, mirroring the existing .crawl-only rules.
+    assert '#source-form .upload-only' in resp.text
+    assert '#source-form:has(input[name="source_type"][value="upload"]:checked) .upload-only' in resp.text
+
+
+def test_new_source_file_input_is_not_required(client):
+    """A `required` file input would block every crawl-type create the moment
+    the browser un-hides it, and blocks the deliberate "create empty upload
+    source now, populate later" flow."""
+    _login(client)
+    resp = client.get("/admin/sources/new")
+    assert resp.status_code == 200
+    match = re.search(r'<input type="file" id="create-upload-files"[^>]*>', resp.text)
+    assert match is not None
+    assert "required" not in match.group(0)
+
+
+def test_edit_form_has_no_create_upload_file_input_or_enctype(client, monkeypatch):
+    """The EDIT view is untouched by this feature: `update_source_submit` is
+    still urlencoded, so an enctype on #source-form (or a stray `files` part)
+    would 422 every save."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7, name="widget-uploads")))
+
+    resp = client.get("/admin/sources/7")
+    assert resp.status_code == 200
+    assert "enctype" not in _source_form_tag(resp.text)
+    assert 'id="create-upload-files"' not in resp.text
+    assert ".upload-only" not in resp.text
+    # The pre-existing standing upload card on upload sources is unaffected.
+    assert 'id="upload-files"' in resp.text
+    assert 'action="/admin/sources/7/upload"' in resp.text
+
+
+def test_edit_form_for_a_crawl_source_has_no_file_input_at_all(client, monkeypatch):
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_make_record(id=7, name="widget")))
+
+    resp = client.get("/admin/sources/7")
+    assert resp.status_code == 200
+    assert "enctype" not in _source_form_tag(resp.text)
+    assert 'type="file"' not in resp.text
+    assert 'name="files"' not in resp.text
+    assert ".upload-only" not in resp.text
+
+
+# (h) the redirect-carried ?msg= banner: does it RENDER, and in which colour? -----------------
+#
+# Two follow-up fixes live behind the redirect contract above, and NEITHER is
+# provable from a `Location` header:
+#
+#   1. Every `?msg=` redirect that lands on a SOURCE page was silently
+#      discarded — `_form_context` never read the param, so `admin/form.html`
+#      rendered a perfectly ordinary-looking form and the operator was never
+#      told the upload had failed. Asserting only on the redirect URL is
+#      exactly what let that ship, so the tests below FOLLOW the redirect and
+#      assert on the final rendered body.
+#   2. `.message` is the green success style, so failures then rendered green.
+#      Severity is now carried explicitly as `&level=warning`, whitelisted
+#      server-side by `_message_level`, and adds the amber `.message-warning`
+#      modifier to the banner's class attribute.
+#
+# `message-warning` also appears in base.html's <style> block on EVERY page, so
+# a bare `"message-warning" in resp.text` would pass no matter what the banner
+# says: these tests read the banner ELEMENT via `_rendered_banner` instead.
+
+_BANNER_RE = re.compile(r'<div class="(?P<cls>message[^"]*)">(?P<text>.*?)</div>', re.DOTALL)
+
+
+def _rendered_banner(html: str) -> tuple[str, str]:
+    """(class attribute, inner text) of the rendered `?msg=` banner.
+
+    Asserts the element exists, so "the banner silently disappeared" — the
+    fix-round-1 bug — always fails loudly instead of vacuously passing."""
+    match = _BANNER_RE.search(html)
+    assert match is not None, "no ?msg= banner element rendered in the page"
+    return match.group("cls"), match.group("text").strip()
+
+
+def _assert_no_banner(html: str) -> None:
+    match = _BANNER_RE.search(html)
+    assert match is None, f"unexpected banner rendered: {match.group(0) if match else ''}"
+
+
+def test_create_upload_failure_message_is_readable_on_the_page_it_lands_on(client, csrf_token, monkeypatch):
+    """THE end-to-end guard: the failure detail is encoded into the redirect
+    correctly *and* survives into the HTML the operator actually reads. A
+    `Location`-header assertion passes even when the landing page drops the
+    message on the floor, which is precisely how that bug shipped."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("payload.exe", b"\x00\x01\x02garbage", "application/octet-stream")},
+        follow_redirects=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.url.path == "/admin/sources/42"
+    cls, text = _rendered_banner(resp.text)
+    assert text == "created widget-uploads — upload failed: No parsable content found in the uploaded file(s)."
+    assert cls.split() == ["message", "message-warning"]
+    ingest_mock.assert_not_called()
+
+
+def test_create_upload_success_message_renders_without_the_warning_modifier(client, csrf_token, monkeypatch):
+    """The other half of the severity contract: a clean `status="ok"` ingest
+    still gets a banner, and it keeps the plain green `.message` style. If
+    everything rendered amber the modifier would carry no information."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    record = _upload_record(id=42, name="widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status="ok", pages_fetched=1, chunks_indexed=3)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", MagicMock(return_value=outcome))
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.url.path == "/admin/sources/42"
+    cls, text = _rendered_banner(resp.text)
+    assert text == "created widget-uploads: ok"
+    assert cls == "message"
+
+
+@pytest.mark.parametrize("status", ["partial", "failed", "some-future-status"])
+def test_create_upload_non_ok_ingest_status_renders_a_warning_banner(client, csrf_token, monkeypatch, status):
+    """`SourceOutcome.status` is `ok | partial | failed`; only `ok` is a clean
+    success. The status rides in the message text, so a green
+    "created widget-uploads: failed" would contradict itself. An unrecognised
+    status warns too — over-warning is cosmetic, a false green is a lie."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    record = _upload_record(id=42, name="widget-uploads")
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status=status, pages_fetched=1, chunks_indexed=0)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", MagicMock(return_value=outcome))
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    cls, text = _rendered_banner(resp.text)
+    assert text == f"created widget-uploads: {status}"
+    assert cls.split() == ["message", "message-warning"]
+
+
+def test_create_upload_lock_busy_message_renders_amber_end_to_end(client, csrf_token, monkeypatch):
+    """The source row exists but is EMPTY — the operator has to come back and
+    upload. That must reach them as an amber banner on the source page, not as
+    a green "created" or (as before the fix) nothing at all."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "create_source", MagicMock(return_value=42))
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=42, name="widget-uploads")))
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    assert admin._manual_sync_lock.acquire(blocking=False)
+    try:
+        resp = client.post(
+            "/admin/sources/new",
+            data={"csrf_token": csrf_token, "name": "widget-uploads", "source_type": "upload"},
+            files={"files": ("a.md", b"# hello world", "text/markdown")},
+            follow_redirects=True,
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.url.path == "/admin/sources/42"
+        cls, text = _rendered_banner(resp.text)
+        assert text == "created widget-uploads — upload skipped: sync in progress"
+        assert cls.split() == ["message", "message-warning"]
+        ingest_mock.assert_not_called()
+        assert admin._manual_sync_lock.locked()  # still this test's own acquire
+    finally:
+        admin._manual_sync_lock.release()
+
+
+def test_upload_submit_success_message_renders_without_the_warning_modifier(client, csrf_token, monkeypatch):
+    """Same contract on the edit page's standing upload form, whose inline
+    redirect goes through the same `_level_suffix`."""
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status="ok", pages_fetched=1, chunks_indexed=3)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", MagicMock(return_value=outcome))
+
+    resp = client.post(
+        "/admin/sources/5/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.url.path == "/admin/sources/5"
+    cls, text = _rendered_banner(resp.text)
+    assert text == "uploaded widget-uploads: ok"
+    assert cls == "message"
+
+
+@pytest.mark.parametrize("status", ["partial", "failed", "some-future-status"])
+def test_upload_submit_non_ok_status_renders_a_warning_banner(client, csrf_token, monkeypatch, status):
+    _login(client)
+    record = _upload_record(id=5)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=record))
+    outcome = SourceOutcome(name="widget-uploads", status=status, pages_fetched=1, chunks_indexed=0)
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", MagicMock(return_value=outcome))
+
+    resp = client.post(
+        "/admin/sources/5/upload",
+        data={"csrf_token": csrf_token},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.url.path == "/admin/sources/5"
+    cls, text = _rendered_banner(resp.text)
+    assert text == f"uploaded widget-uploads: {status}"
+    assert cls.split() == ["message", "message-warning"]
+
+
+# `?level=` is fully URL-controlled — anyone can hand an operator a link with
+# any value in it — and it is interpolated into a `class` attribute, so it is
+# WHITELISTED (only the literal "warning" survives), not sanitized.
+
+
+def test_source_page_renders_the_warning_modifier_for_the_whitelisted_level(client, monkeypatch):
+    """Positive control for the whitelist tests below: without this, "the class
+    is always plain `.message`" would also pass on a page that ignores `level`
+    entirely."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7)))
+
+    resp = client.get("/admin/sources/7", params={"msg": "upload failed: nope", "level": "warning"})
+
+    assert resp.status_code == 200
+    cls, text = _rendered_banner(resp.text)
+    assert text == "upload failed: nope"
+    assert cls.split() == ["message", "message-warning"]
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        "<script>evil</script>",  # injection attempt
+        "danger",  # a plausible-but-unlisted severity
+        "error",
+        "Warning",  # mis-cased: exact match only
+        "WARNING",
+        " warning",  # untrimmed: exact match only
+        "warning ",
+        "warning danger",  # smuggling a second class in
+        "message-warning",  # naming the CSS class directly
+        "",  # present but empty
+    ],
+)
+def test_source_page_ignores_a_level_outside_the_whitelist(client, monkeypatch, level):
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7)))
+
+    resp = client.get("/admin/sources/7", params={"msg": "hello operator", "level": level})
+
+    assert resp.status_code == 200
+    cls, text = _rendered_banner(resp.text)
+    assert cls == "message", f"level={level!r} reached the class attribute"
+    assert text == "hello operator"
+
+
+def test_url_supplied_level_never_appears_in_the_response_at_all(client, monkeypatch):
+    """Stronger than "the class is plain": the attacker-supplied value must not
+    be echoed anywhere in the body — not raw, and not merely HTML-escaped.
+    `evil()` contains no character autoescaping touches, so it would show up in
+    the response under BOTH forms if the value were reflected at all."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7)))
+    payload = '"><script>evil()</script>'
+
+    resp = client.get("/admin/sources/7", params={"msg": "hello operator", "level": payload})
+
+    assert resp.status_code == 200
+    cls, _text = _rendered_banner(resp.text)
+    assert cls == "message"
+    assert payload not in resp.text
+    assert "evil" not in resp.text
+
+
+def test_banner_message_text_itself_is_autoescaped(client, monkeypatch):
+    """`msg` is URL-controlled too, and carries parser-produced text. It is
+    rendered as escaped TEXT, never as markup."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7)))
+
+    resp = client.get("/admin/sources/7", params={"msg": "<script>evil()</script>"})
+
+    assert resp.status_code == 200
+    _cls, text = _rendered_banner(resp.text)
+    assert text == "&lt;script&gt;evil()&lt;/script&gt;"
+    assert "<script>evil()</script>" not in resp.text
+
+
+def test_source_page_without_a_msg_param_renders_no_banner(client, monkeypatch):
+    """`{% if message %}`: a plain GET of a source page must not render an
+    empty banner box."""
+    _login(client)
+    monkeypatch.setattr(admin.sources_repo, "get_source", MagicMock(return_value=_upload_record(id=7)))
+
+    resp = client.get("/admin/sources/7")
+
+    assert resp.status_code == 200
+    _assert_no_banner(resp.text)
+
+
+def test_new_source_form_without_a_msg_param_renders_no_banner(client):
+    _login(client)
+    resp = client.get("/admin/sources/new")
+    assert resp.status_code == 200
+    _assert_no_banner(resp.text)
+
+
+# index.html parity: `?msg=`/`?level=` must mean the same thing on both pages.
+
+
+def _stub_empty_source_lists(monkeypatch) -> None:
+    monkeypatch.setattr(admin.sources_repo, "list_sources", lambda conn, *, status=None: [])
+
+
+def test_index_renders_the_warning_modifier_for_the_whitelisted_level(client, monkeypatch):
+    _login(client)
+    _stub_empty_source_lists(monkeypatch)
+
+    resp = client.get("/admin", params={"msg": "created widget — upload failed: nope", "level": "warning"})
+
+    assert resp.status_code == 200
+    cls, text = _rendered_banner(resp.text)
+    assert text == "created widget — upload failed: nope"
+    assert cls.split() == ["message", "message-warning"]
+
+
+@pytest.mark.parametrize("level", ["<script>evil</script>", "danger", "Warning", "message-warning", ""])
+def test_index_ignores_a_level_outside_the_whitelist(client, monkeypatch, level):
+    _login(client)
+    _stub_empty_source_lists(monkeypatch)
+
+    resp = client.get("/admin", params={"msg": "created widget", "level": level})
+
+    assert resp.status_code == 200
+    cls, text = _rendered_banner(resp.text)
+    assert cls == "message", f"level={level!r} reached the class attribute"
+    assert text == "created widget"
+
+
+def test_index_success_message_renders_without_the_warning_modifier(client, monkeypatch):
+    """The crawl-create redirect (`/admin?msg=created+{name}`, no `level`) is
+    the common green case on this page."""
+    _login(client)
+    _stub_empty_source_lists(monkeypatch)
+
+    resp = client.get("/admin", params={"msg": "created widget"})
+
+    assert resp.status_code == 200
+    cls, text = _rendered_banner(resp.text)
+    assert cls == "message"
+    assert text == "created widget"
+
+
+def test_index_without_a_msg_param_renders_no_banner(client, monkeypatch):
+    _login(client)
+    _stub_empty_source_lists(monkeypatch)
+
+    resp = client.get("/admin")
+
+    assert resp.status_code == 200
+    _assert_no_banner(resp.text)
+
+
+# (i) CSRF on the MULTIPART create path -------------------------------------------------------
+#
+# `require_csrf` reads `csrf_token` via `Form(default="")`. The parametrized
+# rejection test near the top of this file posts a urlencoded body; the create
+# form is now multipart, so the rejection direction has to be proven for a
+# multipart body too — a `Form` parameter that failed to resolve from multipart
+# would 422 (or, worse, silently read as absent-but-valid) instead of 403.
+
+
+def test_create_multipart_without_csrf_token_is_rejected(client, monkeypatch):
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+    ingest_mock = MagicMock()
+    monkeypatch.setattr(admin.store, "ingest_uploaded_docs", ingest_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403, resp.text  # not 422, and emphatically not 303
+    create_mock.assert_not_called()
+    ingest_mock.assert_not_called()
+    assert not admin._manual_sync_lock.locked()
+
+
+def test_create_multipart_with_wrong_csrf_token_is_rejected(client, monkeypatch):
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    resp = client.post(
+        "/admin/sources/new",
+        data={"csrf_token": "not-the-right-value", "name": "widget-uploads", "source_type": "upload"},
+        files={"files": ("a.md", b"# hello world", "text/markdown")},
+        follow_redirects=False,
+    )
+
+    assert resp.status_code == 403, resp.text
+    create_mock.assert_not_called()
+
+
+def test_create_multipart_with_browser_empty_file_part_and_no_csrf_is_rejected(client, csrf_token, monkeypatch):
+    """The exact body shape a browser submits for a crawl create (an untouched
+    file input) must not become a CSRF bypass: the empty part is skipped by
+    `_parse_upload_files`, but the token check runs before any of that."""
+    _login(client)
+    create_mock = MagicMock(return_value=42)
+    monkeypatch.setattr(admin.sources_repo, "create_source", create_mock)
+
+    body, headers = _raw_multipart(
+        [("name", "widget"), ("base_url", "https://widget.example.com/docs/"), ("source_type", "crawl")],
+        [("files", "", b"", "application/octet-stream")],
+    )
+    resp = client.post("/admin/sources/new", content=body, headers=headers, follow_redirects=False)
+
+    assert resp.status_code == 403, resp.text
+    create_mock.assert_not_called()
+
+
 # --- Pure helper unit tests (no DB, no HTTP) ------------------------------------------------
 
 
@@ -1144,6 +2182,49 @@ def test_record_to_config_roundtrip():
     assert isinstance(cfg, SourceConfig)
     assert cfg.name == "widget"
     assert cfg.max_pages == 10
+
+
+def _request_with_query(query: str) -> Request:
+    """A bare ASGI GET request carrying `query`, for the `?level=` helpers —
+    they only ever touch `request.query_params`."""
+    return Request({"type": "http", "method": "GET", "path": "/admin", "query_string": query.encode(), "headers": []})
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("level=warning", "warning"),  # the ONLY accepted value
+        ("", None),  # no level at all: the success default
+        ("msg=created+widget", None),
+        ("level=", None),
+        ("level=Warning", None),  # exact match, so mis-casing is rejected
+        ("level=WARNING", None),
+        ("level=+warning", None),  # untrimmed
+        ("level=warning+danger", None),  # class smuggling
+        ("level=danger", None),
+        ("level=message-warning", None),  # naming the CSS class directly
+        ("level=%3Cscript%3Eevil%3C%2Fscript%3E", None),  # injection attempt
+    ],
+)
+def test_message_level_accepts_only_the_whitelisted_literal(query, expected):
+    """The return value is interpolated into a `class` attribute, so anything
+    that is not an exact whitelist member collapses to None (green default)."""
+    assert admin._message_level(_request_with_query(query)) == expected
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        ("ok", ""),  # the only clean success: no level param, green banner
+        ("partial", "&level=warning"),
+        ("failed", "&level=warning"),
+        ("some-future-status", "&level=warning"),  # unknown => warn, never green
+        ("OK", "&level=warning"),  # exact match: no case-insensitive success
+        ("", "&level=warning"),
+    ],
+)
+def test_level_suffix_treats_only_ok_as_success(status, expected):
+    assert admin._level_suffix(status) == expected
 
 
 def test_list_docs_view(client, csrf_token, monkeypatch):

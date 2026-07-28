@@ -2,7 +2,12 @@
 {% block title %}sources{% endblock %}
 {% block nav_sources %}active{% endblock %}
 {% block content %}
-{% if message %}<div class="message">{{ message }}</div>{% endif %}
+{# Redirect-carried ?msg= banner. `message_level` ('warning' -> amber
+   .message-warning, anything else -> the default green success style) is
+   whitelisted server-side in `_message_level`, so no URL-supplied string
+   reaches this class attribute. Same markup as form.html's, so a message
+   means the same thing on both pages. #}
+{% if message %}<div class="message{% if message_level == 'warning' %} message-warning{% endif %}">{{ message }}</div>{% endif %}
 
 <div class="card">
   <div class="card-header" style="margin-bottom: 1rem; border-bottom: 1px solid var(--color-border); padding-bottom: 0.75rem;">

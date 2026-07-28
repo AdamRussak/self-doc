@@ -504,6 +504,15 @@
       border-radius: var(--radius-md);
       margin-bottom: 1.5rem;
     }
+    /* Severity modifier for .message: a redirect-carried banner that reports a
+       NON-success outcome ("upload failed", "upload skipped", a partial/failed
+       ingest status). Same box geometry as .message, amber instead of green, so
+       an operator never reads a failure out of a success-colored banner. */
+    .message-warning {
+      color: var(--color-warning);
+      background: var(--color-warning-bg);
+      border: 1px solid var(--color-warning);
+    }
 
     /* Form inputs & Sections */
     .form-section {

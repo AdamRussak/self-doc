@@ -39,7 +39,7 @@ from collections.abc import Callable, Collection
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import psycopg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -412,8 +412,10 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
     exactly, swapping `store.sync_source_with_metrics` for
     `store.ingest_uploaded_docs`. Only reached in production (non-pytest,
     non-`SYNC_RUNNER_SYNC`) requests via `run_sync_task`; the lock acquired
-    by `upload_source_submit` before calling this is released here, in the
-    background thread, once ingestion completes (or fails)."""
+    by the calling route (`upload_source_submit` for the edit page's upload
+    form, `create_source_submit` for files attached to a create) before
+    handing off to this worker is released here, in the background thread,
+    once ingestion completes (or fails)."""
     _sync_status["running"] = True
     _sync_status["source"] = record.name
     _sync_status["started_at"] = time.time()
@@ -728,6 +730,54 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
     )
 
 
+# Severity values a `?level=` query param is allowed to select. WHITELIST, not
+# a sanitizer: `_message_level` maps anything outside this set to None, so only
+# a literal string from this tuple can ever reach the banner's `class` attribute
+# (see `_message_level`).
+_ALLOWED_MESSAGE_LEVELS = ("warning",)
+
+
+def _message_level(request: Request) -> str | None:
+    """Severity for the redirect-carried `?msg=` banner, read from the
+    companion `?level=` param.
+
+    Severity is carried EXPLICITLY by the redirecting route rather than
+    inferred from the message text: string-matching words like "failed"
+    would couple presentation to wording and silently mis-colour a banner
+    the day someone rephrases a message.
+
+    The return value is interpolated into a CSS class attribute by
+    `admin/form.html`/`admin/index.html`, so it is WHITELISTED rather than
+    passed through: only an exact match against `_ALLOWED_MESSAGE_LEVELS`
+    survives. Absent, empty, mis-cased, or attacker-supplied values (this
+    param is fully URL-controlled — anyone can hand an operator a link with
+    any `level=` they like) all collapse to None, i.e. the default success
+    styling. Autoescaping already blocks the obvious injection, but an
+    unvalidated value would still let a caller name any class in the
+    stylesheet."""
+    level = request.query_params.get("level")
+    return level if level in _ALLOWED_MESSAGE_LEVELS else None
+
+
+# `store.SourceOutcome.status` is one of "ok" | "partial" | "failed" (assigned
+# by `store.classify_sync`). Only "ok" is a clean success: "partial" means at
+# least one doc in the batch failed to index, "failed" means nothing indexed at
+# all — both are outcomes an operator has to act on, so neither may render in a
+# green success banner.
+_SUCCESS_SYNC_STATUSES = frozenset({"ok"})
+
+
+def _level_suffix(status: str) -> str:
+    """`&level=warning` for a redirect reporting a non-success
+    `SourceOutcome.status`, `""` (no param, i.e. success styling) otherwise.
+
+    An unrecognised status — a value a future `classify_sync` might add —
+    falls on the warning side deliberately: colouring an unknown outcome
+    amber is a cosmetic over-warning, colouring it green would assert a
+    success this function cannot actually vouch for."""
+    return "" if status in _SUCCESS_SYNC_STATUSES else "&level=warning"
+
+
 def _form_context(
     request: Request,
     *,
@@ -735,6 +785,24 @@ def _form_context(
     error: str | None = None,
     values: dict | None = None,
 ) -> dict:
+    """Template context shared by every `admin/form.html` render (the create
+    form, the edit form, and both of their validation re-renders).
+
+    `message` is the redirect-carried `?msg=` banner, read the same way
+    `list_sources_view` reads it for `admin/index.html` — the routes that
+    redirect an operator *to a source page* (`upload_source_submit`'s two
+    success redirects, and every upload-aware exit of
+    `create_source_submit`) put their outcome there, and without this key
+    `form.html` would silently drop it. `.get` returns None when the param
+    is absent (every GET of the form, every validation re-render), which is
+    falsy, so the banner simply does not render. `error` and `message` are
+    independent: a re-render may legitimately carry both, and `form.html`
+    renders the error first.
+
+    `message_level` is that banner's severity, from the companion `?level=`
+    param (see `_message_level` for the whitelist that guards it). None —
+    the case for every success redirect, which deliberately sends no
+    `level` at all — renders the default green success banner."""
     values = values or {}
     return {
         "request": request,
@@ -742,6 +810,8 @@ def _form_context(
         "record": record,
         "error": error,
         "values": values,
+        "message": request.query_params.get("msg"),
+        "message_level": _message_level(request),
     }
 
 
@@ -794,6 +864,9 @@ def list_sources_view(request: Request, _auth=Depends(require_session), conn=Dep
             "rejected": rejected,
             "csrf_token": _expected_csrf_token(),
             "message": request.query_params.get("msg"),
+            # Same severity contract as `_form_context`, so a `?level=` on an
+            # /admin redirect colours the banner identically on both pages.
+            "message_level": _message_level(request),
             "sync_status": _sync_status,
         },
     )
@@ -831,6 +904,19 @@ def create_source_submit(
     # stale cached form or a direct API call) — the create form itself
     # always submits an explicit value via its source-type radio group.
     source_type: str = Form(default="crawl"),
+    # OPTIONAL (`default=[]`, not `File(...)`): the create form is multipart
+    # and carries a file input, but attaching a file is only meaningful for
+    # source_type='upload'. A crawl-type create submits no usable file part
+    # at all — either none (a non-browser/API caller, or a stale cached
+    # copy of the pre-upload form) or the empty part a browser sends for an
+    # untouched `<input type="file">`. Neither ever reaches a parser: a
+    # crawl create returns at the `source_type != "upload"` redirect below
+    # (which ignores `files` outright), and an upload create whose parts
+    # are all blank returns at the `any(...)` pre-check after it — so
+    # `_parse_upload_files`' own skip of blank-filename parts is defense in
+    # depth on this route, not the thing that handles them.
+    # Making this required would turn every crawl create into a 422.
+    files: list[UploadFile] = File(default=[]),
     _auth=Depends(require_csrf),
     conn=Depends(get_conn),
 ):
@@ -892,7 +978,106 @@ def create_source_submit(
             status_code=400,
         )
     logger.info("admin_source_created", source_id=source_id, name=cfg.name)
-    return RedirectResponse(url=f"/admin?msg=created+{cfg.name}", status_code=303)
+    if cfg.source_type != "upload":
+        # Crawl-type create: byte-identical to the pre-upload behavior. Any
+        # file part that somehow rode along is ignored outright — there is
+        # nothing to ingest into a source that gets its content by crawling.
+        return RedirectResponse(url=f"/admin?msg=created+{cfg.name}", status_code=303)
+
+    # --- source_type='upload': create + populate in one submit ---------------
+    #
+    # INVARIANT for everything below: the row created above SURVIVES every
+    # downstream failure. Nothing here deletes it or rolls back the create —
+    # a failed/partial upload only changes which message the operator lands
+    # on, and they retry from the source's own upload form. Correspondingly,
+    # no path below may 500: a bad file is operator input, not a server bug.
+    if not any((upload.filename or "").strip() for upload in files):
+        # Nothing attached (the common "create the source now, upload later"
+        # case, and every non-browser caller that posts no file part).
+        return RedirectResponse(
+            url=f"/admin/sources/{source_id}?msg=created+{quote_plus(cfg.name)}",
+            status_code=303,
+        )
+
+    # Lock ownership transfers to the background thread once handed off via
+    # `run_sync_task` (which releases it inside `_bg_ingest_upload`); every
+    # OTHER path out of the block below must release it itself — hence the
+    # `handed_off` gate in the `finally`, mirroring `upload_source_submit`.
+    # `acquired` additionally gates it because, unlike that route, the lock
+    # is taken INSIDE the try here (parsing runs first, so an unparsable
+    # batch never contends for the lock at all) — releasing a lock this
+    # request never acquired would stomp on whoever does hold it.
+    handed_off = False
+    acquired = False
+    try:
+        docs, upload_errors = _parse_upload_files(files)
+        if not docs:
+            detail = upload_errors[0] if upload_errors else "No parsable content found in the uploaded file(s)."
+            logger.warning("admin_create_upload_unparsable", source_id=source_id, name=cfg.name, error=detail)
+            return _created_upload_failed_redirect(source_id, cfg.name, detail)
+
+        record = sources_repo.get_source(conn, source_id)
+        if record is None:
+            # `create_source` just returned this id, so this is a
+            # can't-happen (a concurrent delete, or a stubbed repo) — treat
+            # it as an upload failure rather than crashing the request.
+            logger.error("admin_create_upload_source_missing", source_id=source_id, name=cfg.name)
+            return _created_upload_failed_redirect(source_id, cfg.name, "source could not be re-read after creation")
+
+        acquired = try_acquire_sync_lock()
+        if not acquired:
+            logger.warning("admin_create_upload_lock_busy", source_id=source_id, name=cfg.name)
+            # `level=warning`: the source row exists but is EMPTY — the
+            # operator must come back and upload. Amber, not green.
+            return RedirectResponse(
+                url=(
+                    f"/admin/sources/{source_id}?msg=created+{quote_plus(cfg.name)}"
+                    "+—+upload+skipped:+sync+in+progress&level=warning"
+                ),
+                status_code=303,
+            )
+
+        if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
+            outcome = store.ingest_uploaded_docs(conn, record, docs, progress_cb=_on_sync_progress)
+            logger.info("admin_create_upload_ingest_complete", source_id=source_id, name=record.name, status=outcome.status)
+            # Same self-contradiction guard as `upload_source_submit`'s
+            # inline redirect: this message ends in the raw outcome status,
+            # so a "partial"/"failed" batch must not land in a green banner
+            # just because the CREATE half of the submit succeeded.
+            return RedirectResponse(
+                url=(
+                    f"/admin/sources/{source_id}?msg=created+{quote_plus(cfg.name)}"
+                    f":+{quote_plus(str(outcome.status))}{_level_suffix(str(outcome.status))}"
+                ),
+                status_code=303,
+                headers={"HX-Trigger": "syncStatusUpdated"},
+            )
+
+        # Hand-off is only real once `run_sync_task` RETURNS: it spawns the
+        # thread that owns (and releases) the lock, so if `Thread.start()`
+        # raises, the lock is still ours and `handed_off` must still be
+        # False for the `finally` to release it.
+        run_sync_task(_bg_ingest_upload, record, docs, lambda: conn, source_id)
+        handed_off = True
+        return RedirectResponse(
+            url=f"/admin/sources/{source_id}?msg=upload_started+{quote_plus(cfg.name)}",
+            status_code=303,
+            headers={"HX-Trigger": "syncStatusUpdated"},
+        )
+    except Exception as exc:
+        # Unlike `upload_source_submit` (where a parser bug may propagate to
+        # a 500 because no row was written), the row here is already
+        # committed: surfacing a traceback would strand the operator on an
+        # error page with no link to the source that DOES now exist. Report
+        # it and send them to that source instead.
+        # `exc_info=True`: this arm is the catch-all for a genuine parser or
+        # repo bug, and the redirect below only carries `str(exc)` — without
+        # a traceback in the log there is nothing else to diagnose it from.
+        logger.error("admin_create_upload_failed", source_id=source_id, name=cfg.name, error=str(exc), exc_info=True)
+        return _created_upload_failed_redirect(source_id, cfg.name, str(exc))
+    finally:
+        if acquired and not handed_off:
+            release_sync_lock()
 
 
 @router.post("/sources/sync-target", response_class=HTMLResponse)
@@ -1365,6 +1550,80 @@ def _upload_edit_values(record: SourceRecord) -> dict:
     }
 
 
+def _parse_upload_files(files: list[UploadFile]) -> tuple[list[UploadedDoc], list[str]]:
+    """Read + parse a multipart file batch into UploadedDocs. Returns
+    (docs, error_messages).
+
+    Shared by `upload_source_submit` (the edit-page upload form) and
+    `create_source_submit` (the create form's optional file input), so both
+    surfaces treat an uploaded batch identically.
+
+    Raw bytes are read here via the blocking `upload.file.read()` sync file
+    handle FastAPI provides to a `def` route, and handed to parsers that
+    return in-memory `UploadedDoc`s — nothing here writes them to disk (the
+    ASGI multipart parser may transiently spool a large file part to an OS
+    temp file before `upload.file.read()` ever runs —
+    `SpooledTemporaryFile`, framework-layer behavior, not something this
+    function does; that file is cleaned up automatically at request end).
+
+    `.zip` uploads go through `upload_zip.expand_zip` directly (not the thin
+    `uploads.parse_upload` registry wrapper) so per-member failures can be
+    surfaced individually; every other supported suffix goes through
+    `uploads.parse_upload`.
+
+    A part whose `filename` is empty/whitespace is SKIPPED, not parsed: a
+    browser submits exactly such an empty part for an untouched
+    `<input type="file">`, which every create-a-crawl-source submit from
+    the (multipart) create form produces. Treating that as a parse failure
+    would attach a bogus "unsupported file type: ''" error to submits that
+    never attached a file at all.
+
+    `UploadError` is swallowed into the returned error list and NEVER
+    raised, so callers can always report a per-file problem instead of
+    500ing. Any OTHER exception (a genuine parser bug) still propagates —
+    callers that hold the sync lock must release it in a `finally`."""
+    docs: list[UploadedDoc] = []
+    errors: list[str] = []
+    for upload in files:
+        filename = upload.filename or ""
+        if not filename.strip():
+            continue
+        data = upload.file.read()
+        try:
+            if filename.lower().endswith(".zip"):
+                result = upload_zip.expand_zip(filename, data)
+                docs.extend(result.docs)
+                errors.extend(f"{failure.member}: {failure.reason}" for failure in result.failures)
+            else:
+                docs.extend(uploads.parse_upload(filename, data))
+        except UploadError as e:
+            errors.append(str(e))
+    return docs, errors
+
+
+def _created_upload_failed_redirect(source_id: int, name: str, detail: str) -> RedirectResponse:
+    """Redirect for `create_source_submit` when the source row was created
+    successfully but the files attached to the same submit could not be
+    ingested. The row ALWAYS survives (it is never deleted or rolled back
+    here) — the operator lands on its edit page, where the standing upload
+    form lets them retry with a corrected file. `detail` is
+    percent-encoded: it is parser-controlled text that can contain `&`,
+    `#`, or newlines, none of which may leak into the Location header
+    unencoded — which is also why `&level=warning` is appended AFTER the
+    encoded detail rather than embedded in it.
+
+    `level=warning` is unconditional here: every caller of this helper is
+    reporting a source row that exists but holds none of the content the
+    operator just attached."""
+    return RedirectResponse(
+        url=(
+            f"/admin/sources/{source_id}?msg=created+{quote_plus(name)}"
+            f"+—+upload+failed:+{quote_plus(detail)}&level=warning"
+        ),
+        status_code=303,
+    )
+
+
 @router.post("/sources/{source_id}/upload", response_class=HTMLResponse)
 def upload_source_submit(
     source_id: int,
@@ -1376,17 +1635,10 @@ def upload_source_submit(
     """Parse uploaded files (Markdown/text, HTML, PDF, zip bundles) and
     index them into an existing `source_type='upload'` source.
 
-    Raw bytes are read here (via the blocking `upload.file.read()` sync
-    file handle FastAPI provides to a `def` route) and handed to parsers
-    that return in-memory `UploadedDoc`s — no application code in this
-    route writes them to disk (the ASGI multipart parser may transiently
-    spool a large file part to an OS temp file before `upload.file.read()`
-    ever runs — `SpooledTemporaryFile`, framework-layer behavior, not
-    something this route's code does; that file is cleaned up automatically
-    at request end). `.zip` uploads go through `upload_zip.expand_zip`
-    directly (not the thin `uploads.parse_upload` registry wrapper) so
-    per-member failures can be surfaced individually; every other supported
-    suffix goes through `uploads.parse_upload`.
+    Reading and parsing the multipart batch lives in `_parse_upload_files`
+    (shared with `create_source_submit`) — see its docstring for the
+    in-memory/no-disk-write, zip-vs-single-file, and `UploadError`-handling
+    contract this route depends on.
     """
     record = sources_repo.get_source(conn, source_id)
     if record is None:
@@ -1424,20 +1676,7 @@ def upload_source_submit(
     # `sync_source_submit`'s acquire/hand-off/release pattern.
     handed_off = False
     try:
-        docs: list[UploadedDoc] = []
-        errors: list[str] = []
-        for upload in files:
-            filename = upload.filename or ""
-            data = upload.file.read()
-            try:
-                if filename.lower().endswith(".zip"):
-                    result = upload_zip.expand_zip(filename, data)
-                    docs.extend(result.docs)
-                    errors.extend(f"{failure.member}: {failure.reason}" for failure in result.failures)
-                else:
-                    docs.extend(uploads.parse_upload(filename, data))
-            except UploadError as e:
-                errors.append(str(e))
+        docs, errors = _parse_upload_files(files)
 
         if not docs:
             error_message = errors[0] if errors else "No parsable content found in the uploaded file(s)."
@@ -1451,14 +1690,23 @@ def upload_source_submit(
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SYNC_RUNNER_SYNC") == "1":
             outcome = store.ingest_uploaded_docs(conn, record, docs, progress_cb=_on_sync_progress)
             logger.info("admin_upload_ingest_complete", source_id=source_id, name=record.name, status=outcome.status)
+            # The status rides in the message text, so the banner must be
+            # coloured by it too: "uploaded widget: failed" in green is a
+            # message that contradicts itself.
             return RedirectResponse(
-                url=f"/admin/sources/{source_id}?msg=uploaded+{record.name}:+{outcome.status}",
+                url=(
+                    f"/admin/sources/{source_id}?msg=uploaded+{record.name}:+{outcome.status}"
+                    f"{_level_suffix(outcome.status)}"
+                ),
                 status_code=303,
                 headers={"HX-Trigger": "syncStatusUpdated"},
             )
 
-        handed_off = True
+        # Set only after `run_sync_task` returns — the spawned thread owns
+        # the lock from that point on, but a raising `Thread.start()` would
+        # leave it ours, and the `finally` below must still release it.
         run_sync_task(_bg_ingest_upload, record, docs, lambda: conn, source_id)
+        handed_off = True
         return RedirectResponse(
             url=f"/admin/sources/{source_id}?msg=upload_started+{record.name}",
             status_code=303,

@@ -5,6 +5,17 @@
 <div class="card">
   <h2>{% if record %}Edit {{ record.name }}{% else %}Add a source{% endif %}</h2>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  {# Redirect-carried ?msg= banner — same markup/class as index.html's, so an
+     operator redirected here (upload outcomes, create-then-upload outcomes)
+     sees the result instead of a normal-looking page. Independent of `error`:
+     if both are set, the error renders first. Autoescaped like every other
+     expression here — `message` can contain parser-controlled text.
+     `message_level` colours it by severity: 'warning' adds the amber
+     .message-warning modifier, anything else keeps the green success style.
+     It is whitelisted server-side in `_message_level` (only the literal
+     'warning' survives), so no URL-supplied string can reach this class
+     attribute. #}
+  {% if message %}<div class="message{% if message_level == 'warning' %} message-warning{% endif %}">{{ message }}</div>{% endif %}
 
   {% if not record %}
   <style>
@@ -15,14 +26,24 @@
        No JS: hidden .crawl-only fields are "barred from constraint
        validation" per the HTML spec (any element with display:none in its
        ancestor chain is exempt from `required`), so hiding base_url here
-       does not block submitting the Uploaded-files form. */
+       does not block submitting the Uploaded-files form.
+       .upload-only is the exact inverse: hidden by default (Crawled URL is
+       the checked default) and revealed only while the Uploaded-files radio
+       is checked. Its file input is deliberately not `required`, so the same
+       barred-from-validation rule is a non-issue in either direction. */
     #source-form:has(input[name="source_type"][value="upload"]:checked) .crawl-only {
       display: none;
+    }
+    #source-form .upload-only {
+      display: none;
+    }
+    #source-form:has(input[name="source_type"][value="upload"]:checked) .upload-only {
+      display: block;
     }
   </style>
   {% endif %}
 
-  <form id="source-form" method="post" action="{% if record %}/admin/sources/{{ record.id }}{% else %}/admin/sources/new{% endif %}">
+  <form id="source-form" method="post" action="{% if record %}/admin/sources/{{ record.id }}{% else %}/admin/sources/new{% endif %}"{% if not record %} enctype="multipart/form-data"{% endif %}>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
     {% if not record %}
@@ -39,6 +60,15 @@
       <p class="hint">Crawled URL indexes a live documentation site. Uploaded files lets you push
         Markdown/HTML/PDF/zip content directly instead of crawling. Cannot be changed after the
         source is created.</p>
+    </div>
+
+    <div class="form-group upload-only">
+      <label for="create-upload-files" style="margin-top: 0;">Files (optional)</label>
+      <input type="file" id="create-upload-files" name="files" multiple accept=".md,.markdown,.txt,.html,.htm,.pdf,.zip">
+      <p class="hint">Markdown/text, HTML, PDF, or zip-bundle files are parsed to Markdown, chunks,
+        and embeddings &mdash; raw file bytes are never stored. Leave blank to create an empty source
+        and upload into it later from its edit page. If the form comes back with a validation error
+        you must re-pick the files (browsers cannot repopulate a file input).</p>
     </div>
     {% endif %}
 
