@@ -76,9 +76,15 @@ generated column, `doc_pages.etag`/`last_modified`, and the `doc_sources`
 first init) and `db/init/02_sources_config.sql` (idempotent `ALTER TABLE ...
 ADD COLUMN IF NOT EXISTS` statements plus a guarded `DO` block, for
 `scripts/migrate.sh` to apply against an existing live database without a
-volume wipe). `.github/workflows/test.yml` now applies both SQL files when
-building the CI database, so CI exercises the same live-migration path as
-production.
+volume wipe).
+
+> **Status update:** CI's test database (`db-test`) applies all `db/init/*.sql`
+> files together via `docker-entrypoint-initdb.d` on a fresh volume — this
+> exercises the fresh-volume path only. The hand-applied live-migration path
+> (`scripts/migrate.sh` running `02_sources_config.sql` over an existing
+> `01_schema.sql`-only database) is not covered by CI; see
+> `docs/runbook.md`'s "REQUIRED — apply the `doc_sources` config migration"
+> section for the current, honest coverage statement.
 
 ## Rationale
 

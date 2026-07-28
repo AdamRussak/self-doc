@@ -7,46 +7,48 @@ in the repo root with a populated `.env` (see `.env.example`).
 
 ## KNOWN ISSUE — a fresh install with default `.env` values is broken (read this first)
 
-**Affects new deployments only.** If you are standing up a **fresh** instance
-(empty Postgres volume) and accept the shipped defaults, sync will fail on
-every insert. **The existing production deployment is unaffected** — its
-`doc_chunks.embedding` column is already `vector(384)` and its `.env` already
-sets `EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` / `EMBEDDING_DIM=384`;
-verified live.
+**Affects new deployments only, and only when `.env` is missing or
+incomplete.** If you are standing up a **fresh** instance (empty Postgres
+volume) via `docker compose up`/`make up` without a populated `.env`, sync
+will fail on every insert. **The existing production deployment is
+unaffected** — its `doc_chunks.embedding` column is already `vector(384)` and
+its `.env` already sets `EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` /
+`EMBEDDING_DIM=384`; verified live.
 
-`config/models.yaml` (the model registry, single source of truth) was
-switched to default `BAAI/bge-small-en-v1.5` (384-dim), and
-`db/init/01_schema.sql` was regenerated so `doc_chunks.embedding` is
-`vector(384)`. Three other places that should have moved with that change
-were not updated and still default to the old
+`config/models.yaml` (the model registry, single source of truth) defaults to
+`BAAI/bge-small-en-v1.5` (384-dim), `db/init/01_schema.sql` creates
+`doc_chunks.embedding vector(384)` to match, and `ingestion/app/embedder.py`,
+`mcp-server/app/retrieval.py`, and `ingestion/app/chunker.py`'s `DEFAULT_*`/
+`TOKENIZER_MODEL_ID` fallback constants all default to the same
+`BAAI/bge-small-en-v1.5` / 384-dim — every code-level fallback is aligned
+with the registry.
+
+**One place was intentionally left unaligned: `docker-compose.yml`'s own
+shell-level env-var defaults**, which still fall back to the old
 `mixedbread-ai/mxbai-embed-large-v1` (1024-dim):
 
-- `docker-compose.yml` — `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` env defaults
-  (`${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}` /
-  `${EMBEDDING_DIM:-1024}`)
-- `ingestion/app/embedder.py` — `DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`
-  fallback constants
-- `mcp-server/app/retrieval.py` — `DEFAULT_MODEL_NAME` fallback constant
+- `EMBEDDING_MODEL_NAME` build arg/env default —
+  `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
+- `EMBEDDING_DIM` env default — `${EMBEDDING_DIM:-1024}`
 
-`.env.example` also shipped with `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`
-commented out, so it never overrode the stale defaults above. Net effect: a
-plain `cp .env.example .env && make up` against an **empty volume** creates a
-`vector(384)` column via `db/init/01_schema.sql`, then every service embeds at
-1024-dim anyway — every `doc_chunks` insert fails at sync time. This is a
-distinct, more severe problem than the "two known-red tests" mentioned
-elsewhere in this repo's test output; see below for why those two tests exist
-and what they mean.
+These only take effect when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset —
+i.e. there is no `.env` file at all, or it exists but doesn't set them. A
+normal `cp .env.example .env && make up` is **not** affected: `.env.example`
+ships with both lines already uncommented at the correct values (see below),
+so copying it verbatim means Compose never falls back to the stale
+`docker-compose.yml` defaults. Net effect: only `docker compose up` run with
+**no `.env` at all** (or a hand-trimmed one missing these two vars) against an
+**empty volume** creates a `vector(384)` column via `db/init/01_schema.sql`
+and then embeds at 1024-dim — every `doc_chunks` insert fails at sync time.
 
-**Workaround — set this in `.env` before your first `make up`:**
+**Workaround — always start from `.env.example`, and set this in `.env`
+before your first `make up` if you skip it:**
 
 ```bash
 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
 EMBEDDING_DIM=384
 ```
 
-`.env.example` now ships with these two lines already uncommented at these
-values, so copying it verbatim is sufficient — just don't hand-edit them back
-to something inconsistent with `db/init/01_schema.sql`'s `vector(N)` width.
 **This must be done before the first `docker compose up`**: `db/init/*.sql`
 scripts run only against an empty Postgres data directory (see "REQUIRED"
 section immediately below for the general rule). If you already brought the
@@ -68,25 +70,7 @@ reconfiguring an **existing** 1024-dim deployment down to 384-dim, do **not**
 assume `03_fix_embedding_dim.sql` will handle the column width — it will not.
 Follow the general [Switch the embedding model](#switch-the-embedding-model)
 procedure below (which does cover a dimension change, via nuke-and-rebuild or
-`make reindex`), and note that section's own "default" claim is part of this
-same known issue (see the callout inside it).
-
-**The two failing tests are expected, and are a symptom of this exact
-inconsistency, not cosmetic drift:**
-- `mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
-- `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`
-
-Both assert that the `DEFAULT_*` fallback constants in `embedder.py`/
-`retrieval.py` equal `config/models.yaml`'s registry default row — an
-unconfigured checkout fails both, because those constants still say
-mxbai/1024. `make test` reports green regardless, but only because its `test`
-target hardcodes `EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5`
-as env vars for every test suite it runs, overriding the broken fallback
-constants for the duration of the test run — this masks the inconsistency
-rather than resolving it. These two tests will go green (with no test change
-needed) once `docker-compose.yml`'s defaults and the two services'
-`DEFAULT_*` constants are aligned to the registry default; that alignment is
-tracked as follow-up work and is intentionally not part of this change.
+`make reindex`).
 
 ---
 
@@ -162,10 +146,20 @@ set -a; source .env; set +a
 `self-docs-db` container with `02_sources_config.sql`. It is **idempotent**
 (every statement is `ADD COLUMN IF NOT EXISTS` or a guarded `DO` block for
 the `CHECK` constraint / the `fts` redefinition above) — safe to re-run at
-any time, including by accident. `.github/workflows/test.yml` applies both
-`01_schema.sql` and `02_sources_config.sql` when building the CI database, so
-CI exercises the same live-migration path documented here, not just the
-fresh-volume path.
+any time, including by accident.
+
+**CI does not exercise this hand-applied path.** CI no longer provisions its
+own Postgres — `make test` (via its `test-db-up` prerequisite) is the sole
+Postgres provisioner in every workflow, and its `db-test` container applies
+all four `db/init/*.sql` files (`01_schema.sql`, `02_sources_config.sql`,
+`03_fix_embedding_dim.sql`, `04_upload_sources.sql`) together, in order, via
+`docker-entrypoint-initdb.d` against a fresh volume on every run. That
+exercises the **fresh-volume path only**: applying `02_sources_config.sql` by
+hand (`./scripts/migrate.sh`) over an **existing** database that only has
+`01_schema.sql` applied — i.e. the live-migration path this section
+documents — is not covered by any automated test. Treat it as a manual,
+unverified-by-CI procedure and be extra careful running it against a
+non-trivial live corpus (see the `fts` column rewrite cost callout below).
 
 **Status: this migration has already been applied to this deployment's live
 database.** Nobody needs to (and nobody should assume they still need to) run
@@ -840,24 +834,22 @@ with `\dx` (pgvector extension) and `\dt` (three tables) via
 
 The embedding model is selected from a registry (`config/models.yaml`, the
 single source of truth). Selecting a model auto-derives its vector dimension and
-the two services' Docker memory limits. The default is
-`mixedbread-ai/mxbai-embed-large-v1` (1024-dim).
+the two services' Docker memory limits. The registry default is
+`BAAI/bge-small-en-v1.5` (384-dim), matched by the committed
+`db/init/01_schema.sql` (`vector(384)`) and by both services' `DEFAULT_*`
+fallback constants (`embedder.DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`,
+`retrieval.DEFAULT_MODEL_NAME`).
 
 > [!WARNING]
-> That "default" statement describes the two services' current *code*
-> fallback constants (`embedder.DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`,
-> `retrieval.DEFAULT_MODEL_NAME`) and `docker-compose.yml`'s env defaults —
-> it does **not** match `config/models.yaml`'s actual registry default, which
-> is `BAAI/bge-small-en-v1.5` (384-dim), nor the committed
-> `db/init/01_schema.sql`, which is already `vector(384)`. This is the exact
-> inconsistency described in [Known issue — a fresh install with default
-> `.env` values is broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
-> at the top of this runbook — read that section before relying on "the
-> default" anywhere in this one. Until the code constants above are aligned to
-> the registry, treat `BAAI/bge-small-en-v1.5` / 384-dim as the actual
-> intended default for a fresh install, and explicitly set
-> `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` in `.env` rather than relying on
-> unset-env fallbacks.
+> `docker-compose.yml`'s own env-var fallbacks are the one place that was
+> **not** aligned to the registry default — they still fall back to
+> `mixedbread-ai/mxbai-embed-large-v1` (1024-dim) when
+> `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in `.env`. See [Known
+> issue — a fresh install with default `.env` values is
+> broken](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+> at the top of this runbook. Always set `EMBEDDING_MODEL_NAME`/
+> `EMBEDDING_DIM` explicitly in `.env` (which `.env.example` already does)
+> rather than relying on unset-env fallbacks.
 
 To see the options:
 
@@ -1000,17 +992,18 @@ review finding M1. `docker-compose.test.yml` does not touch or extend the
 `make test` brings `db-test` up automatically (`test-db-up` target, waited
 until its healthcheck reports `healthy`) before running any suite, and pins
 `EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5` for every
-test invocation — matching the deployed default in `config/models.yaml` and
-the `vector(384)` column in `db/init/01_schema.sql`. Without this, DB-backed
-tests fail on `expected 384 dimensions, not 1024` because
-`ingestion/app/embedder.py`'s hardcoded fallback constants
-(`DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`) still default to the 1024-dim
-`mxbai` model — a known, deliberately-untouched mismatch (see
-`test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
-and its ingestion-side twin in `tests/test_model_registry.py`, both
-intentionally left red). Do not "fix" this by editing
-`mcp-server/app/retrieval.py` or `config/models.yaml` — the Makefile
-env-pinning is the correct workaround, not those fallback constants.
+test invocation — matching the deployed default in `config/models.yaml`, the
+`vector(384)` column in `db/init/01_schema.sql`, and (as of this change) the
+`DEFAULT_*` fallback constants in `ingestion/app/embedder.py` and
+`mcp-server/app/retrieval.py`, which now also default to
+`BAAI/bge-small-en-v1.5`/384-dim. The pinning is now redundant with those
+fallbacks rather than a workaround for them — kept as explicit belt-and-
+suspenders insurance against `.env`/`docker-compose.yml` drift (see the
+[Known issue](#known-issue--a-fresh-install-with-default-env-values-is-broken)
+above) rather than a mask for a code-level mismatch. Both parity tests now
+pass by default on an unconfigured checkout:
+`mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
+and `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`.
 
 **Useful targets:**
 

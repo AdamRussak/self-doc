@@ -5,78 +5,32 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  # Literal `release-` prefix, not `${{ github.workflow }}` — inside a
+  # called (reusable) workflow, `github.workflow` resolves to the CALLER's
+  # name, so if this used that expression its group string here
+  # ("Release Containers to GHCR-refs/heads/main") would be byte-identical
+  # to the group `verify` inherits when it calls test.yml, causing GitHub
+  # to cancel one of the two and leaving `needs: [verify]` unsatisfied
+  # downstream. A literal prefix guarantees this group never collides with
+  # anything test.yml (which declares no concurrency of its own) resolves to.
+  group: release-${{ github.ref }}
+  # NOT cancel-in-progress here (unlike pr.yml): this workflow pushes git
+  # tags (bump-version) and multi-arch container images (build-and-push). A
+  # cancelled mid-push run could leave a tag published without matching
+  # images, or a partially-pushed image manifest. A superseded run is left
+  # to finish rather than risk that inconsistent state; a new push to main
+  # simply queues behind it.
+  cancel-in-progress: false
+
 jobs:
+  # Runs the same lint + typecheck + test suite as test.yml, via a reusable
+  # workflow call, instead of duplicating it here. The duplicate copy used
+  # to drift from test.yml (it still had the now-removed `services: db:`
+  # block/port-5433 race after test.yml's sibling task fixed it) — reusing
+  # the single definition makes that class of drift impossible.
   verify:
-    runs-on: ubuntu-latest
-    services:
-      db:
-        image: pgvector/pgvector:0.8.2-pg16
-        env:
-          POSTGRES_USER: self_docs
-          POSTGRES_PASSWORD: testpass123
-          POSTGRES_DB: self_docs
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U self_docs -d self_docs"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          --health-start-period 20s
-
-    env:
-      POSTGRES_USER: self_docs
-      POSTGRES_PASSWORD: testpass123
-      POSTGRES_DB: self_docs
-      POSTGRES_HOST: 127.0.0.1
-      POSTGRES_PORT: "5433"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-
-      - name: Lint (ruff)
-        run: make lint
-
-      - name: Type-check (mypy)
-        run: make typecheck
-
-      - name: Wait for Postgres
-        run: |
-          for i in $(seq 1 30); do
-            pg_isready -h 127.0.0.1 -p 5433 -U self_docs && break
-            sleep 1
-          done
-
-      - name: Configure embedding model (small/fast for CI)
-        run: |
-          python -m pip install --quiet pyyaml
-          make configure MODEL=BAAI/bge-small-en-v1.5
-
-      - name: Pre-download embedding model weights for CI
-        run: |
-          python -m pip install --quiet fastembed
-          python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
-
-      - name: Init database schema
-        run: |
-          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
-            -f db/init/01_schema.sql
-          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
-            -f db/init/02_sources_config.sql
-
-      - name: Run tests
-        run: make test
+    uses: ./.github/workflows/test.yml
 
   bump-version:
     needs: [verify]

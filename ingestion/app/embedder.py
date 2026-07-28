@@ -4,9 +4,9 @@ The embedding model, its dimension, and the per-model PASSAGE prompt are all
 env-driven (set by `make configure` from config/models.yaml), defaulting to the
 registry default so a fresh checkout / CI works with no configuration:
 
-    EMBEDDING_MODEL_NAME  default mixedbread-ai/mxbai-embed-large-v1
-    EMBEDDING_DIM         default 1024
-    EMBEDDING_PASSAGE_PROMPT  default "" (mxbai wants no passage prefix)
+    EMBEDDING_MODEL_NAME  default BAAI/bge-small-en-v1.5
+    EMBEDDING_DIM         default 384
+    EMBEDDING_PASSAGE_PROMPT  default "" (bge wants no passage prefix)
 
 Asymmetric retrieval: many models want an instruction/prefix that DIFFERS
 between documents and queries. FastEmbed's `passage_embed`/`query_embed` do NOT
@@ -29,8 +29,8 @@ from .logging_config import get_logger
 
 # Fallbacks used when EMBEDDING_* env is unset. These MUST equal the registry
 # default row in config/models.yaml — tests/test_model_registry.py enforces it.
-DEFAULT_MODEL_NAME = "mixedbread-ai/mxbai-embed-large-v1"
-DEFAULT_EMBEDDING_DIM = 1024
+DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+DEFAULT_EMBEDDING_DIM = 384
 DEFAULT_PASSAGE_PROMPT = ""
 
 MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", DEFAULT_MODEL_NAME)
@@ -45,16 +45,19 @@ PASSAGE_PROMPT = os.environ.get("EMBEDDING_PASSAGE_PROMPT", DEFAULT_PASSAGE_PROM
 # docker-compose ORT_NUM_THREADS env var silently ineffective (it isn't a real
 # ORT env var; only SessionOptions set in code has any effect). Default of 4
 # matches the docker-compose value. 4 is a measured tradeoff, not a guess:
-# benchmarked on mxbai-large over 80 x ~300-word chunks at batch_size 8,
-# throughput was 1.37 chunks/s unbounded, 0.95 at threads=4 (1.44x slower),
-# and 0.59 at threads=2 (2.3x slower). Against a ~3.5h full-sync baseline
-# that is roughly 5.0h at 4 and 8.1h at 2 — do not lower this without
+# benchmarked on mxbai-large (the heaviest supported model, so this sizing is a
+# safe upper bound for lighter models too) over 80 x ~300-word chunks at
+# batch_size 8, throughput was 1.37 chunks/s unbounded, 0.95 at threads=4
+# (1.44x slower), and 0.59 at threads=2 (2.3x slower). Against a ~3.5h full-sync
+# baseline that is roughly 5.0h at 4 and 8.1h at 2 — do not lower this without
 # re-benchmarking.
 DEFAULT_ORT_THREADS = 4
 ORT_NUM_THREADS = int(os.environ.get("ORT_NUM_THREADS", str(DEFAULT_ORT_THREADS)))
-# Batch size for ONNX inference. mxbai-large (1024-dim) allocates substantial ONNX
-# workspace memory per chunk; batch_size=8 keeps peak RAM usage safely under 1.5GB
-# during multi-chunk page embedding, preventing cgroup OOM kills on 2GB limits.
+# Batch size for ONNX inference. mxbai-large (1024-dim, the heaviest supported
+# model) allocates substantial ONNX workspace memory per chunk; batch_size=8
+# keeps peak RAM usage safely under 1.5GB during multi-chunk page embedding,
+# preventing cgroup OOM kills on 2GB limits — a safe upper bound for lighter
+# models too.
 BATCH_SIZE = 8
 
 logger = get_logger(component="embedder")

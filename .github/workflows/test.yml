@@ -1,10 +1,17 @@
 name: Test
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+
+# No concurrency block here on purpose. Inside a called (reusable) workflow,
+# `${{ github.workflow }}` resolves to the CALLER's workflow name, not this
+# file's — so a group keyed on it would collide with the caller's own
+# concurrency group (e.g. release.yml's `release-${{ github.ref }}` if this
+# used the same pattern) and GitHub would cancel one of the two runs
+# sharing that group, breaking `needs: [verify]` gating downstream. Entry
+# points (pr.yml, release.yml) own concurrency; this reusable workflow must
+# not declare its own. See:
+# https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations
 
 jobs:
   lint:
@@ -23,29 +30,15 @@ jobs:
   test:
     runs-on: ubuntu-latest  # or: self-hosted
 
-    services:
-      db:
-        image: pgvector/pgvector:0.8.2-pg16
-        env:
-          POSTGRES_USER: self_docs
-          POSTGRES_PASSWORD: testpass123
-          POSTGRES_DB: self_docs
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U self_docs -d self_docs"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-          --health-start-period 20s
-
-    env:
-      POSTGRES_USER: self_docs
-      POSTGRES_PASSWORD: testpass123
-      POSTGRES_DB: self_docs
-      POSTGRES_HOST: 127.0.0.1
-      POSTGRES_PORT: "5433"
-
+    # No `services: db:` block here. `make test` (via its `test-db-up`
+    # dependency) is the sole Postgres provisioner in CI: it brings up the
+    # isolated `db-test` compose service bound to 127.0.0.1:5433, waits for
+    # it to report healthy, and lets Postgres apply ALL of db/init/*.sql
+    # (01_schema, 02_sources_config, 03_fix_embedding_dim,
+    # 04_upload_sources) via the container's docker-entrypoint-initdb.d
+    # mount — strictly more faithful than hand-applying two of those files
+    # here. A second provisioner binding the same host port races this one
+    # and fails with "address already in use"; don't reintroduce one.
     steps:
       - uses: actions/checkout@v4
 
@@ -59,13 +52,6 @@ jobs:
         with:
           go-version: "1.22"
 
-      - name: Wait for Postgres
-        run: |
-          for i in $(seq 1 30); do
-            pg_isready -h 127.0.0.1 -p 5433 -U self_docs && break
-            sleep 1
-          done
-
       - name: Configure embedding model (small/fast for CI)
         run: |
           # Use the small 384-dim model in CI so the suite doesn't download the
@@ -73,6 +59,8 @@ jobs:
           # exercises `make configure`: it writes EMBEDDING_* into .env (which
           # the Makefile exports to the test venvs) and re-renders 01_schema.sql
           # to vector(384) so the seeded test vectors match the column width.
+          # Must run before `make test` — db-test reads 01_schema.sql at
+          # first boot via docker-entrypoint-initdb.d.
           python -m pip install --quiet pyyaml
           make configure MODEL=BAAI/bge-small-en-v1.5
 
@@ -80,17 +68,6 @@ jobs:
         run: |
           python -m pip install --quiet fastembed
           python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
-
-      - name: Init database schema
-        run: |
-          # Apply both init files, matching scripts/migrate.sh's production
-          # flow: 01_schema.sql creates the base tables, 02_sources_config.sql
-          # adds the extended doc_sources columns (including llms_txt/
-          # llms_etag/llms_last_modified) that the DB-dependent tests rely on.
-          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
-            -f db/init/01_schema.sql
-          PGPASSWORD=testpass123 psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5433 -U self_docs -d self_docs \
-            -f db/init/02_sources_config.sql
 
       - name: Run tests
         run: make test

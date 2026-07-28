@@ -34,7 +34,7 @@ OVERLAP_RATIO = 0.15
 # that will actually embed the text (mismatched tokenizers can push a chunk
 # past the model's context and silently truncate). Env-driven, same default as
 # the embedder (config/models.yaml registry default).
-TOKENIZER_MODEL_ID = os.environ.get("EMBEDDING_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
+TOKENIZER_MODEL_ID = os.environ.get("EMBEDDING_MODEL_NAME", "BAAI/bge-small-en-v1.5")
 
 logger = get_logger(component="chunker")
 

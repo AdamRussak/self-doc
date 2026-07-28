@@ -28,25 +28,28 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 > [!WARNING]
 > **If you are doing a first install, read this before `make up`.** This does
 > **not** affect the existing production deployment (its `doc_chunks.embedding`
-> column and `.env` are already on `BAAI/bge-small-en-v1.5` / 384-dim) — it
-> only affects **new deployments that accept the shipped defaults**.
+> column and `.env` are already on `BAAI/bge-small-en-v1.5` / 384-dim), and it
+> does **not** affect a normal `cp .env.example .env && make up` — it only
+> affects `docker compose up` run with **no `.env` at all** (or a hand-trimmed
+> one missing `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`).
 >
-> `config/models.yaml`'s registry default was switched to
-> `BAAI/bge-small-en-v1.5` (384-dim) and `db/init/01_schema.sql` was
-> regenerated to create `doc_chunks.embedding vector(384)`. But three other
-> places that should have moved with it were not updated, and still default to
-> the old `mixedbread-ai/mxbai-embed-large-v1` (1024-dim):
-> - `docker-compose.yml` (`EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` env defaults)
-> - `ingestion/app/embedder.py` (`DEFAULT_MODEL_NAME`/`DEFAULT_EMBEDDING_DIM`)
-> - `mcp-server/app/retrieval.py` (`DEFAULT_MODEL_NAME`)
+> `config/models.yaml`'s registry default is `BAAI/bge-small-en-v1.5`
+> (384-dim), matched by `db/init/01_schema.sql` (`doc_chunks.embedding
+> vector(384)`) and by `ingestion/app/embedder.py`, `mcp-server/app/retrieval.py`,
+> and `ingestion/app/chunker.py`'s fallback constants — every code-level
+> default is aligned. The one place still **not** aligned is
+> `docker-compose.yml`'s own shell-level env-var fallbacks:
+> - `EMBEDDING_MODEL_NAME` — `${EMBEDDING_MODEL_NAME:-mixedbread-ai/mxbai-embed-large-v1}`
+> - `EMBEDDING_DIM` — `${EMBEDDING_DIM:-1024}`
 >
-> and `.env.example` shipped with `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`
-> commented out. The result: `cp .env.example .env && make up` on an **empty
-> volume** creates a `vector(384)` column, then the services embed at
-> 1024-dim — every `doc_chunks` insert fails at sync time.
+> These only kick in when `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM` are unset in
+> `.env`. The result, only if you skip `.env.example`: an **empty volume**
+> creates a `vector(384)` column, then the services embed at 1024-dim —
+> every `doc_chunks` insert fails at sync time.
 >
-> **Workaround — do this before your first `make up`:** set the following in
-> `.env` (this is now also the value `.env.example` ships with):
+> **Workaround — always start from `.env.example`:** it already ships with
+> both lines uncommented at the correct values, so copying it verbatim (the
+> Quickstart below) avoids this entirely. If you hand-edit `.env`, keep these:
 > ```bash
 > EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
 > EMBEDDING_DIM=384
@@ -63,19 +66,6 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
 > unrelated `doc_sources` URL/sitemap fixups). Do not attempt to reconfigure an
 > existing 1024-dim deployment to 384-dim without a manual re-embed plan; see
 > [Runbook → switch the embedding model](docs/runbook.md#switch-the-embedding-model).
->
-> **The two failing tests you may notice are expected, not cosmetic:**
-> `mcp-server/tests/test_registry_defaults.py::test_retrieval_defaults_match_registry_default`
-> and
-> `tests/test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default`
-> fail on an unconfigured checkout because they assert the `DEFAULT_*`
-> constants above match `config/models.yaml`'s registry default — they are
-> the automated symptom of this exact inconsistency. `make test` only shows
-> green because it hardcodes `EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5`
-> for every suite it runs, which masks the problem rather than fixing it. They
-> will go green once `docker-compose.yml`, `embedder.DEFAULT_MODEL_NAME`/
-> `DEFAULT_EMBEDDING_DIM`, and `retrieval.DEFAULT_MODEL_NAME` are aligned to
-> the registry default — tracked as follow-up work, not done in this change.
 
 ---
 
@@ -103,7 +93,9 @@ API — and exposes hybrid semantic search as MCP tools over streamable HTTP.
   GPU/torch); documentation never leaves your network. The model is selectable
   from a registry (`config/models.yaml`) — `make configure` derives the vector
   dimension and container memory limits from your choice. Default:
-  `BAAI/bge-small-en-v1.5` (384-dim). *(Note: See the Known issue above for code-level fallbacks).*
+  `BAAI/bge-small-en-v1.5` (384-dim). *(Note: See the Known issue above —
+  `docker-compose.yml`'s own env-var fallback can still drift from this if
+  `.env` is missing).*
 - **Hybrid retrieval.** Vector similarity + per-source-language Postgres
   full-text search over `pgvector`, so exact terms and semantic matches both
   surface.

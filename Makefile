@@ -135,6 +135,24 @@ test-db-up:
 		echo "Stale self-docs-db-test container from another worktree ($$owner) detected — removing it so this worktree can start its own."; \
 		docker rm -f self-docs-db-test >/dev/null 2>&1 || true; \
 	fi
+	@# Preflight: after the stale-container cleanup above, any self-docs-db-test
+	@# container still around is guaranteed to be OURS (this worktree's). If
+	@# TEST_POSTGRES_PORT is already bound by that container, this is just a
+	@# normal back-to-back re-run — `docker compose up` below will happily
+	@# reuse it, so stay quiet. If the port is bound by anything else, fail
+	@# fast here with an actionable message instead of letting `docker compose
+	@# up` surface dockerd's opaque "failed to bind host port ... address
+	@# already in use" networking error. Uses a portable bash /dev/tcp probe
+	@# (explicit `bash -c`, since `make` recipes run under /bin/sh by default
+	@# and this feature is bash-only) rather than lsof/ss/nc, whose
+	@# availability and flags differ between macOS (dev) and the minimal
+	@# ubuntu-latest CI image.
+	@our_port="$$(docker port self-docs-db-test 5432/tcp 2>/dev/null | tail -n1 | sed -n 's/.*:\([0-9]\{1,5\}\)$$/\1/p')"; \
+	if [ "$$our_port" != "$(TEST_POSTGRES_PORT)" ] && bash -c 'exec 3<>/dev/tcp/127.0.0.1/$(TEST_POSTGRES_PORT)' 2>/dev/null; then \
+		echo "port $(TEST_POSTGRES_PORT) is already in use by another process, and it is not this project's db-test container." >&2; \
+		echo "Free it, or rerun with a different port:  make test TEST_POSTGRES_PORT=<port>" >&2; \
+		exit 1; \
+	fi
 	docker compose -f docker-compose.yml -f docker-compose.test.yml up -d db-test
 	@echo "Waiting for db-test to become healthy..."
 	@for i in $$(seq 1 30); do \
@@ -168,15 +186,11 @@ test-db-reset:
 # vector(384)) so DB-backed tests don't fail on the stale 1024-dim mxbai
 # fallback constants baked into the app code.
 #
-# Two tests are KNOWN-RED and left that way on purpose (user-approved,
-# out of scope to fix here — the mxbai-vs-registry embedding-default
-# mismatch): mcp-server/tests/test_registry_defaults.py::
-# test_retrieval_defaults_match_registry_default and tests/
-# test_model_registry.py::test_ingestion_embedder_defaults_match_registry_default.
-# Every suite below therefore runs to completion regardless of earlier
-# failures (`|| SUITE_FAIL=1`, no suite short-circuits the next), and the
-# target still exits non-zero overall so a real regression can't hide behind
-# the two expected failures.
+# Every suite below runs to completion regardless of earlier failures
+# (`|| SUITE_FAIL=1`, no suite short-circuits the next) so a single run
+# surfaces every failing suite instead of stopping at the first one. The
+# target still exits non-zero if ANY suite failed — a non-zero exit here
+# means a real regression, full stop.
 test: test-db-up
 	@SUITE_FAIL=0; \
 	echo "=== doc-cli Go test suite ==="; \
@@ -198,10 +212,9 @@ test: test-db-up
 	echo "=== e2e (cross-package) test suite ==="; \
 	(cd tests && POSTGRES_HOST=$(TEST_POSTGRES_HOST) POSTGRES_PORT=$(TEST_POSTGRES_PORT) POSTGRES_USER=$(TEST_POSTGRES_USER) POSTGRES_PASSWORD=$(TEST_POSTGRES_PASSWORD) POSTGRES_DB=$(TEST_POSTGRES_DB) EMBEDDING_DIM=384 EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 ../ingestion/.venv/bin/python -m pytest -q) || SUITE_FAIL=1; \
 	if [ "$$SUITE_FAIL" -ne 0 ]; then \
-		echo "make test: FAILURES present (expected: the 2 documented known-red"; \
-		echo "registry-default-mismatch tests — see the comment above this target;"; \
-		echo "anything else here is a real regression). DB-backed tests ran against"; \
-		echo "the isolated db-test service on $(TEST_POSTGRES_HOST):$(TEST_POSTGRES_PORT)"; \
+		echo "make test: FAILURES present — see the suite output above for which"; \
+		echo "suite(s) failed; a non-zero exit here means a real regression. DB-backed"; \
+		echo "tests ran against the isolated db-test service on $(TEST_POSTGRES_HOST):$(TEST_POSTGRES_PORT)"; \
 		echo "(own container, own pgdata_test volume) — the production db/pgdata"; \
 		echo "volume was never touched."; \
 		exit 1; \

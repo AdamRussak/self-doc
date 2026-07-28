@@ -4,6 +4,16 @@
 **Date:** 2026-07-21
 **Decision makers:** Project owner + architect
 
+> **Status update (post-2026-07-26):** the "default moves to
+> `mixedbread-ai/mxbai-embed-large-v1`" decision below was subsequently
+> reverted — `config/models.yaml`'s `default:` row is now back to
+> `BAAI/bge-small-en-v1.5` (384-dim), matching the committed
+> `db/init/01_schema.sql` (`vector(384)`) and both services' `DEFAULT_*`
+> fallback constants. This ADR is left as-written below as the historical
+> record of the original decision and its rationale; it does not describe
+> the current default. See `docs/runbook.md`'s "Known issue" section for the
+> current state.
+
 ## Context
 
 [ADR-001](001-custom-pipeline-over-off-the-shelf.md) fixed the embedding model at

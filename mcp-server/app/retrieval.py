@@ -46,7 +46,7 @@ logger = structlog.get_logger(__name__)
 # services MUST run the same model for the vectors to be comparable.
 # Fallbacks used when EMBEDDING_* env is unset. These MUST equal the registry
 # default row in config/models.yaml — the parity tests enforce it.
-DEFAULT_MODEL_NAME = "mixedbread-ai/mxbai-embed-large-v1"
+DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DEFAULT_QUERY_PROMPT = "Represent this sentence for searching relevant passages: "
 # PASSAGE_PROMPT is the mcp-server-side counterpart of ingestion/app/embedder.py's
 # EMBEDDING_PASSAGE_PROMPT, used only by upload_text (T11) to embed
@@ -228,6 +228,31 @@ def search(query: str, source: str | None = None, limit: int = 5) -> str:
         pool = get_pool()
         with pool.connection() as conn:
             with conn.cursor() as cur:
+                # `vector_candidates` orders by the HNSW index and only THEN
+                # joins/filters by `source` (see HYBRID_SEARCH_SQL's module
+                # docstring). A plain HNSW index scan for that ORDER BY
+                # explores only `hnsw.ef_search` (default 40) globally
+                # nearest candidates and applies the source filter as a
+                # post-scan Join Filter — it has no way to push the filter
+                # into the graph traversal. Once `doc_chunks` holds any
+                # nontrivial, semantically-diverse row count, a source's own
+                # matching rows can easily fall outside that fixed top-40
+                # window, so the join filter silently discards them and the
+                # arm returns fewer rows than actually exist for that source
+                # — in the worst case zero, even though a search unscoped by
+                # source (or a plain seq scan) would find them immediately.
+                # `hnsw.iterative_scan = strict_order` (pgvector >= 0.8) is
+                # the index's own fix for exactly this "filtered ANN search"
+                # gap: it keeps expanding the graph search, re-checking the
+                # filter as it goes, until either LIMIT is satisfied or
+                # `hnsw.max_scan_tuples` is hit, instead of stopping dead at
+                # ef_search. `strict_order` (not `relaxed_order`) keeps the
+                # scan's distance ordering exact, which vector_arm's
+                # `row_number() OVER (ORDER BY distance)` — and therefore the
+                # RRF rank fusion downstream — depends on. `SET LOCAL` scopes
+                # this to the current transaction only, so it never leaks
+                # onto a pooled connection's next, unrelated query.
+                cur.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
                 cur.execute(
                     HYBRID_SEARCH_SQL,
                     {
