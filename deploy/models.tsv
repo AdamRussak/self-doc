@@ -1,0 +1,4 @@
+bge-small-en-v1.5|BAAI/bge-small-en-v1.5|384|1500m|1g|Represent this sentence for searching relevant passages: ||true
+mxbai-embed-large-v1|mixedbread-ai/mxbai-embed-large-v1|1024|3g|2g|Represent this sentence for searching relevant passages: ||false
+multilingual-e5-large|intfloat/multilingual-e5-large|1024|3g|2g|query: |passage: |false
+bge-base-en-v1.5|BAAI/bge-base-en-v1.5|768|1500m|1g|Represent this sentence for searching relevant passages: ||false

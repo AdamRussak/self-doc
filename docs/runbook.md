@@ -200,6 +200,17 @@ trusting this list):
 > mode. This is the same failure mode as the fresh-install bug described
 > above, just triggered by a mismatched pulled tag instead of an unset `.env`.
 
+> [!WARNING]
+> **`v0.0.1`, `v0.0.2`, and any other `0.0.x` tag in GHCR predate the
+> per-model image matrix — do not use them.** They were built before
+> `ARG EMBEDDING_MODEL_NAME` existed as a per-tag axis, are all baked with
+> `mixedbread-ai/mxbai-embed-large-v1` (1024-dim) regardless of what a caller
+> might expect, and carry **no** `io.self-docs.*` labels (verified). Pairing
+> one of them with, say, the registry-default 384-dim schema is exactly the
+> dimension mismatch described above. `deploy/install.sh`'s label-verify step
+> fails closed against these (no labels → `die_runtime`, exit `1`), but the
+> right move is simpler: only use tags from **`v0.1.0` or later**.
+
 **Recipe — pin a non-default model's pre-built image:**
 
 ```bash
@@ -249,6 +260,93 @@ other's cache), not something meant to be pulled and run.
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
 ```
 A GitHub Personal Access Token (PAT) with `read:packages` scope is required when pulling private GHCR packages.
+
+### Operating an installer-created deployment
+
+This section is about deployments created by `deploy/install.sh` (the
+"Quickstart — Pre-Built Images" installer path — see
+[README](../README.md#quickstart--pre-built-images-no-clone) and
+[`deploy/README.md`](../deploy/README.md)), not the from-source
+`make up`/`make configure` flow the rest of this doc otherwise assumes. It is
+its own directory tree, independent of any clone of this repository.
+
+**Where things live.** Everything the installer wrote is under the
+`--dir` you gave it (`./self-docs` by default):
+
+- `<install-dir>/.env` — mode `0600`, generated secrets (`SYNC_TOKEN`,
+  `MCP_TOKEN`, `POSTGRES_PASSWORD`) plus the resolved
+  `SELF_DOCS_IMAGE_TAG`/`EMBEDDING_MODEL_NAME`/`EMBEDDING_DIM`/prompts/memory
+  limits for the model you picked.
+- `<install-dir>/docker-compose.yml` — the kit's compose file, copied in as-is.
+- `<install-dir>/db/init/{01_schema.sql,02_sources_config.sql,03_fix_embedding_dim.sql,04_upload_sources.sql}` —
+  `01_schema.sql` was rendered for your model's dimension at install time;
+  the other three are copied unmodified. Postgres only re-applies these on
+  an **empty** volume, so editing them after first boot has no effect
+  without a re-init (see nuke-and-rebuild below).
+
+Run every command below from inside `<install-dir>` (or add `-f
+<install-dir>/docker-compose.yml` / `--env-file` flags if you'd rather not
+`cd`).
+
+**Upgrading within the same model.** If you're staying on the same
+`--model`/slug, a newer build of that slug's images is a plain pull-and-recreate —
+safe because `EMBEDDING_DIM` (and the schema's `vector(N)`) don't change:
+
+```bash
+cd <install-dir>
+docker compose pull
+docker compose up -d
+```
+
+This is only safe because `SELF_DOCS_IMAGE_TAG` in `.env` still names the
+same model slug (moving `<slug>` tag, or a newer `--version` of the same
+`<slug>`). It is **not** safe to hand-edit `.env`'s `SELF_DOCS_IMAGE_TAG` to a
+*different* model's slug and then `pull`/`up` — see the next paragraph.
+
+**Switching models is not a tag swap.** Changing `EMBEDDING_MODEL_NAME`
+changes both the vectors and (usually) the `vector(N)` column width. There is
+no in-place migration: you have to re-render `db/init/01_schema.sql` for the
+new dimension, drop and recreate the `db` volume, and re-sync the whole
+corpus. The mechanics are identical to the from-source flow —
+[Re-index from scratch (nuke-and-rebuild)](#re-index-from-scratch-nuke-and-rebuild) —
+just run its `docker compose` commands from `<install-dir>` instead of a repo
+clone. The simplest correct path in practice is to install a second time into
+a fresh `--dir` with the new `--model`, rather than mutating an existing
+install's `.env` by hand.
+
+**Uninstalling.** `docker compose down -v` (run from `<install-dir>`) stops
+the containers and **destroys the `pgdata` volume — every indexed chunk and
+every uploaded document is gone**, exactly like the nuke-and-rebuild path
+above. It does not touch `<install-dir>` itself (`.env`, `docker-compose.yml`,
+`db/init/`, or any GHCR images already pulled to the host) — remove those
+yourself if you want a completely clean uninstall.
+
+**`--force` re-install over a surviving volume reuses the Postgres
+password — on purpose.** A plain `docker compose down` (no `-v`) leaves
+`pgdata` intact, and Postgres only ever applies `POSTGRES_PASSWORD` while
+initializing an **empty** volume. So `install.sh --force` detects whether the
+install's `pgdata` volume still exists and, if so, **preserves** the
+existing `POSTGRES_PASSWORD` in the rewritten `.env` instead of generating a
+new one that the surviving volume wouldn't accept; a confirmed-gone volume
+(e.g. after `down -v`) still gets a fresh password, same as a first install.
+`SYNC_TOKEN`/`MCP_TOKEN` are **not** volume-coupled and are always
+regenerated on `--force` — update any MCP client's bearer token from the
+rewritten `.env` afterward. See
+[`deploy/README.md`'s `--force` row](../deploy/README.md#flag-reference) for
+the full detection mechanics.
+
+**What this kit deliberately does not include.** `deploy/docker-compose.yml`
+ships only `db` + `ingestion` + `mcp-server`, all loopback-only
+(`127.0.0.1:<port>`), and nothing else:
+
+- No `renderer` service — it has no published image (source-build only). If
+  you need JS-rendered crawling, that requires a from-source checkout; see
+  [Headless-render retry (T7)](#headless-render-retry-t7).
+- No Traefik/reverse-proxy overlay — host-specific TLS/hostname wiring
+  doesn't belong in a from-scratch kit. For LAN-wide access, see
+  [README → Quickstart — Production](../README.md#quickstart--production-home-lab--traefik)
+  and layer that overlay on top once this stack is confirmed healthy on
+  loopback.
 
 ---
 

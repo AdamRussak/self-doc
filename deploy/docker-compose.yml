@@ -1,0 +1,218 @@
+# Standalone deployment kit for self-docs, built entirely from pre-built
+# GHCR images — NOT an overlay. Unlike the repo-root docker-compose.yml (which
+# builds ingestion/mcp-server from local source and gates them behind a
+# "full" profile so `docker compose up` with no flags starts nothing), this
+# file is meant to run in an empty directory containing only itself, a `.env`,
+# and a `db/init/` folder, with no clone of this repository present. That
+# means: no build directives (there is no source tree to build from) and no
+# profile gating (an operator running a bare `docker compose up -d` here must
+# get the full stack, not silence).
+#
+# Renderer and Traefik are deliberately excluded from this file:
+#   - `renderer` has no published image (source-build only), so it cannot
+#     be run from a tag alone.
+#   - Traefik routing is a host-specific choice (hostnames, TLS resolver,
+#     existing proxy network) that doesn't belong in a from-scratch kit; wire
+#     it up separately once this stack is confirmed healthy on loopback.
+#
+# Variable contract (exactly these, see deploy/.env.example for defaults):
+#   SELF_DOCS_OWNER, SELF_DOCS_IMAGE_TAG,
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+#   SYNC_TOKEN, MCP_TOKEN,
+#   EMBEDDING_MODEL_NAME, EMBEDDING_DIM,
+#   EMBEDDING_QUERY_PROMPT, EMBEDDING_PASSAGE_PROMPT,
+#   INGESTION_MEM_LIMIT, MCP_MEM_LIMIT,
+#   SELF_DOCS_API_PORT, SELF_DOCS_MCP_PORT,
+#   TZ
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.2-pg16 # pinned — CVE-2026-3172 fix (parallel HNSW buffer overflow), do NOT float to :pg16
+    # Deliberately no fixed container name key here. Docker container names
+    # are global on the host, not scoped to a compose project. A fixed name
+    # would collide with the repo-root docker-compose.yml's own fixed name
+    # for this service on the same host (e.g. a maintainer's laptop, or
+    # anyone who cloned the repo before switching to this image-based kit),
+    # and would block running two of these kits side by side (one per
+    # embedding model — see deploy/models.tsv). Leaving it unset lets Compose
+    # derive a project-scoped name (`<project>-db-1`) from the install
+    # directory, or from COMPOSE_PROJECT_NAME / `docker compose -p <name>` if
+    # you want more than one install coexisting under explicit names.
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # The operator must render db/init/01_schema.sql (vector(N) column)
+      # themselves before first boot — N must equal EMBEDDING_DIM below, or
+      # inserts from ingestion will fail with a dimension mismatch. See
+      # deploy/models.tsv for the model -> dimension mapping.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  ingestion:
+    # No build directive here — this kit only ever runs published images.
+    # One tag drives BOTH services because they must agree on the embedding
+    # model:
+    # a mismatch would produce vectors of the wrong dimension (rejected by
+    # the vector(N) column) or, worse, dimension-matching-but-semantically
+    # incompatible vectors from two different models. Never pin this to
+    # `latest` — `latest` tracks the registry's current default model, which
+    # can move to a different model/dimension in a future release; an
+    # existing deployment that floats on `latest` would then silently start
+    # writing vectors the wrong shape for its own database. Pin to a model
+    # slug tag (e.g. `bge-small-en-v1.5`) and change it deliberately.
+    image: ghcr.io/${SELF_DOCS_OWNER}/self-docs-ingestion:${SELF_DOCS_IMAGE_TAG}
+    # Deliberately no fixed container name key here either — see the `db`
+    # service's comment above. This stays project-scoped so this kit can
+    # coexist with a from-source checkout and with other per-model installs
+    # on the same host.
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      SYNC_TOKEN: ${SYNC_TOKEN}
+      # Declares where this deployment is ACTUALLY reachable, for the
+      # boot-time placeholder-token check in ingestion/app/security.py (the
+      # process cannot work this out for itself — uvicorn always binds
+      # 0.0.0.0:8080 inside the container). This kit publishes ONLY
+      # 127.0.0.1:${SELF_DOCS_API_PORT} below and has no reverse-proxy
+      # overlay, so loopback is the true, complete answer — same shape as
+      # the upstream repo's base docker-compose.yml. If you later add your
+      # own reverse proxy or LAN exposure in front of this stack, you MUST
+      # add that address here too, or the security check will keep warning
+      # instead of refusing a leaked placeholder SYNC_TOKEN.
+      SELF_DOCS_LISTENERS: 127.0.0.1:${SELF_DOCS_API_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      OMP_NUM_THREADS: 1
+      ORT_NUM_THREADS: 4
+      # Must match the image tag's baked-in model (see deploy/models.tsv) AND
+      # the vector(N) dimension the operator rendered into
+      # db/init/01_schema.sql. There is no build step here to cross-check
+      # this against, so getting these two values right is on the operator.
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      EMBEDDING_PASSAGE_PROMPT: "${EMBEDDING_PASSAGE_PROMPT}"
+    ports:
+      # Loopback-only, deliberately: this kit ships with no reverse proxy and
+      # no TLS, so publishing to 0.0.0.0 would put a destructive admin API
+      # (crawl trigger, purge, doc_sources CRUD) directly on the LAN/WAN.
+      # Front it with your own reverse proxy on this same host if remote
+      # access is needed, and update SELF_DOCS_LISTENERS above to match.
+      - "127.0.0.1:${SELF_DOCS_API_PORT}:8080"
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          # No `make configure` in this kit to auto-fill this per model —
+          # set it yourself to match the model behind SELF_DOCS_IMAGE_TAG
+          # (see deploy/models.tsv for the recommended per-model values).
+          memory: ${INGESTION_MEM_LIMIT}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Long grace period: the container loads an ONNX embedding model at
+      # boot (see "loading_embedding_model" log line) before /health can
+      # respond; a shorter start_period would flap the container mid-startup.
+      start_period: 120s
+
+  mcp-server:
+    # No build directive — same published-image-only rule as ingestion
+    # above, and the same tag (${SELF_DOCS_IMAGE_TAG}) so both services run
+    # the identical model. See the ingestion service's comment for why
+    # `latest` is never used here.
+    image: ghcr.io/${SELF_DOCS_OWNER}/self-docs-mcp-server:${SELF_DOCS_IMAGE_TAG}
+    # Deliberately no fixed container name key here either — see the `db`
+    # service's comment above.
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      # Unlike ingestion, this service declares no listener-exposure variable
+      # — and there genuinely is no equivalent knob to set. mcp-server is a
+      # separate codebase (mcp-server/app/server.py) that never imports
+      # ingestion/app/security.py, so the SELF_DOCS_LISTENERS mechanism (and
+      # its warn-on-loopback / refuse-on-exposure escalation) is
+      # ingestion-only; there is no parallel warn/refuse ladder here to
+      # arm. What this service actually enforces, at import time, before any
+      # socket binds: `MCP_TOKEN` must be a non-empty string or the process
+      # exits non-zero (server.py's own hard fail-fast) — but that check is
+      # presence-only, NOT a placeholder-value check, so setting
+      # MCP_TOKEN to something like "mcp-token" or "changeme" boots
+      # successfully and serves that value as a real bearer credential.
+      # Today that's contained by the loopback-only port binding below. If
+      # you later expose this service (Traefik, another reverse proxy, or by
+      # rebinding its port), there is no variable here that will make the
+      # boot-time check escalate — you must independently confirm MCP_TOKEN
+      # is a real, non-guessable secret before doing so, and add
+      # authentication/rate-limiting at the proxy layer (see
+      # docker-compose.prod.yml's Traefik ratelimit middleware in the
+      # upstream repo) since this container will not refuse to boot on a
+      # weak token on its own.
+      MCP_TOKEN: ${MCP_TOKEN}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      OMP_NUM_THREADS: 1
+      ORT_NUM_THREADS: 4
+      # Must match the ingestion service's model — see the note there. Query
+      # embeddings and passage embeddings must come from the same model or
+      # similarity search is meaningless.
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME}
+      EMBEDDING_QUERY_PROMPT: "${EMBEDDING_QUERY_PROMPT}"
+    ports:
+      # Loopback-only — same rationale as ingestion's port above.
+      - "127.0.0.1:${SELF_DOCS_MCP_PORT}:8000"
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          memory: ${MCP_MEM_LIMIT}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  # No fixed `name:` override on `default`: like the container names above,
+  # a hardcoded network name is global on the host, not project-scoped, and
+  # would collide with (or silently bridge into) the repo-root
+  # docker-compose.yml's `self-docs-internal` network, or another instance
+  # of this same kit running a different model. Leaving `default` unnamed
+  # lets Compose derive `<project>_default` from the install directory (or
+  # COMPOSE_PROJECT_NAME / `docker compose -p <name>`), so each install gets
+  # its own isolated bridge.
+  default: {}
+
+volumes:
+  pgdata:

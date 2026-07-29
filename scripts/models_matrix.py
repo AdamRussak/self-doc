@@ -24,14 +24,36 @@ literal `all`/an empty string, meaning "every model") — used by the release
 workflow to build the default model on every push while gating the rest
 behind a manual dispatch input, without duplicating this generator's logic.
 
-Usage:
-    python scripts/models_matrix.py [--only <csv>]
+`--format {json,tsv}` (default `json`) selects the output shape. `json` is
+the `.github/workflows/release.yml`-facing contract described above and MUST
+stay byte-for-byte unchanged by anything added after it. `tsv` is a second,
+independent consumer: the `deploy/` install kit's bash installer, which has
+only `docker`/`curl` available (no Python/PyYAML/jq) and so cannot read
+`config/models.yaml` directly. Despite the name it is pipe- (`|`), not tab-,
+delimited — the installer parses it with `while IFS='|' read -r ...`, and
+pipe survives a significant trailing space in a field where tab/space would
+not. One line per model, no header, registry-default row first then
+`config/models.yaml` declaration order (same ordering as the JSON matrix),
+fields in this exact order:
 
-Exit codes: 0 with the JSON array on stdout; 2 with a message on stderr (and
-NOTHING on stdout) if --only names an unknown model, two rows resolve to the
-same slug, two rows' slugs collide via the artifact-download glob (one slug
-is the other plus a '-' prefix, e.g. `foo` and `foo-bar`), or a slug is not a
-valid Docker tag fragment.
+    slug|model|dim|mem_ingestion|mem_mcp|query_prompt|passage_prompt|is_default
+
+`mem_ingestion`/`mem_mcp`/`query_prompt`/`passage_prompt` are copied verbatim
+from the matching `config/models.yaml` row (prompts emitted RAW, including
+any significant trailing space — e.g. bge/mxbai's query_prompt ends in a
+space that the services prepend directly to query text; stripping it would
+silently degrade retrieval). `is_default` is the literal string `true`/`false`.
+
+Usage:
+    python scripts/models_matrix.py [--only <csv>] [--format json|tsv]
+
+Exit codes: 0 with the requested output on stdout; 2 with a message on
+stderr (and NOTHING on stdout) if --only names an unknown model, two rows
+resolve to the same slug, two rows' slugs collide via the artifact-download
+glob (one slug is the other plus a '-' prefix, e.g. `foo` and `foo-bar`), a
+slug is not a valid Docker tag fragment, or (tsv only) an emitted field value
+contains the `|` delimiter or a newline, which would silently corrupt the
+installer's `IFS='|'` parse.
 """
 
 from __future__ import annotations
@@ -180,15 +202,73 @@ def build_matrix(registry: dict[str, Any], only: list[str] | None = None) -> lis
     return rows
 
 
+# TSV (pipe-delimited, see module docstring) field order — deliberately not
+# reusing the JSON matrix row's key order/keys, since the JSON contract must
+# never change and the TSV contract carries extra registry fields the JSON
+# rows do not (mem_ingestion/mem_mcp/query_prompt/passage_prompt).
+TSV_FIELDS = (
+    "slug",
+    "model",
+    "dim",
+    "mem_ingestion",
+    "mem_mcp",
+    "query_prompt",
+    "passage_prompt",
+    "is_default",
+)
+
+
+def build_tsv_rows(registry: dict[str, Any], matrix: list[dict[str, Any]]) -> list[str]:
+    """Render the JSON matrix rows (already ordered: registry-default first,
+    then declaration order) into pipe-delimited TSV lines, pulling the extra
+    per-model registry fields (mem_ingestion/mem_mcp/*_prompt) the JSON rows
+    don't carry. Raises MatrixError if any field value contains the `|`
+    delimiter or a newline — today none do, but a future registry row must
+    fail loudly here rather than silently corrupting the bash installer's
+    `IFS='|' read -r` parse.
+    """
+    models: dict[str, Any] = registry["models"]
+    lines: list[str] = []
+    for row in matrix:
+        model_row = models[row["model"]]
+        values = {
+            "slug": row["slug"],
+            "model": row["model"],
+            "dim": str(row["dim"]),
+            "mem_ingestion": str(model_row["mem_ingestion"]),
+            "mem_mcp": str(model_row["mem_mcp"]),
+            "query_prompt": model_row["query_prompt"],
+            "passage_prompt": model_row["passage_prompt"],
+            "is_default": "true" if row["is_default"] else "false",
+        }
+        for field in TSV_FIELDS:
+            value = values[field]
+            if "|" in value or "\n" in value:
+                raise MatrixError(
+                    f"model {row['model']!r} field {field!r} contains a "
+                    f"forbidden character ('|' or newline) that would corrupt "
+                    f"the pipe-delimited deploy/models.tsv parse: {value!r}"
+                )
+        lines.append("|".join(values[field] for field in TSV_FIELDS))
+    return lines
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="models_matrix.py",
-        description="Print the per-model container-image build matrix as one line of JSON.",
+        description="Print the per-model container-image build matrix as JSON or pipe-delimited TSV.",
     )
     parser.add_argument(
         "--only",
         default=None,
         help="Comma-separated full model names to include, or 'all'/empty for every model.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json", "tsv"),
+        default="json",
+        help="Output format: 'json' (default, .github/workflows/release.yml's contract, "
+        "byte-stable) or 'tsv' (pipe-delimited, for the deploy/ install kit).",
     )
     return parser.parse_args(argv)
 
@@ -199,10 +279,16 @@ def main(argv: list[str]) -> int:
     only = parse_only(args.only)
     try:
         matrix = build_matrix(registry, only)
+        if args.format == "tsv":
+            tsv_lines = build_tsv_rows(registry, matrix)
     except MatrixError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    print(json.dumps(matrix))
+    if args.format == "tsv":
+        for line in tsv_lines:
+            print(line)
+    else:
+        print(json.dumps(matrix))
     return 0
 
 
