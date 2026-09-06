@@ -16,6 +16,9 @@ Routes (see module docstring sections below for detail):
     POST /admin/sources/{id}/upload    upload files (source_type='upload' only)
     POST /admin/sources/{id}/approve   pending -> active
     POST /admin/sources/{id}/reject    pending -> rejected
+    GET  /admin/quarantine             review queue for flagged (injection-suspected) pages
+    POST /admin/quarantine/{id}/allow  index immediately (human judged it a false positive)
+    POST /admin/quarantine/{id}/purge  tombstone (drop the retained content, keep the decision)
     GET  /admin/login                  login form (unauthenticated)
     POST /admin/login                  exchange SYNC_TOKEN for a session cookie
 
@@ -301,6 +304,7 @@ _sync_status: dict[str, Any] = {
     "pages_failed": 0,
     "shell_suspected_count": 0,
     "pages_js_rendered": 0,
+    "injection_blocked": 0,
     "last_url": "",
     "last_completed_summary": None,
 }
@@ -323,6 +327,7 @@ def _on_sync_progress(outcome: Any, current_url: str) -> None:
     _sync_status["pages_failed"] = _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed")
     _sync_status["shell_suspected_count"] = _safe_int(outcome, "shell_suspected_count")
     _sync_status["pages_js_rendered"] = _safe_int(outcome, "pages_js_rendered")
+    _sync_status["injection_blocked"] = _safe_int(outcome, "injection_blocked")
     _sync_status["last_url"] = str(current_url)
     _sync_status["message"] = f"Syncing {getattr(outcome, 'name', '')} ({_sync_status['pages_fetched']} indexed, {_sync_status['pages_skipped']} skipped)..."
 
@@ -352,6 +357,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     outcome: store.SourceOutcome | None = None
     exc_message: str | None = None
@@ -386,6 +392,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
                     "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                     "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                     "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                    "injection_blocked": _safe_int(outcome, "injection_blocked"),
                     "error": _safe_str(outcome, "error"),
                     "finished_at": time.time(),
                 }
@@ -399,6 +406,7 @@ def _bg_sync_single(cfg: SourceConfig, conn_factory: Callable[[], Any], source_i
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Sync failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -427,6 +435,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     outcome: store.SourceOutcome | None = None
     exc_message: str | None = None
@@ -461,6 +470,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
                     "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                     "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                     "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                    "injection_blocked": _safe_int(outcome, "injection_blocked"),
                     "error": _safe_str(outcome, "error"),
                     "finished_at": time.time(),
                 }
@@ -474,6 +484,7 @@ def _bg_ingest_upload(record: SourceRecord, docs: list[UploadedDoc], conn_factor
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Upload ingestion failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -507,6 +518,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
     _sync_status["pages_failed"] = 0
     _sync_status["shell_suspected_count"] = 0
     _sync_status["pages_js_rendered"] = 0
+    _sync_status["injection_blocked"] = 0
     _sync_status["last_url"] = ""
     results: dict[str, store.SourceOutcome] | None = None
     exc_message: str | None = None
@@ -540,6 +552,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                 total_failed = sum(_safe_int(o, "pages_failed") + _safe_int(o, "pages_soft_failed") for o in results.values())
                 total_shell_suspected = sum(_safe_int(o, "shell_suspected_count") for o in results.values())
                 total_js_rendered = sum(_safe_int(o, "pages_js_rendered") for o in results.values())
+                total_injection_blocked = sum(_safe_int(o, "injection_blocked") for o in results.values())
                 any_failed = any(_safe_str(o, "status") == "failed" for o in results.values())
                 errors = [_safe_str(o, "error") for o in results.values() if _safe_str(o, "error")]
                 _sync_status["last_completed_summary"] = {
@@ -551,6 +564,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                     "pages_failed": total_failed,
                     "shell_suspected_count": total_shell_suspected,
                     "pages_js_rendered": total_js_rendered,
+                    "injection_blocked": total_injection_blocked,
                     "error": "; ".join(errors) if errors else None,
                     "finished_at": time.time(),
                 }
@@ -564,6 +578,7 @@ def _bg_sync_all(sources: list[SourceRecord], conn_factory: Callable[[], Any]) -
                     "pages_failed": _sync_status.get("pages_failed", 0) + 1,
                     "shell_suspected_count": _sync_status.get("shell_suspected_count", 0),
                     "pages_js_rendered": _sync_status.get("pages_js_rendered", 0),
+                    "injection_blocked": _sync_status.get("injection_blocked", 0),
                     "error": exc_message or _sync_status.get("message", "Full sync failed unexpectedly"),
                     "finished_at": time.time(),
                 }
@@ -623,6 +638,7 @@ def _build_source_config(
     rate_limit_rps: str,
     llms_txt: str = "auto",
     js_render: bool = False,
+    injection_auto_purge: bool = False,
     source_type: str = "crawl",
     taken: Collection[str] | None = None,
 ) -> tuple[SourceConfig | None, str | None]:
@@ -688,6 +704,7 @@ def _build_source_config(
             rate_limit_rps=rate_limit_rps_value,
             llms_txt=(llms_txt.strip() or "auto"),
             js_render=js_render,
+            injection_auto_purge=injection_auto_purge,
         )
         return cfg, None
     except ValidationError as e:
@@ -727,6 +744,7 @@ def _record_to_config(record: SourceRecord) -> SourceConfig:
         rate_limit_rps=record.rate_limit_rps if (record.rate_limit_rps is not None and record.rate_limit_rps > 0) else 1.0,
         llms_txt=record.llms_txt or "auto",
         js_render=record.js_render,
+        injection_auto_purge=record.injection_auto_purge,
     )
 
 
@@ -765,6 +783,24 @@ def _message_level(request: Request) -> str | None:
 # all — both are outcomes an operator has to act on, so neither may render in a
 # green success banner.
 _SUCCESS_SYNC_STATUSES = frozenset({"ok"})
+
+# `doc_quarantine.state` reaches a badge CSS class in quarantine.html — the
+# same whitelist-not-sanitizer pattern as `_message_level` above, for the
+# same reason (autoescaping blocks injection; an unvalidated value could
+# still name an arbitrary class in the stylesheet). An unrecognised state
+# renders as the warning style, never the success style, mirroring
+# `_level_suffix`'s "unknown -> warn, never green" rule.
+_ALLOWED_QUARANTINE_STATES = ("quarantined", "allowed", "purged")
+
+
+def _quarantine_badge_class(state: str) -> str:
+    if state == "allowed":
+        return "badge-success"
+    if state == "purged":
+        return "badge-error"
+    if state in _ALLOWED_QUARANTINE_STATES:
+        return "badge-warning"
+    return "badge-warning"  # unrecognised state — never render as success
 
 
 def _level_suffix(status: str) -> str:
@@ -854,6 +890,7 @@ def list_sources_view(request: Request, _auth=Depends(require_session), conn=Dep
     active = sources_repo.list_sources(conn, status="active")
     pending = sources_repo.list_sources(conn, status="pending")
     rejected = sources_repo.list_sources(conn, status="rejected")
+    quarantine_pending_count = store.count_quarantine_pending(conn)
     return templates.TemplateResponse(
         request,
         "admin/index.html",
@@ -862,6 +899,7 @@ def list_sources_view(request: Request, _auth=Depends(require_session), conn=Dep
             "active": active,
             "pending": pending,
             "rejected": rejected,
+            "quarantine_pending_count": quarantine_pending_count,
             "csrf_token": _expected_csrf_token(),
             "message": request.query_params.get("msg"),
             # Same severity contract as `_form_context`, so a `?level=` on an
@@ -900,6 +938,7 @@ def create_source_submit(
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
     js_render: str = Form(default=""),
+    injection_auto_purge: str = Form(default=""),
     # Defaults to "crawl" if missing/empty for backward safety (e.g. a
     # stale cached form or a direct API call) — the create form itself
     # always submits an explicit value via its source-type radio group.
@@ -932,6 +971,7 @@ def create_source_submit(
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
         "js_render": bool(js_render),
+        "injection_auto_purge": bool(injection_auto_purge),
     }
     taken: Collection[str] = set()
     cfg, error = _build_source_config(
@@ -945,6 +985,7 @@ def create_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        injection_auto_purge=bool(injection_auto_purge),
         source_type=source_type,
         taken=taken,
     )
@@ -1109,6 +1150,7 @@ def edit_source_form(source_id: int, request: Request, _auth=Depends(require_ses
         "rate_limit_rps": str(record.rate_limit_rps),
         "llms_txt": record.llms_txt or "auto",
         "js_render": record.js_render,
+        "injection_auto_purge": record.injection_auto_purge,
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
@@ -1128,6 +1170,7 @@ def update_source_submit(
     rate_limit_rps: str = Form(default="1.0"),
     llms_txt: str = Form(default="auto"),
     js_render: str = Form(default=""),
+    injection_auto_purge: str = Form(default=""),
     schedule_cron: str = Form(default=""),
     enabled: str = Form(default=""),
     _auth=Depends(require_csrf),
@@ -1148,6 +1191,7 @@ def update_source_submit(
         "rate_limit_rps": rate_limit_rps,
         "llms_txt": llms_txt,
         "js_render": bool(js_render),
+        "injection_auto_purge": bool(injection_auto_purge),
         "schedule_cron": schedule_cron,
         "enabled": bool(enabled),
     }
@@ -1169,6 +1213,7 @@ def update_source_submit(
         rate_limit_rps=rate_limit_rps,
         llms_txt=llms_txt,
         js_render=bool(js_render),
+        injection_auto_purge=bool(injection_auto_purge),
         source_type=record.source_type,
     )
     if cfg is None:
@@ -1299,6 +1344,7 @@ def sync_source_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         outcome = None
         try:
@@ -1320,6 +1366,7 @@ def sync_source_submit(
                         "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                         "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                         "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                        "injection_blocked": _safe_int(outcome, "injection_blocked"),
                         "error": _safe_str(outcome, "error"),
                         "finished_at": time.time(),
                     }
@@ -1478,6 +1525,7 @@ def refresh_source_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         outcome = None
         try:
@@ -1499,6 +1547,7 @@ def refresh_source_submit(
                         "pages_failed": _safe_int(outcome, "pages_failed") + _safe_int(outcome, "pages_soft_failed"),
                         "shell_suspected_count": _safe_int(outcome, "shell_suspected_count"),
                         "pages_js_rendered": _safe_int(outcome, "pages_js_rendered"),
+                        "injection_blocked": _safe_int(outcome, "injection_blocked"),
                         "error": _safe_str(outcome, "error"),
                         "finished_at": time.time(),
                     }
@@ -1545,6 +1594,7 @@ def _upload_edit_values(record: SourceRecord) -> dict:
         "rate_limit_rps": str(record.rate_limit_rps),
         "llms_txt": record.llms_txt or "auto",
         "js_render": record.js_render,
+        "injection_auto_purge": record.injection_auto_purge,
         "schedule_cron": record.schedule_cron or "",
         "enabled": record.enabled,
     }
@@ -1772,6 +1822,7 @@ def sync_all_submit(
         _sync_status["pages_failed"] = 0
         _sync_status["shell_suspected_count"] = 0
         _sync_status["pages_js_rendered"] = 0
+        _sync_status["injection_blocked"] = 0
         _sync_status["last_url"] = ""
         results: dict[str, store.SourceOutcome] = {}
         try:
@@ -1790,6 +1841,7 @@ def sync_all_submit(
                 total_failed = sum(_safe_int(o, "pages_failed") + _safe_int(o, "pages_soft_failed") for o in results.values())
                 total_shell_suspected = sum(_safe_int(o, "shell_suspected_count") for o in results.values())
                 total_js_rendered = sum(_safe_int(o, "pages_js_rendered") for o in results.values())
+                total_injection_blocked = sum(_safe_int(o, "injection_blocked") for o in results.values())
                 any_failed = any(_safe_str(o, "status") == "failed" for o in results.values())
                 errors = [_safe_str(o, "error") for o in results.values() if _safe_str(o, "error")]
                 _sync_status["last_completed_summary"] = {
@@ -1801,6 +1853,7 @@ def sync_all_submit(
                     "pages_failed": total_failed,
                     "shell_suspected_count": total_shell_suspected,
                     "pages_js_rendered": total_js_rendered,
+                    "injection_blocked": total_injection_blocked,
                     "error": "; ".join(errors) if errors else None,
                     "finished_at": time.time(),
                 }
@@ -1934,3 +1987,127 @@ def reject_source_submit(
     sources_repo.set_status(conn, source_id, "rejected")
     logger.info("admin_source_rejected", source_id=source_id, name=record.name)
     return RedirectResponse(url=f"/admin?msg=rejected+{record.name}", status_code=303)
+
+
+# --- Injection quarantine review queue ---------------------------------------------------------
+#
+# Content flagged by app.injection.scan() never reaches doc_pages/doc_chunks
+# (see store.py's _apply_injection_gate) — it lives in doc_quarantine
+# instead, reviewed here. This is its own page rather than a column on
+# /admin/docs (list_docs_view above) because that view is doc_pages-driven,
+# and quarantined content has no doc_pages row by construction.
+
+
+@router.get("/quarantine", response_class=HTMLResponse)
+def list_quarantine_view(
+    request: Request,
+    source_id: int | None = None,
+    _auth=Depends(require_session),
+    conn=Depends(get_conn),
+):
+    entries = store.list_quarantine(conn, source_id=source_id, state="quarantined", limit=200)
+    sources = sources_repo.list_sources(conn, status="active")
+    return templates.TemplateResponse(
+        request,
+        "admin/quarantine.html",
+        {
+            "request": request,
+            "entries": entries,
+            "sources": sources,
+            "selected_source_id": source_id,
+            "badge_class": _quarantine_badge_class,
+            # Global, unfiltered count — matches list_sources_view's call
+            # (line ~893) exactly. `len(entries)` would have undercounted
+            # past the `limit=200` cap and, worse, changed value depending
+            # on the `source_id` filter currently applied to THIS page's own
+            # list, even though the nav badge is a shared element rendered
+            # identically on every admin page (base.html) — a per-source
+            # count doesn't belong on a page-independent badge.
+            "quarantine_pending_count": store.count_quarantine_pending(conn),
+            "csrf_token": _expected_csrf_token(),
+            "message": request.query_params.get("msg"),
+            "message_level": _message_level(request),
+        },
+    )
+
+
+@router.post("/quarantine/{quarantine_id}/allow", response_class=HTMLResponse)
+def allow_quarantine_submit(
+    quarantine_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    """Index the flagged page's content IMMEDIATELY (see
+    `store.index_quarantined_page`'s docstring for why this doesn't wait for
+    the next scheduled sync). Takes the same sync lock every crawl/purge
+    route uses — this closes the race where a running sync's preloaded
+    `injection_decisions` map would otherwise go stale relative to a
+    just-clicked Allow."""
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="quarantine entry not found")
+
+    acquired = try_acquire_sync_lock()
+    if not acquired:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {
+                "request": request,
+                "heading": "Sync already running",
+                "message": "a sync is currently in progress; try Allow again shortly.",
+            },
+            status_code=409,
+        )
+    try:
+        # "admin": this codebase's admin auth is a single shared session
+        # (SYNC_TOKEN login, no per-user identity — see require_session),
+        # so "admin" is the most specific truthful attribution available;
+        # it still distinguishes a human-reviewed decision from NULL
+        # (auto-purge, or never decided) in the audit column.
+        store.index_quarantined_page(conn, quarantine_id, decided_by="admin")
+        if hasattr(conn, "commit"):
+            conn.commit()
+    except ValueError as e:
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {"request": request, "heading": "Allow failed", "message": str(e)},
+            status_code=400,
+        )
+    except Exception as e:  # noqa: BLE001 - never 500 an admin action; report and keep the lock clean
+        logger.error("admin_quarantine_allow_failed", quarantine_id=quarantine_id, error=str(e))
+        return templates.TemplateResponse(
+            request,
+            "admin/message.html",
+            {"request": request, "heading": "Allow failed", "message": f"failed to index: {e}"},
+            status_code=500,
+        )
+    finally:
+        release_sync_lock()
+
+    logger.info("admin_quarantine_allowed", quarantine_id=quarantine_id, url=entry.url)
+    return RedirectResponse(url="/admin/quarantine?msg=allowed", status_code=303, headers={"HX-Trigger": "syncStatusUpdated"})
+
+
+@router.post("/quarantine/{quarantine_id}/purge", response_class=HTMLResponse)
+def purge_quarantine_submit(
+    quarantine_id: int,
+    request: Request,
+    _auth=Depends(require_csrf),
+    conn=Depends(get_conn),
+):
+    entry = store.get_quarantine_entry(conn, quarantine_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="quarantine entry not found")
+
+    # "admin": see allow_quarantine_submit's identical comment above.
+    store.set_injection_decision(conn, quarantine_id, "purged", decided_by="admin")
+    if hasattr(conn, "commit"):
+        conn.commit()
+    logger.info("admin_quarantine_purged", quarantine_id=quarantine_id, url=entry.url)
+    # No &level=warning: a deliberate, successful admin action (the operator
+    # chose to purge) renders as plain success, matching how
+    # reject_source_submit above treats its own deliberate-negative outcome.
+    return RedirectResponse(url="/admin/quarantine?msg=purged", status_code=303)

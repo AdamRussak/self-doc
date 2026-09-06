@@ -100,6 +100,16 @@ PAGES_SHELL_SUSPECTED = Counter(
     "some of these may go on to be recovered via the headless renderer (T7), see app/store.py",
     ["source"],
 )
+PAGES_INJECTION_BLOCKED = Counter(
+    "pages_injection_blocked_total",
+    "Pages held out of the index (quarantined or auto-purged) by app.injection's "
+    "prompt-injection scan. Kept OUT of pages_soft_failed_total on purpose — a soft "
+    "failure and an injection block are different operator concerns with different "
+    "remediations (a flaky upstream vs. a page needing admin review), and folding "
+    "the two together would make classify_sync's soft-fail-ratio rule fire for the "
+    "wrong reason. See classify_sync's own injection-block ratio rule instead.",
+    ["source"],
+)
 CHUNKS_INDEXED = Counter("chunks_indexed_total", "Chunks written to doc_chunks", ["source"])
 SYNC_DURATION = Histogram("sync_duration_seconds", "Duration of a full sync run for one source", ["source"])
 SYNC_LAST_SUCCESS = Gauge(
@@ -128,6 +138,7 @@ class _SyncOutcomeLike(Protocol):
     pages_failed: int
     chunks_indexed: int
     shell_suspected_count: int
+    injection_blocked: int
     status: str
 
 
@@ -149,6 +160,7 @@ def record_sync_outcome(source_name: str, outcome: _SyncOutcomeLike, duration_se
     PAGES_SOFT_FAILED.labels(source=source_name).inc(outcome.pages_soft_failed)
     PAGES_FAILED.labels(source=source_name).inc(outcome.pages_failed)
     PAGES_SHELL_SUSPECTED.labels(source=source_name).inc(outcome.shell_suspected_count)
+    PAGES_INJECTION_BLOCKED.labels(source=source_name).inc(outcome.injection_blocked)
     CHUNKS_INDEXED.labels(source=source_name).inc(outcome.chunks_indexed)
     SYNC_DURATION.labels(source=source_name).observe(duration_seconds)
     if outcome.status in ("ok", "partial"):

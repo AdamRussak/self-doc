@@ -597,7 +597,12 @@ def _build_synthetic_checkout(tmp_path: Path, tsv_content: str) -> Path:
         REPO_ROOT / "db" / "init" / "01_schema.sql.template",
         checkout / "db" / "init" / "01_schema.sql.template",
     )
-    for name in ("02_sources_config.sql", "03_fix_embedding_dim.sql", "04_upload_sources.sql"):
+    for name in (
+        "02_sources_config.sql",
+        "03_fix_embedding_dim.sql",
+        "04_upload_sources.sql",
+        "05_injection_quarantine.sql",
+    ):
         (checkout / "db" / "init" / name).write_text("-- stub\n", encoding="utf-8")
     return checkout
 
@@ -802,27 +807,36 @@ def test_install_sh_does_not_execute_awk_injection_from_hostile_dir_name(tmp_pat
 # 13. db/init/*.sql file-mode symmetry (final-review fix).
 #
 # Contract: after rendering, ALL FOUR db/init/*.sql files (01_schema.sql,
-# rendered via awk/shell redirection, and 02-04, fetched via
+# rendered via awk/shell redirection, and 02-05, fetched via
 # mktemp(0600)->mv->chmod) must be mode 0644 so postgres — a non-root,
 # non-installing-user uid on a Linux bind mount — can read every one of
-# them; only .env stays 0600. Asserted on all four explicitly, per the task
-# dispatch notes: the whole bug was that exactly one of the four differed
-# from the other three, so sampling a single file would have missed it.
+# them; only .env stays 0600. Asserted on all five explicitly, per the task
+# dispatch notes: the whole bug was that exactly one of the four (at the
+# time) differed from the other three, so sampling a single file would have
+# missed it — the same reasoning is why 05_injection_quarantine.sql was
+# added here rather than assumed to inherit the fix by association.
 # ---------------------------------------------------------------------------
 
 
-def test_all_four_sql_files_are_mode_0644_and_env_stays_mode_0600(tmp_path):
+def test_all_five_sql_files_are_mode_0644_and_env_stays_mode_0600(tmp_path):
     """EXPECTED RED pre-fix: verified by hand against this worktree's
     current, unpatched install.sh — 01_schema.sql (written by `sed ... >
     file` under the ambient umask) lands at 0644, but 02_sources_config.sql,
-    03_fix_embedding_dim.sql and 04_upload_sources.sql (fetched via
-    mktemp(0600)->mv, which preserves mktemp's 0600) all land at 0600 —
-    unreadable by postgres's uid on a real Linux bind mount."""
+    03_fix_embedding_dim.sql, 04_upload_sources.sql and
+    05_injection_quarantine.sql (fetched via mktemp(0600)->mv, which
+    preserves mktemp's 0600) all land at 0600 — unreadable by postgres's uid
+    on a real Linux bind mount."""
     dest = tmp_path / "sql-mode-check"
     result = _run_install_dry_run(dest, REGISTRY["default"])
     assert result.returncode == 0, result.stderr
 
-    for name in ("01_schema.sql", "02_sources_config.sql", "03_fix_embedding_dim.sql", "04_upload_sources.sql"):
+    for name in (
+        "01_schema.sql",
+        "02_sources_config.sql",
+        "03_fix_embedding_dim.sql",
+        "04_upload_sources.sql",
+        "05_injection_quarantine.sql",
+    ):
         sql_path = dest / "db" / "init" / name
         mode = stat.S_IMODE(sql_path.stat().st_mode)
         assert mode == 0o644, f"{sql_path} has mode {oct(mode)}, expected 0o644"

@@ -502,17 +502,18 @@ generate_secret() {
 
 mkdir -p -- "${DIR}/db/init"
 
-# 02_sources_config.sql, 03_fix_embedding_dim.sql, 04_upload_sources.sql and
-# docker-compose.yml are byte-identical across every model in the manifest —
-# model-independent — so they're safe to fetch/write here, before the
-# --force + surviving-volume decision below. docker-compose.yml specifically
-# MUST already be on disk at this point: detect_pgdata_volume_status() (below)
-# needs it to resolve this directory's Compose project name.
+# 02_sources_config.sql, 03_fix_embedding_dim.sql, 04_upload_sources.sql,
+# 05_injection_quarantine.sql and docker-compose.yml are byte-identical
+# across every model in the manifest — model-independent — so they're safe
+# to fetch/write here, before the --force + surviving-volume decision below.
+# docker-compose.yml specifically MUST already be on disk at this point:
+# detect_pgdata_volume_status() (below) needs it to resolve this directory's
+# Compose project name.
 #
 # 01_schema.sql is the ONE file that varies per model (`vector(N)`), and its
 # render is deliberately placed AFTER that decision block instead of here —
 # see the comment down there for why.
-for f in 02_sources_config.sql 03_fix_embedding_dim.sql 04_upload_sources.sql; do
+for f in 02_sources_config.sql 03_fix_embedding_dim.sql 04_upload_sources.sql 05_injection_quarantine.sql; do
     fetch_file "db/init/${f}" "${DIR}/db/init/${f}"
 done
 
@@ -759,7 +760,7 @@ umask 077
 umask "$OLD_UMASK"
 chmod -- 600 "$ENV_PATH"
 
-echo "${SCRIPT_NAME}: wrote ${DIR}/db/init/{01_schema.sql,02_sources_config.sql,03_fix_embedding_dim.sql,04_upload_sources.sql}"
+echo "${SCRIPT_NAME}: wrote ${DIR}/db/init/{01_schema.sql,02_sources_config.sql,03_fix_embedding_dim.sql,04_upload_sources.sql,05_injection_quarantine.sql}"
 echo "${SCRIPT_NAME}: wrote ${DIR}/docker-compose.yml"
 echo "${SCRIPT_NAME}: wrote ${ENV_PATH} (mode 600) for model '${SEL_MODEL}' (dim ${SEL_DIM}), image tag '${IMAGE_TAG}'"
 

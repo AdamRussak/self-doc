@@ -115,6 +115,9 @@ SOURCE_COLUMNS: tuple[str, ...] = (
     # position. 'crawl' (scheduled by due_sources) or 'upload' (never
     # scheduled — see due_sources' WHERE clause below).
     "source_type",
+    # Per-source opt-in for silent auto-purge of injection-flagged pages —
+    # see config.py's SourceConfig.injection_auto_purge docstring.
+    "injection_auto_purge",
 )
 
 _SELECT_COLUMNS_SQL = ", ".join(SOURCE_COLUMNS)
@@ -153,6 +156,10 @@ class SourceRecord:
     # test_api.py, test_scheduler.py, test_sync_health.py — outside this
     # task's touch-list) keep working unmodified.
     source_type: str = "crawl"
+    # Defaulted to False for the same reason source_type is defaulted above:
+    # pre-existing test call sites across the suite construct a
+    # `SourceRecord` directly and must keep working unmodified.
+    injection_auto_purge: bool = False
 
 
 @dataclass(frozen=True)
@@ -196,6 +203,7 @@ def _row_to_record(row: tuple) -> SourceRecord:
         last_synced,
         last_status,
         source_type,
+        injection_auto_purge,
     ) = row
     return SourceRecord(
         id=id_,
@@ -220,14 +228,15 @@ def _row_to_record(row: tuple) -> SourceRecord:
         # guarantees this is never None even if a row somehow has a NULL/
         # empty value (should be impossible given the DB's NOT NULL DEFAULT).
         source_type=source_type if source_type in ("crawl", "upload") else "crawl",
+        injection_auto_purge=bool(injection_auto_purge),
     )
 
 
 def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
     """`SourceConfig` -> the plain-value tuple shared by every write path:
     `(base_url, sitemap, include_prefixes, exclude_prefixes, max_pages,
-    language, rate_limit_rps, llms_txt, js_render, source_type)`. Pure — no
-    DB, no I/O.
+    language, rate_limit_rps, llms_txt, js_render, source_type,
+    injection_auto_purge)`. Pure — no DB, no I/O.
 
     `name` is deliberately excluded: `create_source` writes it once at
     insert time (a source's `name` is its stable identity, see
@@ -245,6 +254,7 @@ def _cfg_to_write_values(cfg: SourceConfig) -> tuple:
         str(cfg.llms_txt),
         bool(cfg.js_render),
         cfg.source_type,
+        bool(cfg.injection_auto_purge),
     )
 
 
@@ -263,6 +273,7 @@ def _cfg_matches_record(cfg: SourceConfig, record: SourceRecord) -> bool:
         and cfg.llms_txt == record.llms_txt
         and bool(cfg.js_render) == record.js_render
         and cfg.source_type == record.source_type
+        and bool(cfg.injection_auto_purge) == record.injection_auto_purge
     )
 
 
@@ -457,16 +468,18 @@ def create_source(
     if status not in VALID_STATUSES:
         raise ValueError(f"invalid status {status!r}: must be one of {VALID_STATUSES}")
 
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render, source_type = (
-        _cfg_to_write_values(cfg)
-    )
+    (
+        base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language,
+        rate_limit_rps, llms_txt, js_render, source_type, injection_auto_purge,
+    ) = _cfg_to_write_values(cfg)
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO doc_sources
                 (name, base_url, sitemap, include_prefixes, exclude_prefixes,
-                 max_pages, language, rate_limit_rps, llms_txt, js_render, source_type, status, proposed_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 max_pages, language, rate_limit_rps, llms_txt, js_render, source_type,
+                 injection_auto_purge, status, proposed_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -481,6 +494,7 @@ def create_source(
                 llms_txt,
                 js_render,
                 source_type,
+                injection_auto_purge,
                 status,
                 proposed_by,
             ),
@@ -499,16 +513,18 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
     (`name` is immutable via this function; `source_id` is the identity) and
     does not touch `status`/`enabled`/`schedule_cron`/`proposed_by` — use
     `set_status` for status changes. DB-dependent."""
-    base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language, rate_limit_rps, llms_txt, js_render, source_type = (
-        _cfg_to_write_values(cfg)
-    )
+    (
+        base_url, sitemap, include_prefixes, exclude_prefixes, max_pages, language,
+        rate_limit_rps, llms_txt, js_render, source_type, injection_auto_purge,
+    ) = _cfg_to_write_values(cfg)
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE doc_sources
             SET base_url = %s, sitemap = %s, include_prefixes = %s,
                 exclude_prefixes = %s, max_pages = %s, language = %s,
-                rate_limit_rps = %s, llms_txt = %s, js_render = %s, source_type = %s
+                rate_limit_rps = %s, llms_txt = %s, js_render = %s, source_type = %s,
+                injection_auto_purge = %s
             WHERE id = %s
             """,
             (
@@ -522,6 +538,7 @@ def update_source(conn: psycopg.Connection, source_id: int, cfg: SourceConfig) -
                 llms_txt,
                 js_render,
                 source_type,
+                injection_auto_purge,
                 source_id,
             ),
         )

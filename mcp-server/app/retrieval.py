@@ -498,6 +498,15 @@ class ProposedSourceConfig(BaseModel):
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"
     js_render: bool = False
+    # Field-for-field mirror of ingestion/app/config.py's
+    # SourceConfig.injection_auto_purge — kept in sync by the same
+    # drift-guard test. propose_doc_source never sets this to anything but
+    # the False default: an agent-proposed source always starts under human
+    # review at /admin/quarantine, same as it always starts status='pending'
+    # under human review at /admin. PROPOSE_SOURCE_SQL does not write this
+    # column either (mirroring js_render, which it also omits) — the
+    # DEFAULT FALSE column default covers it.
+    injection_auto_purge: bool = False
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod

@@ -10,8 +10,8 @@ Split to match the module's pure/DB-dependent split:
     live Postgres reachable at POSTGRES_* env vars (the compose `db` service
     test overlay on 127.0.0.1:5433) and are skipped automatically otherwise —
     mirroring test_store.py / test_migration.py. They build the T-A2 target
-    schema (01_schema.sql + 02_sources_config.sql) on a throwaway database
-    and never touch the shared `self_docs` database.
+    schema (01_schema.sql + 02_sources_config.sql + 05_injection_quarantine.sql)
+    on a throwaway database and never touch the shared `self_docs` database.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ def _row_from_cfg(
     last_synced: datetime | None = None,
     last_status: str | None = None,
     source_type: str | None = None,
+    injection_auto_purge: bool | None = None,
 ) -> tuple:
     """Build a plain row tuple in SOURCE_COLUMNS order the way a real
     `SELECT ... FROM doc_sources` would return it (psycopg hands back TEXT[]
@@ -94,6 +95,9 @@ def _row_from_cfg(
         "last_synced": last_synced,
         "last_status": last_status,
         "source_type": source_type if source_type is not None else cfg.source_type,
+        "injection_auto_purge": (
+            injection_auto_purge if injection_auto_purge is not None else bool(cfg.injection_auto_purge)
+        ),
     }
     return tuple(values[col] for col in SOURCE_COLUMNS)
 
@@ -161,6 +165,25 @@ def test_cfg_to_write_values_sitemap_none_stays_none() -> None:
     cfg = _make_cfg(sitemap=None)
     _, sitemap, *_ = _cfg_to_write_values(cfg)
     assert sitemap is None
+
+
+def test_injection_auto_purge_defaults_false_and_round_trips() -> None:
+    cfg = _make_cfg()
+    assert cfg.injection_auto_purge is False
+
+    row = _row_from_cfg(cfg, id_=1)
+    record = _row_to_record(row)
+    assert record.injection_auto_purge is False
+
+    *_, injection_auto_purge = _cfg_to_write_values(cfg)
+    assert injection_auto_purge is False
+    assert _cfg_matches_record(cfg, record)
+
+    cfg_on = _make_cfg(injection_auto_purge=True)
+    record_off = _row_to_record(_row_from_cfg(cfg, id_=1))
+    assert not _cfg_matches_record(cfg_on, record_off), (
+        "a differing injection_auto_purge must be treated as a real config change"
+    )
 
 
 # --- Pure: _cfg_matches_record (import idempotency decision) ---------------
@@ -424,12 +447,19 @@ pytestmark_live = pytest.mark.skipif(
 @pytest.fixture()
 def db_conn():
     """A connection to a fresh throwaway database with 01_schema.sql +
-    02_sources_config.sql applied — never touches `self_docs`."""
+    02_sources_config.sql + 05_injection_quarantine.sql applied — never
+    touches `self_docs`. 05_injection_quarantine.sql is what adds
+    `doc_sources.injection_auto_purge` (in SOURCE_COLUMNS since the
+    injection-protection PR); skipping it here would make every DB round-
+    trip test that SELECTs SOURCE_COLUMNS fail with UndefinedColumn."""
     schema_sql = (
         Path(__file__).resolve().parents[2] / "db" / "init" / "01_schema.sql"
     ).read_text()
     migration_sql = (
         Path(__file__).resolve().parents[2] / "db" / "init" / "02_sources_config.sql"
+    ).read_text()
+    quarantine_sql = (
+        Path(__file__).resolve().parents[2] / "db" / "init" / "05_injection_quarantine.sql"
     ).read_text()
 
     admin = _admin_connect()
@@ -449,6 +479,7 @@ def db_conn():
     with conn.cursor() as cur:
         cur.execute(schema_sql)
         cur.execute(migration_sql)
+        cur.execute(quarantine_sql)
 
     try:
         yield conn

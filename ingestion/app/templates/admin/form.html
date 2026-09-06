@@ -141,6 +141,20 @@
               in the logs) are retried — every other page is unaffected. No effect if the renderer isn't running: a retry
               simply fails soft and the page stays skipped, same as before.</p>
           </div>
+
+          <!-- NOT inside .crawl-only: injection scanning runs on both crawl AND
+               upload sources (the third hash site is the upload path), so this
+               toggle must stay visible regardless of source_type. -->
+          <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 1.25rem;">
+            <input type="checkbox" id="injection_auto_purge" name="injection_auto_purge" value="yes" {% if values.injection_auto_purge %}checked{% endif %}>
+            <label for="injection_auto_purge" style="margin: 0; cursor: pointer; font-weight: 500;">
+              Auto-purge pages flagged as suspected prompt injection
+            </label>
+          </div>
+          <p class="hint">Default off: a flagged page is held at <a href="/admin/quarantine">/admin/quarantine</a> for human
+            review (Allow indexes it immediately; Purge discards it permanently). Enabling this silently drops flagged
+            pages instead — no review, no notification. Only enable this for a source you trust yourself to review less
+            carefully than the default human-in-the-loop path.</p>
         </div>
 
         <div class="form-section">

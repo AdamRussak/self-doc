@@ -12,6 +12,7 @@ Schema (per IMPLEMENTATION_PLAN.md §2 `sources.yaml` schema):
         language: english           # optional, default english
         rate_limit_rps: 1.0         # optional, default 1.0
         js_render: false            # optional, default false — see T7 below
+        injection_auto_purge: false # optional, default false — see below
 
 `source_type` (default `'crawl'`): set to `'upload'` for a source whose
 content comes from a document upload (Markdown/text, HTML, PDF, zip bundle)
@@ -40,6 +41,13 @@ that leaves this false (the default) is completely unaffected: no renderer
 call is ever made for it, matching pre-T7 behavior exactly. No extra
 validation needed here — the renderer re-fetches URLs already constrained to
 this same, already-validated `base_url` host.
+
+`injection_auto_purge`: per-source opt-in for silently auto-purging pages
+`app.injection.scan()` flags as a suspected indirect prompt injection,
+instead of holding them for human review at `/admin/quarantine`. See
+`docs/adr/007-quarantine-untrusted-doc-content.md`. No extra validation
+needed here either — read by `store._apply_injection_gate`, acted on
+identically regardless of which config layer set it.
 """
 
 from __future__ import annotations
@@ -145,6 +153,16 @@ class SourceConfig(BaseModel):
     rate_limit_rps: float = Field(default=1.0, gt=0)
     llms_txt: Literal["auto", "off", "only"] = "auto"
     js_render: bool = False
+    # Per-source opt-in for silent auto-purge of injection-flagged pages
+    # (default False): a flagged page is recorded as state='purged' — no
+    # review, no notification — instead of 'quarantined'. A source that
+    # leaves this False (the default) is unaffected: every detection still
+    # queues for human review at /admin/quarantine, matching the confirmed
+    # design (see docs/adr/007-quarantine-untrusted-doc-content.md). This is
+    # the precise meaning of "the source owner pre-granted permission" — set
+    # it only for a source you trust yourself to review less carefully than
+    # the default human-in-the-loop path.
+    injection_auto_purge: bool = False
 
     @field_validator("include_prefixes", "exclude_prefixes", mode="before")
     @classmethod

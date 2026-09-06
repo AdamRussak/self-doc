@@ -59,6 +59,7 @@ from .metrics import (
     CHUNKS_INDEXED,  # noqa: F401
     PAGES_FAILED,  # noqa: F401
     PAGES_FETCHED,  # noqa: F401
+    PAGES_INJECTION_BLOCKED,  # noqa: F401
     PAGES_NOT_MODIFIED,  # noqa: F401
     PAGES_SHELL_SUSPECTED,  # noqa: F401
     PAGES_SKIPPED,  # noqa: F401
@@ -643,6 +644,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                     "pages_soft_failed": 0,
                     "shell_suspected_count": 0,
                     "pages_js_rendered": 0,
+                    "injection_blocked": 0,
                     "pages_removed": 0,
                     "chunks_indexed": 0,
                     "last_status": "failed",
@@ -700,6 +702,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
                 "pages_soft_failed": outcome.pages_soft_failed,
                 "shell_suspected_count": outcome.shell_suspected_count,
                 "pages_js_rendered": outcome.pages_js_rendered,
+                "injection_blocked": outcome.injection_blocked,
                 "pages_removed": outcome.pages_removed,
                 "chunks_indexed": outcome.chunks_indexed,
                 "last_status": outcome.status,
@@ -720,6 +723,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
         total_failed = sum(r.get("pages_failed", 0) + r.get("pages_soft_failed", 0) for r in _state["results"].values())
         total_shell_suspected = sum(r.get("shell_suspected_count", 0) for r in _state["results"].values())
         total_js_rendered = sum(r.get("pages_js_rendered", 0) for r in _state["results"].values())
+        total_injection_blocked = sum(r.get("injection_blocked", 0) for r in _state["results"].values())
         any_failed = any(r.get("last_status") == "failed" for r in _state["results"].values())
         errors = [str(r["error"]) for r in _state["results"].values() if r.get("error")]
         admin._sync_status["last_completed_summary"] = {
@@ -732,6 +736,7 @@ def _run_sync_blocking(names: list[str], sources_by_name: dict[str, SourceRecord
             "pages_failed": total_failed,
             "shell_suspected_count": total_shell_suspected,
             "pages_js_rendered": total_js_rendered,
+            "injection_blocked": total_injection_blocked,
             "error": "; ".join(errors) if errors else None,
             "finished_at": time.time(),
         }

@@ -1,0 +1,93 @@
+{% extends "admin/base.html" %}
+{% block title %}injection quarantine{% endblock %}
+{% block nav_quarantine %}active{% endblock %}
+{% block content %}
+{% if message %}<div class="message{% if message_level == 'warning' %} message-warning{% endif %}">{{ message }}</div>{% endif %}
+<div class="card">
+  <div class="card-header" style="margin-bottom: 0.5rem; border-bottom: 1px solid var(--color-border); padding-bottom: 0.75rem;">
+    <h2>Injection Quarantine</h2>
+    <span class="badge badge-primary">{{ entries|length }} pending review</span>
+  </div>
+  <p class="hint" style="margin-bottom: 1.25rem;">
+    Pages app.injection.scan() flagged as suspected indirect prompt injection. Flagged content is held here — it never
+    reaches doc_pages/doc_chunks — until a human clicks Allow (a false positive: index it now) or Purge (permanently
+    drop the retained content; the decision is kept so this exact content is never re-queued).
+  </p>
+
+  <form method="get" action="/admin/quarantine" class="filter-toolbar">
+    <div>
+      <label for="source_id" style="margin-top: 0; font-size: 0.8rem; color: var(--color-text-muted);">Filter by Source</label>
+      <select id="source_id" name="source_id">
+        <option value="">-- All Active Sources --</option>
+        {% for s in sources %}
+        <option value="{{ s.id }}" {% if selected_source_id and s.id == selected_source_id %}selected{% endif %}>{{ s.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+      <button type="submit" class="btn btn-primary">Filter</button>
+      {% if selected_source_id %}
+      <a href="/admin/quarantine" class="btn">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <table class="table" style="font-family: var(--font-mono); font-size: 0.85rem;">
+    <thead>
+      <tr>
+        <th style="width: 6%;">id</th>
+        <th style="width: 30%;">url</th>
+        <th style="width: 8%;">score</th>
+        <th style="width: 18%;">rules</th>
+        <th style="width: 14%;">detected at</th>
+        <th style="width: 8%;">status</th>
+        <th style="width: 16%;">actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in entries %}
+      <tr>
+        <td style="color: var(--color-text-muted);">#{{ e.id }}</td>
+        <td style="word-break: break-all;">{{ e.url }}</td>
+        <td><span class="badge {{ badge_class(e.state) }}">{{ e.score }}</span></td>
+        <td style="font-size: 0.75rem; color: var(--color-text-muted);">{{ e.rule_ids|join(', ') }}</td>
+        <td style="font-size: 0.8rem; color: var(--color-text-muted);">{{ e.detected_at.strftime('%Y-%m-%d %H:%M:%S UTC') if e.detected_at else '-' }}</td>
+        <td><span class="badge {{ badge_class(e.state) }}">{{ e.state }}</span></td>
+        <td class="actions">
+          <button type="button" class="btn" data-toggle-target="quarantine-evidence-{{ e.id }}">
+            View
+          </button>
+          <form method="post" action="/admin/quarantine/{{ e.id }}/allow" style="display: inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-primary">Allow</button>
+          </form>
+          <form method="post" action="/admin/quarantine/{{ e.id }}/purge" style="display: inline;"
+                data-confirm-delete
+                data-source-name="quarantine entry #{{ e.id }} ({{ e.url }})"
+                data-confirm-extra="This permanently discards the retained content; the decision is kept so it is never re-queued.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-warning">Purge</button>
+          </form>
+        </td>
+      </tr>
+      <tr id="quarantine-evidence-{{ e.id }}" style="display: none;">
+        <td colspan="7">
+          <div style="background: rgba(4, 14, 31, 0.6); border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: 0.75rem 1rem; margin: 0.5rem 0;">
+            <strong style="color: var(--color-primary-tint); font-size: 0.8rem;">Evidence:</strong>
+            <div style="font-size: 0.8rem; color: var(--color-text-muted); margin-bottom: 0.5rem;">{{ e.evidence or '(none)' }}</div>
+            <strong style="color: var(--color-primary-tint); font-size: 0.8rem;">Retained content:</strong>
+            <pre style="white-space: pre-wrap; word-break: break-word; font-size: 0.8rem; max-height: 20rem; overflow-y: auto;">{{ e.markdown or '(no content retained — already purged)' }}</pre>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="7" class="muted" style="text-align: center; padding: 2rem;">
+          Nothing pending review. Flagged pages will appear here after the next sync.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

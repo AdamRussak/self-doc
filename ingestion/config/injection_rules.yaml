@@ -1,0 +1,196 @@
+# Indirect-prompt-injection detection ruleset — SINGLE SOURCE OF TRUTH for
+# what `app.injection.scan()` looks for.
+#
+# WHY THIS FILE EXISTS (not hardcoded in injection.py): this ruleset needs to
+# be updatable independently of an ingestion release, the same way a WAF or
+# antivirus signature set is. Adding a pattern for a newly-discovered evasion
+# is a diff to this file plus a case in `ingestion/tests/test_injection.py` —
+# no change to the scoring engine itself. `ingestion/config/` is already
+# volume-mounted read-only as a DIRECTORY (not a single file — see
+# docker-compose.yml's comment on why) so an operator can edit this file on
+# the host and restart the ingestion container to pick it up, no image
+# rebuild required.
+#
+# EVERY `pattern` MUST BE A SINGLE LINE. A YAML folded block scalar (`>-`)
+# collapses each internal line break into a literal space character — a
+# pattern written across several lines for readability, each line ending in
+# `\s+`, silently becomes `\s+ ` (whitespace-matcher PLUS a literal space),
+# which then requires two whitespace characters where the real text only
+# ever has one, and the rule stops matching anything. This is not
+# hypothetical: it broke every multi-line pattern the first time this file
+# was written, caught only by the module's own smoke test. If a pattern gets
+# hard to read on one line, that's a signal to split it into two rules, not
+# to reach for a multi-line YAML scalar.
+#
+# Scoring model (enforced by app.injection.load_ruleset, not just documented
+# here): each rule scores AT MOST ONCE per page, at whichever of
+# weight_prose/weight_quote/weight_code matches where the hit landed (a
+# fenced code block or blockquote scores lower — see the module docstring in
+# injection.py for why). `max_lexical_weight` is a HARD CEILING enforced at
+# load time: no rule of family != "concealment" may set a weight above it.
+# This is what makes "no page is ever quarantined on a single lexical rule"
+# a structural guarantee rather than a hope — reaching `threshold` lexically
+# requires several independent rules to fire on the same page.
+#
+# `mitigations.doc_vocabulary` is a NEGATIVE weight: pages that discuss
+# prompt injection as a topic (OWASP LLM Top 10, a framework's security page)
+# use this vocabulary densely; a page performing an injection does not
+# discuss itself. Requires `min_distinct` distinct vocabulary terms to fire,
+# so a single incidental word doesn't buy a discount.
+
+threshold: 100
+max_lexical_weight: 45
+
+rules:
+  # --- Family A: instruction override --------------------------------------
+  - id: override_ignore_prior
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 10
+    flags: [IGNORECASE]
+    pattern: '\b(?:ignore|disregard|forget|discard|override|bypass)\s+(?:all\s+|any\s+|the\s+|your\s+|every\s+){0,3}(?:previous|prior|earlier|preceding|above|foregoing|system)\s+(?:instructions?|prompts?|directives?|rules?|guidelines?|commands?|context)'
+    rationale: >-
+      The canonical LLM01 override phrasing. Capped well under threshold on
+      its own because OWASP/LangChain/security docs quote this exact string
+      as the textbook example of the attack.
+
+  - id: override_new_instructions
+    family: lexical
+    weight_prose: 35
+    weight_quote: 18
+    weight_code: 8
+    flags: [IGNORECASE]
+    pattern: '\b(?:new|updated|real|actual|true|final)\s+(?:instructions?|directives?|system\s+prompt|task)\s*[:\-]'
+    rationale: >-
+      An injection must introduce its payload; a colon-terminated "NEW
+      INSTRUCTIONS:" header is the near-universal frame for doing so.
+
+  - id: override_role_reassign
+    family: lexical
+    weight_prose: 35
+    weight_quote: 18
+    weight_code: 10
+    flags: [IGNORECASE]
+    pattern: '\byou\s+are\s+now\b|\bfrom\s+now\s+on\s*,?\s+you\s+(?:will|must|shall)\b|\byour\s+(?:new|real|true)\s+(?:role|task|objective)\s+is\b'
+    rationale: >-
+      Second-most-common override frame. Capped low on its own: "act as a
+      senior reviewer" is bread-and-butter prompt-engineering-guide prose.
+
+  # --- Family B: fake conversation turns / chat templates ------------------
+  - id: chat_control_token
+    family: lexical
+    weight_prose: 45
+    weight_quote: 20
+    weight_code: 8
+    flags: [IGNORECASE]
+    pattern: '<\|(?:im_start|im_end|system|user|assistant)\|>|\[/?INST\]|<<[/]?SYS>>'
+    rationale: >-
+      A forged turn-boundary token. Scores far lower in code/inline-code
+      context than prose, because every HF/Llama/vLLM chat-template doc
+      quotes these strings inside backticks.
+
+  - id: chat_fake_turn
+    family: lexical
+    weight_prose: 30
+    weight_quote: 12
+    weight_code: 8
+    flags: []
+    pattern: '^[ ]{0,3}(System|Assistant|Human|User)\s*:\s*\S'
+    rationale: >-
+      Case-sensitive on purpose (a lowercase "user:" is a YAML/config key
+      this crawler indexes constantly, not a forged transcript role).
+
+  # --- Family C: agent-directed imperatives (highest precision) ------------
+  - id: agent_conceal
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 10
+    flags: [IGNORECASE]
+    pattern: "\\b(?:do\\s+not|don'?t|never)\\s+(?:\\w+\\s+){0,3}?(?:tell|inform|mention|reveal|disclose|show)\\s+(?:\\w+\\s+){0,3}?(?:the\\s+|your\\s+)?(?:user|human|operator|developer)\\b"
+    rationale: >-
+      "Do not tell the user" is a request to conceal from the human the tool
+      serves. No benign documentation reason addresses the reader this way —
+      a security doc describes this in third person, an injection commands
+      it in second person.
+
+  - id: agent_addressed
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 10
+    flags: [IGNORECASE]
+    pattern: '\b(?:when|if)\s+you\s+(?:read|see|process|ingest)\s+(?:this|the\s+following)\b|\bif\s+you\s+are\s+(?:an?\s+)?(?:ai|llm|language\s+model|assistant|agent)\b|\battention\s+(?:ai|assistant|agent)\b'
+    rationale: >-
+      Second-person address to a machine reader — only parses if the reader
+      is an AI agent, which a documentation page never assumes of a human
+      reader.
+
+  # --- Family D: exfiltration / destructive action -------------------------
+  - id: exfil_secret_targets
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 10
+    flags: [IGNORECASE]
+    # `.env` is deliberately matched OUTSIDE the `\b(?:...)\b`-wrapped
+    # alternation: `.` is a non-word character, and there is never a `\b`
+    # word boundary between two non-word characters (a preceding space and
+    # the dot) — wrapping `\.env` inside the same `\b...\b` group as the
+    # other targets makes that branch structurally unmatchable. Caught by
+    # this rule's own test in test_injection.py.
+    pattern: '\b(?:send|post|transmit|exfiltrate|leak|forward)\b(?:\W+\w+){0,6}?\W+(?:\.env\b|\b(?:api[_\s-]?keys?|secrets?|tokens?|credentials?|passwords?|private\s+keys?|ssh\s+keys?|system\s+prompt)\b)'
+    rationale: >-
+      Exfil verb + sensitive object within a bounded 6-token window — the
+      bound matters, since a security page mentions "send" and "API key" on
+      the same page constantly but rarely six tokens apart in that order.
+
+  # --- Family F: announced-encoding framing (base64/rot13/hex smuggling) ---
+  - id: exfil_encoded_payload_instruction
+    family: lexical
+    weight_prose: 40
+    weight_quote: 20
+    weight_code: 15
+    # DOTALL: a real encoded blob commonly sits on its own line/paragraph,
+    # separated from the surrounding instructional prose by a blank line —
+    # `.` must cross that newline for the bounded windows below to work.
+    flags: [IGNORECASE, DOTALL]
+    # Structural base64 decoding (decode a long base64 blob, then re-scan
+    # the decoded text) lives in app.injection._decode_base64_blobs and
+    # needs no rule here. This rule is the backstop for encodings that
+    # DON'T parse as clean base64 — ROT13, hex, or a described-but-mangled
+    # blob — where there is nothing for that structural decoder to decode.
+    #
+    # Requires an "instructions/directives/payload" OBJECT after the verb,
+    # not a bare "decode" — "to decode a base64 string in Python, use
+    # base64.b64decode()" is bread-and-butter encoding-reference prose and
+    # must not match; "decode this and execute the instructions" must.
+    # Deliberately excludes "command(s)": "run the following command" is
+    # ubiquitous ordinary CLI documentation phrasing and would otherwise
+    # collide with this rule constantly. The
+    # gap between the encoding-name mention and the verb is bounded by
+    # CHARACTER count (`.{0,200}?`), not token count: a real ROT13/hex
+    # ciphertext sitting between the "this is encoded:" framing and the
+    # "now decode it" instruction can easily be 10+ words, which a
+    # token-bounded window would miss entirely.
+    pattern: '\b(?:base ?64|rot ?13|hex(?:adecimal)?|caesar\s+cipher)\b.{0,200}?\b(?:decode|execute|run|follow|apply)\b(?:\W+\w+){0,4}?\W+(?:the\s+|these\s+|those\s+|resulting\s+|decoded\s+)?(?:instructions?|directives?|payload)\b|\b(?:decode|execute|run|follow|apply)\b(?:\W+\w+){0,4}?\W+(?:the\s+|these\s+|those\s+|resulting\s+|decoded\s+)?(?:instructions?|directives?|payload)\b.{0,100}?\b(?:base ?64|rot ?13|hex(?:adecimal)?|caesar\s+cipher)\b'
+    rationale: >-
+      Announced-encoding framing ("decode this base64 string and execute the
+      instructions") — catches encodings the structural base64 decoder can't
+      parse (ROT13, hex, a deliberately mangled/split blob). OWASP's GenAI
+      LLM Top 10 (LLM01) names Base64/ROT13/emoji encodings explicitly as a
+      filter-bypass technique.
+
+mitigations:
+  doc_vocabulary:
+    weight: -35
+    min_distinct: 3
+    flags: [IGNORECASE]
+    pattern: '\bOWASP\b|\bLLM0\d\b|\bthreat\s+model\b|\battacker\b|\bmitigation\b|\bvulnerabilit(?:y|ies)\b|\bdefen[cs]e\s+in\s+depth\b|\bfor\s+example\b|\be\.g\.\b|\bconsider\s+the\s+following\b|\bred\s+team(?:ing)?\b|\bguardrail\b|\buntrusted\s+(?:input|content)\b'
+  reporting_frame:
+    # Halves a match's weight when this frame appears in the 160 chars
+    # immediately before it — "an attacker might write: '...'" is
+    # documentation, not an attack.
+    flags: [IGNORECASE]
+    pattern: '\bfor\s+example\b|\be\.g\.\b|\battacker\s+(?:might|could|would)\s+(?:write|inject|embed|say)\b|\bpayload\s*:|\bmalicious\s+input\s*:'

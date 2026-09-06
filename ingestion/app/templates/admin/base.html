@@ -32,6 +32,24 @@
         }
       }
     });
+    // Generic show/hide toggle for a `data-toggle-target="<id>"` button —
+    // used by the quarantine review queue to reveal a row's retained
+    // content/evidence inline. Delegated (not an inline onclick=""), and the
+    // target id itself never touches this script body: it's read from a
+    // plain HTML data-* attribute at click time, which Jinja's normal
+    // autoescaping already covers (see test_no_template_interpolates_a_
+    // server_value_into_a_javascript_context, which forbids exactly the
+    // inline-onclick/inline-script-interpolation shape this avoids).
+    document.addEventListener("click", function (event) {
+      var trigger = event.target.closest("[data-toggle-target]");
+      if (!trigger) {
+        return;
+      }
+      var target = document.getElementById(trigger.getAttribute("data-toggle-target"));
+      if (target) {
+        target.style.display = target.style.display === "none" ? "table-row" : "none";
+      }
+    });
   </script>
   <style>
 
@@ -786,6 +804,12 @@
             <path d="M4 4a2 2 0 012-2h8l4 4v10a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/>
           </svg>
           <span class="nav-label">Knowledge Base</span>
+        </a>
+        <a href="/admin/quarantine" class="nav-item {% block nav_quarantine %}{% endblock %}">
+          <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor">
+            <path d="M10 2a1 1 0 01.894.553l7 14A1 1 0 0117 18H3a1 1 0 01-.894-1.447l7-14A1 1 0 0110 2zm0 4a1 1 0 00-1 1v4a1 1 0 002 0V7a1 1 0 00-1-1zm0 8a1 1 0 100 2 1 1 0 000-2z"/>
+          </svg>
+          <span class="nav-label">Quarantine{% if quarantine_pending_count is defined and quarantine_pending_count > 0 %} ({{ quarantine_pending_count }}){% endif %}</span>
         </a>
       </nav>
     </aside>

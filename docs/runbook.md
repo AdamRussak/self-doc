@@ -592,6 +592,98 @@ declared**.
 
 ---
 
+## Injection quarantine — reviewing flagged pages
+
+**Every page `app.injection.scan()` flags as a suspected indirect prompt
+injection is held out of `doc_pages`/`doc_chunks` entirely** — it never
+reaches `search_docs`, the `doc-cli`, or any other reader — until a human
+reviews it in the admin UI at `/admin/quarantine`.
+
+| Surface | Effect |
+| --- | --- |
+| `GET /admin/quarantine` | The review queue: url, score, tripped rule ids, detection time |
+| `POST /admin/quarantine/{id}/allow` | False positive — indexes the retained content **immediately** (no re-crawl, no waiting for the next sync) |
+| `POST /admin/quarantine/{id}/purge` | Permanently discards the retained content; the decision itself is kept (a tombstone), so this exact content is never re-queued |
+
+Decisions are content-addressed by `(url, content_hash)`: editing the
+flagged page upstream produces a new hash and gets re-evaluated from
+scratch, so an Allow can never be used as a standing bypass for a page an
+attacker later edits to add a real payload.
+
+### `INJECTION_ENFORCE` — the rollout knob
+
+A global env var read once at ingestion startup, independent of any
+per-source setting:
+
+| Value | Behavior |
+| --- | --- |
+| `on` (default) | Full enforcement: a flagged page is held out of the index; a previously-indexed page that becomes flagged is de-indexed. |
+| `shadow` | Every page is still scanned and every detection is still recorded in the review queue, but **nothing is blocked** — everything indexes normally. Use this to measure the real false-positive rate against your own corpus before trusting the ruleset to remove anything: sync once, read `/admin/quarantine`, and run `make eval` to confirm nothing important vanished. |
+| `off` | `app.injection.scan()` is never called — byte-identical to this feature not existing. The fast escape hatch if the ruleset ever needs to be pulled entirely. |
+
+An unrecognized value falls back to `on` (fail toward *not* serving
+unreviewed content, not toward serving it) and logs an
+`injection_enforce_unknown_value_defaulting_to_on` warning.
+
+### Tuning the ruleset
+
+The detection rules — patterns, per-context weights, mitigations — live in
+`ingestion/config/injection_rules.yaml`, not in Python. Adding or adjusting a
+pattern (e.g. a false positive on a specific documentation site's phrasing)
+is a diff to that file plus a case in `ingestion/tests/test_injection.py` —
+no code change, no rebuild. `ingestion/config/` is mounted read-only as a
+**directory** (see `docker-compose.yml`'s comment on why: a single-file mount
+would pin an inode and go stale under an editor's atomic-rename save), so
+edit the file on the host and restart the `ingestion` container to pick it
+up:
+
+```bash
+docker compose restart ingestion
+```
+
+Every pattern in that file **must be a single line** — see the file's own
+header comment for why a YAML folded block scalar (`>-`) silently breaks a
+multi-line regex (it inserts a literal space at each line break, which
+defeated this ruleset's own `\s+`-terminated patterns the first time it was
+written).
+
+`load_ruleset` fails fast at startup if a pattern doesn't compile, or if any
+rule outside the `concealment` family sets a weight above
+`MAX_LEXICAL_RULE_WEIGHT` (45) — the structural guarantee that no page is
+ever quarantined on the evidence of a single lexical rule.
+
+### A ruleset update doesn't retroactively re-scan unchanged pages
+
+A page that keeps 304-ing (unchanged upstream) is never re-evaluated against
+a newer ruleset — its body is never re-fetched, so there's nothing new to
+scan. If you've just tightened or loosened `injection_rules.yaml` and want
+the *entire* existing corpus re-judged against it, run a full re-index (see
+[Re-index from scratch](#re-index-from-scratch-nuke-and-rebuild) or `make
+reindex`) — this forces every page to be re-fetched and re-scanned, since a
+truncated `doc_pages` has no conditional-GET validators left to short-circuit
+on.
+
+### Migration
+
+`doc_quarantine` and `doc_sources.injection_auto_purge` ship in
+`db/init/05_injection_quarantine.sql`. On a fresh install this applies
+automatically; on an existing deployment, apply it by hand:
+
+```bash
+set -a; source .env; set +a; ./scripts/migrate_injection.sh
+```
+
+Safe to re-run — every statement is idempotent.
+
+### Local test suite
+
+The `pgdata_test` volume some developers already have on disk predates this
+migration; `ingestion/tests/test_store.py`'s `conn` fixture applies
+`05_injection_quarantine.sql` idempotently on every test run, so this is
+self-healing — no manual `make test-db-reset` required.
+
+---
+
 ## Add a new doc source
 
 **`doc_sources` in Postgres is the sole source of truth for crawl config.**
@@ -1422,7 +1514,15 @@ docker compose logs ingestion | grep -E '"event": "(page_index_failed|sync_sourc
   covers `POST /sync`, the admin UI's manual-sync button, and the
   scheduler, so any of the three can be the reason another is blocked. Not
   an error — wait and poll `GET /status`, or treat it as a no-op (this is
-  how the scheduler's `skipped-locked` log event handles it too).
+  how the scheduler's `skipped-locked` log event handles it too). `POST
+  /admin/quarantine/{id}/allow` takes the same lock, so a page stuck on
+  "Allow" during a sync is expected — retry once the sync finishes.
+
+- **A page I expected to be indexed is missing.** Check `/admin/quarantine`
+  before assuming a crawl bug — `app.injection.scan()` may have flagged it.
+  If it's a false positive, click Allow (indexes immediately); if the
+  ruleset needs adjusting, see [Tuning the
+  ruleset](#tuning-the-ruleset) above.
 
 - **`503` on `POST /sync`.** The database read failed (Postgres
   unreachable, connection error, ...) — see the [migration
@@ -1534,6 +1634,7 @@ Six alerting rules over the `/metrics` series from
 `ingestion/app/metrics.py` (`pages_fetched_total`,
 `pages_skipped_unchanged_total`, `pages_not_modified_total`,
 `pages_soft_failed_total`, `pages_failed_total`, `pages_shell_suspected_total`,
+`pages_injection_blocked_total`,
 `chunks_indexed_total`, `sync_duration_seconds`, `sync_last_success_timestamp`,
 and `sync_last_status` — the last one labelled `source` + `status`, the rest
 labelled `source` only). Load them into
@@ -1582,9 +1683,12 @@ source, so at most one status series is active per source at any time (see
 `metrics.py`'s module docstring for why a labelled gauge, and how the
 classic "stale series" pitfall is avoided). `partial` means at least one of:
 a hard pipeline failure (`pages_failed > 0`), an early-aborted crawl, a
-refused purge-ratio guard, or a soft-failure ratio above
-`SOFT_FAIL_PARTIAL_RATIO` — see `classify_sync` in `ingestion/app/store.py`
-for the exact rule order.
+refused purge-ratio guard, a soft-failure ratio above
+`SOFT_FAIL_PARTIAL_RATIO`, **or an injection-block ratio above
+`INJECTION_BLOCK_PARTIAL_RATIO`** — a source flagging a large fraction of
+its own pages every sync deserves a look at `/admin/quarantine`, the same
+way a soft-failure spike deserves a look at the logs. See `classify_sync` in
+`ingestion/app/store.py` for the exact rule order.
 
 **Triage:**
 1. `curl -sS http://localhost:8080/status | jq '."<name>"'` — check the real
