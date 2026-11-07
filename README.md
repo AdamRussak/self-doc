@@ -13,7 +13,7 @@
   <img alt="pgvector 0.8.2" src="https://img.shields.io/badge/pgvector-0.8.2-4169E1">
   <img alt="FastMCP 3.x" src="https://img.shields.io/badge/FastMCP-3.x-6E56CF">
   <img alt="Protocol: MCP" src="https://img.shields.io/badge/protocol-MCP-000000">
-  <img alt="License: Private" src="https://img.shields.io/badge/license-Private-lightgrey">
+  <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg">
 </p>
 
 **self-docs** gives your coding agents (Cursor, Claude Code, Antigravity, or any
@@ -541,4 +541,4 @@ make typecheck
 
 ## License
 
-Private — not published. All rights reserved; see [LICENSE](LICENSE).
+Released under the [MIT License](LICENSE).
